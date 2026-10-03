@@ -1,0 +1,41 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "classroomautowork"
+version = "0.1.0"
+description = "Local, read-only Google Classroom assistance for Codex"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+dependencies = [
+  "google-api-python-client>=2.150,<3",
+  "google-auth-oauthlib>=1.2,<2",
+  "keyring>=25,<26",
+  "tzdata>=2025.1",
+  "pypdf>=6,<7",
+  "pypdfium2>=4.30,<6",
+  "defusedxml>=0.7,<1",
+  "filelock>=3.18,<4",
+  "Pillow>=11,<13",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10", "ruff>=0.11,<1"]
+
+[project.scripts]
+classroomaw = "classroomautowork.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/classroomautowork"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "UP", "B"]
+ignore = ["BLE001"]  # CLI boundary suppresses credential-bearing exception text.

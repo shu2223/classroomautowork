@@ -1,0 +1,37 @@
+# Runtime/private data belongs outside this checkout.
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+.env*
+credentials*.json
+client_secret*.json
+token*.json
+*.sqlite*
+*.db
+*.part
+local/
+private/
+cache/
+review-packages/
+config.local.*
+# Course attachments and generated reviews are never source files.
+*.pdf
+*.doc
+*.docx
+*.ppt
+*.pptx
+*.xls
+*.xlsx
+*.mp4
+*.mkv
+*.mov
+*.mp3
+*.wav
+*.m4a
+*.srt
+*.vtt

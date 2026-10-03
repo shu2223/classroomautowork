@@ -1,0 +1,4 @@
+interface:
+  display_name: "Classroom 作业辅助"
+  short_description: "按截止日期收集课程资料，依据真实证据准备初稿、要求检查表和人工审核包"
+  default_prompt: "使用 $classroom-assistant 处理指定截止日期前的待完成作业，生成供我审阅的审核包。"
