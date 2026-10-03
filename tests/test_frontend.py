@@ -177,6 +177,48 @@ def test_course_forbidden_blocks_even_when_user_checks_ai(tmp_path, monkeypatch)
     assert drafting.generate_review(package, ai_confirmed=True)["draft_sha256"] is None
 
 
+def test_metadata_only_revision_reuses_real_output_but_changed_content_does_not(
+    tmp_path, monkeypatch
+):
+    from classroomautowork.policy import confirmed_gate
+
+    package, _, _, review = prepared_fixture(tmp_path)
+    offline_rpc(tmp_path, monkeypatch, package, review)
+    first = drafting.generate_review(package, ai_confirmed=True, model="unit-model", effort="high")
+
+    class SameContent(ReaderFixture):
+        version = "2"
+        text = "食品安全 unit revision 1"
+
+        def download(self, metadata, destination):
+            destination.mkdir(parents=True)
+            path = destination / "unit.txt"
+            path.write_text(self.text, encoding="utf-8")
+            return {"path": str(path)}
+
+    reader = SameContent()
+    settings = unit_settings(tmp_path)
+    with Store(tmp_path) as store:
+        course = workflow.sync_course(reader, settings, store, "1")
+        prepared = workflow.prepare_assignment(settings, store, course, "2")
+    monkeypatch.setattr(
+        drafting, "codex_command", lambda: pytest.fail("Identical content must not invoke AI again")
+    )
+    second = drafting.generate_review(
+        Path(prepared["package"]), ai_confirmed=True, model="unit-model", effort="high"
+    )
+    assert second["reused"] and second["package"] == first["package"]
+    assert second["generation"]["started_at"] == first["generation"]["started_at"]
+    reader.version, reader.text = "3", "Changed unit content"
+    with Store(tmp_path) as store:
+        course = workflow.sync_course(reader, settings, store, "1")
+        changed = workflow.prepare_assignment(settings, store, course, "2")
+    path = Path(changed["package"])
+    manifest = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
+    manifest["policy"] = confirmed_gate(manifest["policy"], True)
+    assert drafting.equivalent_review(path, manifest, model="unit-model", effort="high") is None
+
+
 def test_cancel_terminates_the_owned_codex_process(tmp_path, monkeypatch):
     from classroomautowork import codex_rpc
 

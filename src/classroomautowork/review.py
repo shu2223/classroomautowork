@@ -28,13 +28,25 @@ def finalize(package: Path, review_path: Path, draft_path: Path | None = None) -
         gate = confirmed_gate(gate, manifest["ai_confirmation"])
     if gate != manifest["policy"]:
         raise WorkflowError("Course policy changed since preparation; prepare the package again.")
+    aliases = {}
     with Store(root) as store:
         current = {x["id"]: x for x in store.chunks(manifest["course_id"])}
         for source in sources.values():
             real = current.get(source["id"])
+            fields = ("text", "source_kind", "title", "source_id", "locator", "url", "image_path")
+            if real is None:
+                # Drive can change metadata versions while retaining identical bytes.
+                # Preserve the original model citations only for exactly equal current
+                # evidence; do not rewrite its recorded input or claim a new model turn.
+                real = next(
+                    (x for x in current.values() if all(source.get(k) == x.get(k) for k in fields)),
+                    None,
+                )
+                if real:
+                    aliases[source["id"]] = real["id"]
             if not real or any(
                 source.get(k) != real.get(k)
-                for k in ("text", "revision", "source_id", "locator", "url", "image_path")
+                for k in fields + (() if source["id"] in aliases else ("revision",))
             ):
                 raise WorkflowError(
                     "Evidence changed or is no longer in the current readable cache; prepare again."
@@ -113,6 +125,7 @@ def finalize(package: Path, review_path: Path, draft_path: Path | None = None) -
         "review_sha256": sha256_file(output),
         "submission": "manual_only",
         "citation_validation": "IDs and exact quotations checked; semantic claims require human review.",
+        "equivalent_current_evidence_ids": aliases,
     }
     atomic_json(package / "review-receipt.json", receipt)
     return receipt

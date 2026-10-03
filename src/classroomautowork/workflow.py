@@ -223,7 +223,11 @@ def sync_course(
                 }
                 for x in result["chunks"]
             ]
-            store.replace_chunks(course_id, source_id, fingerprint([revision, processor]), chunks)
+            # Evidence identity follows actual content and processor settings. A Drive
+            # metadata-only version change must not invalidate identical extracted pages.
+            store.replace_chunks(
+                course_id, source_id, fingerprint([content_hash, processor]), chunks
+            )
             readable.add(source_id)
             warnings.extend({"source": source_id, "error": x} for x in result.get("warnings", []))
         except RunCancelled:
@@ -244,7 +248,7 @@ def sync_course(
         "policy": policy.draft_gate(),
         "warnings": warnings,
         "assignment_sources": {item["id"]: item for kind, item in records if kind == "coursework"},
-        "submissions": {item["courseWorkId"]: item for item in submissions},
+        "submissions": {item["courseWorkId"]: stable_source(item) for item in submissions},
         "attachment_origins": origins,
         "attachment_resolutions": resolutions,
         "downloads": downloads,

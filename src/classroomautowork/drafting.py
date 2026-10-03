@@ -168,6 +168,55 @@ def output_schema():
     )
 
 
+def equivalent_review(package: Path, manifest: dict, *, model, effort) -> dict | None:
+    """Reuse actual AI output only when the new readable inputs are exactly equivalent."""
+
+    def profile(path, name):
+        sources = json.loads((path / name).read_text(encoding="utf-8"))["sources"]
+        return sorted(
+            json.dumps(
+                {k: v for k, v in source.items() if k not in {"id", "revision"}},
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            for source in sources
+        )
+
+    wanted = (profile(package, "evidence.json"), profile(package, "requirements.json"))
+    downloads = sorted((x["id"], x["sha256"]) for x in manifest.get("downloads", []))
+    for candidate in sorted(
+        package.parent.iterdir(), key=lambda p: p.stat().st_mtime_ns, reverse=True
+    ):
+        if not candidate.is_dir() or not re.fullmatch(r"[a-f0-9]{24}", candidate.name):
+            continue
+        try:
+            old = json.loads((candidate / "manifest.json").read_text(encoding="utf-8"))
+            generation = json.loads(
+                (candidate / "codex-generation.json").read_text(encoding="utf-8")
+            )
+            if (
+                generation.get("status") != "completed"
+                or generation.get("model") != model
+                or generation.get("reasoning_effort") != effort
+                or old.get("policy") != manifest["policy"]
+                or old.get("assignment") != manifest["assignment"]
+                or old.get("warnings") != manifest.get("warnings")
+                or sorted((x["id"], x["sha256"]) for x in old.get("downloads", [])) != downloads
+            ):
+                continue
+            if (
+                profile(candidate, "evidence.json"),
+                profile(candidate, "requirements.json"),
+            ) != wanted:
+                continue
+            result = reusable_review(candidate, model=model, effort=effort)
+            if result:
+                return result
+        except (OSError, KeyError, ValueError, WorkflowError):
+            continue
+    return None
+
+
 def build_input(package: Path, skill: Path, manifest: dict):
     """Send actual requirement/lecture text and page pixels, with a persisted input manifest."""
     evidence = json.loads((package / "evidence.json").read_text(encoding="utf-8"))["sources"]
@@ -284,13 +333,18 @@ def generate_review(
         "ultra",
     }:
         raise WorkflowError("推理强度无效。")
+    manifest["ai_confirmation"] = ai_confirmed
+    manifest["policy"] = confirmed_gate(manifest["policy"], ai_confirmed)
+    same_content = equivalent_review(package, manifest, model=model, effort=effort)
+    if same_content:
+        progress("已核对实际文本、页图和文件校验值未变，复用原模型初稿；没有重新生成")
+        on_generation(same_content["generation"])
+        return {**same_content, "reused": True}
     identity = hashlib.sha256(
         json.dumps([manifest["fingerprint"], model, effort, "codex-rpc-v2", ai_confirmed]).encode()
     ).hexdigest()[:24]
     variant = require_private_path(package.parent / identity)
     variant.mkdir(parents=True, exist_ok=True)
-    manifest["ai_confirmation"] = ai_confirmed
-    manifest["policy"] = confirmed_gate(manifest["policy"], ai_confirmed)
     for name in ("manifest.json", "requirements.json", "evidence.json"):
         target = require_private_path(variant / name)
         content = (

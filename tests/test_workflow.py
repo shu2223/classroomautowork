@@ -305,6 +305,20 @@ def test_review_validates_actual_quotes_and_unknown_citations(tmp_path):
         finalize(package, path, draft)
 
 
+def test_legacy_citations_match_only_exactly_equal_current_evidence(tmp_path):
+    package, path, draft, _ = prepared_fixture(tmp_path)
+    with Store(tmp_path) as store:
+        original = [x for x in store.chunks("1") if x["source_id"] == "file:unit-file-01"]
+        store.replace_chunks("1", "file:unit-file-01", "metadata-only-unit-revision", original)
+    receipt = finalize(package, path, draft)
+    assert original[0]["id"] in receipt["equivalent_current_evidence_ids"]
+    with Store(tmp_path) as store:
+        changed = {**original[0], "text": "Different readable source"}
+        store.replace_chunks("1", "file:unit-file-01", "actual-unit-change", [changed])
+    with pytest.raises(WorkflowError, match="Evidence changed"):
+        finalize(package, path, draft)
+
+
 def test_forbidden_ai_stops_answer_draft(tmp_path):
     package, path, draft, review = prepared_fixture(tmp_path, "forbidden")
     with pytest.raises(WorkflowError, match="blocks"):
