@@ -258,6 +258,16 @@ class LocalHandler(BaseHTTPRequestHandler):
                     effort=payload.get("effort"),
                     ai_confirmed=payload.get("ai_confirmed", False),
                 )
+            elif path == "/api/documents/authorize":
+                if payload:
+                    raise WorkflowError("文档授权请求不接受额外参数。")
+                result = jobs.authorize_documents()
+            elif match := re.fullmatch(
+                r"/api/jobs/([a-f0-9]{32})/items/([0-9]+:[0-9]+)/fill", path
+            ):
+                if payload:
+                    raise WorkflowError("填入请求不接受远端文档 ID 或额外写入指令。")
+                result = jobs.fill_existing(match[1], match[2])
             elif match := re.fullmatch(r"/api/jobs/([a-f0-9]{32})/approval", path):
                 if set(payload) != {"id", "decision"}:
                     raise WorkflowError("审批只接受当前请求 ID 与本次决定。")

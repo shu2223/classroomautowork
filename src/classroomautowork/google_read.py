@@ -120,6 +120,19 @@ class GoogleReader:
             )
         )
 
+    def personal_document_metadata(self, file_id: str) -> dict:
+        return retry_read(
+            lambda: (
+                self._drive.files()
+                .get(
+                    fileId=file_id,
+                    supportsAllDrives=True,
+                    fields="id,mimeType,ownedByMe,owners(emailAddress),capabilities(canEdit)",
+                )
+                .execute()
+            )
+        )
+
     def file_metadata(self, file_id: str, resource_key: str | None = None) -> dict:
         request = self._drive.files().get(
             fileId=file_id,

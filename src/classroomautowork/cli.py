@@ -9,6 +9,7 @@ from pathlib import Path
 from .auth import credentials_for, secure_keyring
 from .buzz import BuzzConfig, setup_buzz
 from .config import Settings, assignment_ids
+from .document_fill import fill_review
 from .errors import WorkflowError
 from .google_read import GoogleReader
 from .local import state_root
@@ -83,6 +84,13 @@ def main(argv=None) -> int:
     initialize.add_argument("--timezone", default="Asia/Tokyo")
     initialize.add_argument("--data-dir", type=Path, default=state_root() / "data")
     commands.add_parser("auth", help="Open genuine Google installed-app OAuth in your browser")
+    commands.add_parser(
+        "auth-documents", help="Authorize Google Docs read/write separately; no Classroom writes"
+    )
+    fill = commands.add_parser(
+        "fill", help="Fill a verified Codex draft into its existing personal submission Doc"
+    )
+    fill.add_argument("--package", required=True, type=Path)
     verify = commands.add_parser(
         "verify", help="Read the real assignment and download a permitted attachment"
     )
@@ -163,13 +171,17 @@ def main(argv=None) -> int:
             }
         else:
             settings = Settings.load(args.config)
-            if args.command == "auth":
-                _, identity = credentials_for(settings, authorize=True)
+            if args.command in {"auth", "auth-documents"}:
+                _, identity = credentials_for(
+                    settings, authorize=True, documents=args.command == "auth-documents"
+                )
                 result = {
                     "oauth": "authorized",
                     "identity": identity,
                     "connection": "Run verify to validate assignment and download.",
                 }
+            elif args.command == "fill":
+                result = fill_review(settings, args.package)
             elif args.command == "pending":
                 credentials, _ = credentials_for(settings)
                 result = discover_pending(

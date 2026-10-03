@@ -12,3 +12,5 @@
 `finalize` 会生成 `checklist.md`、`questions.md`、`review-receipt.json`；答案允许且确实生成时保留 `draft.md`。`evidence.json` 提供可追溯的来源证据。机械检查只能验证 ID、直接引文和配置，事实含义、要求是否完整及表达是否合适仍需 Codex 和用户审阅。
 
 不要修改 prepared 包内的 manifest、requirements 或 evidence 来绕过检查。资料或规则变化时重新运行 prepare。
+
+`document_answers` 是前端结果 schema 的独立数组，不属于 `review.json`。每项复制原生答案栏的 document_id、field_id 和 context_sha256，并提供适合该栏的单段 text。内部证据标记保留在本机 draft/checklist 中，原文档只填写作业答案。写入后给出原文档审阅入口，证据包下载可选。

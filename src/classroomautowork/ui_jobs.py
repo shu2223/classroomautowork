@@ -7,9 +7,10 @@ import uuid
 from dataclasses import asdict, replace
 from pathlib import Path
 
-from .auth import credentials_for
+from .auth import credentials_for, documents_authorized
 from .codex_rpc import model_catalog
 from .config import Settings
+from .document_fill import fill_review, prepare_document_forms
 from .drafting import codex_command, generate_review
 from .errors import ConfigurationError, RunCancelled, WorkflowError
 from .google_read import GoogleReader
@@ -31,6 +32,8 @@ FILES = {
     "codex-summary.md",
     "codex-generation.json",
     "README.txt",
+    "document-fill.json",
+    "document-answers.json",
 }
 POLICY_FIELDS = {
     "ai_use",
@@ -95,6 +98,7 @@ class FrontendJobs:
             return json.loads(
                 json.dumps(
                     {
+                        "documents_authorized": documents_authorized(self.settings),
                         "account": self.settings.school_email,
                         "timezone": self.settings.timezone,
                         "pending": pending,
@@ -168,6 +172,17 @@ class FrontendJobs:
     def refresh(self):
         return self._start("refresh", [])
 
+    def authorize_documents(self):
+        return self._start("document_auth", [])
+
+    def fill_existing(self, job_id, key):
+        package = self.package_path(job_id, key)
+        source = self.job(job_id)
+        item = next(x for x in source["items"] if item_key(x) == key)
+        if not source.get("ai_confirmed"):
+            raise WorkflowError("未确认使用 AI 的资料包不能自动填入。")
+        return self._start("fill", [{**item, "package": str(package)}], ai_confirmed=True)
+
     def start_selected(
         self,
         selected: list[dict],
@@ -228,6 +243,10 @@ class FrontendJobs:
             raise WorkflowError("任务仍在运行。")
         if job["kind"] == "refresh":
             return self.refresh()
+        if job["kind"] == "document_auth":
+            return self.authorize_documents()
+        if job["kind"] == "fill":
+            return self.fill_existing(job_id, item_key(job["items"][0]))
         return self.start_selected(
             [
                 {"course_id": x["course_id"], "assignment_id": x["assignment_id"]}
@@ -303,7 +322,45 @@ class FrontendJobs:
             with self._lock:
                 job["status"] = "running"
                 self._save(job)
-            if job["kind"] == "refresh":
+            if job["kind"] == "document_auth":
+                self._log(
+                    job_id,
+                    "请在 Google 页面确认文档读写授权。权限允许编辑账户可编辑的文档；本程序只填写本人待完成作业副本。",
+                )
+                credentials_for(self.settings, authorize=True, documents=True)
+                self._log(
+                    job_id,
+                    "学校账户的文档读写授权已实际完成，可以自动填入；课堂提交与留言仍由你手动操作。",
+                )
+                status = "completed"
+            elif job["kind"] == "fill":
+                for item in job["items"]:
+                    self._item(job_id, item, status="filling_document")
+                    try:
+                        result = fill_review(
+                            self.settings,
+                            Path(item["package"]),
+                            progress=lambda msg: self._log(job_id, msg),
+                        )
+                        self._item(
+                            job_id,
+                            item,
+                            status="document_needs_user"
+                            if any(d["remaining_empty_fields"] for d in result["documents"])
+                            else "document_ready",
+                            document_fill=result,
+                            error=None,
+                        )
+                    except RunCancelled:
+                        raise
+                    except WorkflowError as exc:
+                        self._item(job_id, item, status="needs_document", error=str(exc))
+                status = (
+                    "completed"
+                    if all(x["status"] == "document_ready" for x in job["items"])
+                    else "completed_with_issues"
+                )
+            elif job["kind"] == "refresh":
                 self._log(job_id, "正在连接学校账户并读取真实待办")
                 credentials, _ = credentials_for(self.settings)
                 pending = discover_pending(
@@ -352,6 +409,9 @@ class FrontendJobs:
                     )
                     self._item(job_id, result, status="drafting")
                     try:
+                        forms = []
+                        if job.get("ai_confirmed"):
+                            forms = prepare_document_forms(self.settings, Path(result["package"]))
                         receipt = generate_review(
                             Path(result["package"]),
                             cancelled=self._cancel.is_set,
@@ -359,6 +419,7 @@ class FrontendJobs:
                             model=job.get("model"),
                             effort=job.get("effort"),
                             ai_confirmed=job.get("ai_confirmed", False),
+                            forms=forms,
                             on_generation=lambda value, item=result: self._item(
                                 job_id,
                                 item,
@@ -382,21 +443,45 @@ class FrontendJobs:
                             reused_review=bool(receipt.get("reused")),
                             package=receipt["package"],
                         )
+                        if job.get("ai_confirmed") and receipt.get("draft_sha256") and forms:
+                            self._item(job_id, result, status="filling_document")
+                            try:
+                                filled = fill_review(
+                                    self.settings,
+                                    Path(receipt["package"]),
+                                    progress=lambda msg: self._log(job_id, msg),
+                                )
+                                self._item(
+                                    job_id,
+                                    result,
+                                    status="document_needs_user"
+                                    if any(d["remaining_empty_fields"] for d in filled["documents"])
+                                    else "document_ready",
+                                    document_fill=filled,
+                                    error=None,
+                                )
+                            except RunCancelled:
+                                raise
+                            except WorkflowError as exc:
+                                self._item(job_id, result, status="needs_document", error=str(exc))
                     except RunCancelled:
                         raise
                     except WorkflowError as exc:
                         self._item(job_id, result, status="failed", error=str(exc))
                 status = (
                     "completed_with_issues"
-                    if any(x["status"] == "failed" for x in job["items"])
+                    if any(x["status"] in {"failed", "needs_document"} for x in job["items"])
                     else "completed"
                 )
-                ready = sum(x["status"] == "ready" for x in job["items"])
-                needs = sum(x["status"] == "needs_user" for x in job["items"])
+                ready = sum(x["status"] == "document_ready" for x in job["items"])
+                needs = sum(
+                    x["status"] in {"needs_user", "document_needs_user", "needs_document"}
+                    for x in job["items"]
+                )
                 materials = sum(x["status"] == "materials_ready" for x in job["items"])
                 self._log(
                     job_id,
-                    f"处理结束：{ready} 项实际初稿待审阅，{materials} 项资料包，{needs} 项待补充；没有提交任何作业",
+                    f"处理结束：{ready} 项已填入原文档可审阅，{materials} 项资料包，{needs} 项待补充；没有提交任何作业",
                 )
             with self._lock:
                 job["status"] = status
@@ -527,6 +612,7 @@ class FrontendJobs:
             "receipt": receipt,
             "policy_changed": changed,
             "generation": generation,
+            "document_fill": read_json(package / "document-fill.json"),
         }
 
     @staticmethod

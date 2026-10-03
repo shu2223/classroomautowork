@@ -20,6 +20,28 @@ SCOPES = (
     "https://www.googleapis.com/auth/drive.readonly",
 )
 SERVICE = "classroomautowork.google-oauth"
+DOCUMENT_SCOPES = (
+    "openid",
+    "https://www.googleapis.com/auth/userinfo.email",
+    "https://www.googleapis.com/auth/documents",
+)
+DOCUMENT_SERVICE = "classroomautowork.google-documents-oauth"
+
+
+def documents_authorized(settings: Settings) -> bool:
+    """Local scope status only; real identity/API validation occurs before every write."""
+    try:
+        secure_keyring()
+        client = json.loads(settings.client_json.read_text(encoding="utf-8-sig"))["installed"]
+        stored = keyring.get_password(
+            DOCUMENT_SERVICE, settings.school_email + ":" + client["client_id"]
+        )
+        return bool(stored) and normalized_scopes(json.loads(stored).get("scopes", [])) == set(
+            DOCUMENT_SCOPES
+        )
+    except (WorkflowError, OSError, ValueError, KeyError):
+        return False
+
 
 # Google returns canonical scope names; these documented aliases have identical read authority.
 SCOPE_ALIASES = {
@@ -76,7 +98,12 @@ def verify_identity(credentials: Credentials, expected_email: str) -> dict:
     }
 
 
-def credentials_for(settings: Settings, *, authorize: bool = False) -> tuple[Credentials, dict]:
+def credentials_for(
+    settings: Settings, *, authorize: bool = False, documents: bool = False
+) -> tuple[Credentials, dict]:
+    # Separate OS entries: enabling personal-Doc filling never broadens the reader.
+    scopes = DOCUMENT_SCOPES if documents else SCOPES
+    service = DOCUMENT_SERVICE if documents else SERVICE
     client_path = settings.client_json
     if not client_path.is_file():
         raise ConfigurationError(
@@ -101,7 +128,7 @@ def credentials_for(settings: Settings, *, authorize: bool = False) -> tuple[Cre
         )
     secure_keyring()
     account_key = settings.school_email + ":" + client["client_id"]
-    stored = None if authorize else keyring.get_password(SERVICE, account_key)
+    stored = None if authorize else keyring.get_password(service, account_key)
     credentials = None
     if stored:
         try:
@@ -110,11 +137,11 @@ def credentials_for(settings: Settings, *, authorize: bool = False) -> tuple[Cre
             raise ConfigurationError(
                 "OS credential-store entry is invalid. Run auth again."
             ) from exc
-        if not set(SCOPES).issubset(normalized_scopes(credentials.scopes or ())):
+        if not set(scopes).issubset(normalized_scopes(credentials.scopes or ())):
             raise PermissionDenied(
                 "Stored authorization lacks required read-only scopes. Run auth again."
             )
-        if normalized_scopes(credentials.scopes or ()) - set(SCOPES):
+        if normalized_scopes(credentials.scopes or ()) - set(scopes):
             raise PermissionDenied(
                 "Stored authorization includes unexpected scopes. Run auth again."
             )
@@ -127,10 +154,14 @@ def credentials_for(settings: Settings, *, authorize: bool = False) -> tuple[Cre
                 ) from exc
     if not credentials or not credentials.valid:
         if not authorize:
+            if documents:
+                raise PermissionDenied(
+                    "尚未授权 Google Docs 自动填入。请点击‘启用自动填入’，在 Google 页面确认新增读写权限。"
+                )
             raise PermissionDenied("No valid OAuth authorization. Run classroomaw auth first.")
         # Use the already validated installed config, not a second file read.
         flow = InstalledAppFlow.from_client_config(
-            {"installed": client}, scopes=SCOPES, autogenerate_code_verifier=True
+            {"installed": client}, scopes=scopes, autogenerate_code_verifier=True
         )
         flow.oauth2session.register_compliance_hook(
             "access_token_response", normalize_scope_response
@@ -155,9 +186,9 @@ def credentials_for(settings: Settings, *, authorize: bool = False) -> tuple[Cre
             ) from exc
     identity = verify_identity(credentials, settings.school_email)
     granted = normalized_scopes(credentials.granted_scopes or credentials.scopes or ())
-    if granted != set(SCOPES):
+    if granted != set(scopes):
         raise PermissionDenied(
-            "Granted scopes differ from the fixed read-only scope set. Reauthorize."
+            "Granted scopes differ from the requested fixed scope set. Reauthorize."
         )
-    keyring.set_password(SERVICE, account_key, credentials.to_json())
+    keyring.set_password(service, account_key, credentials.to_json())
     return credentials, identity

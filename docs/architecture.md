@@ -13,7 +13,9 @@ flowchart LR
   T --> R[本地 BM25 检索]
   R --> D[Codex 按课程规则撰写]
   D --> V[本地审核校验]
-  V --> H[用户审阅与手动提交]
+  V --> F[固定答案栏规划与本人文档核验]
+  F --> GD[Google Docs 独立读写授权]
+  GD --> H[用户打开原文档审阅与手动提交]
 ```
 
 ## 公共调用
@@ -86,5 +88,8 @@ Buzz 先由本地 ffmpeg 转成 16kHz 单声道 PCM，每五分钟独立缓存�
 manifest/evidence/requirements 是准备阶段的输入，不允许为通过校验而修改。
 finalize 检查来源是否仍匹配当前索引，核对课程配置、引文、个人事实索引和显示的证据 ID，
 生成 checksum receipt 后停止。机械检查不判断所有主张是否被证据蕴含，不代替人工审阅。
+用户要求自动填入时，经过文档填入模块继续写入本人副本并回读，生成单独 document-fill receipt。
+Classroom 仍无写接口。Docs OAuth 独立固定 scopes；模型只能返回字段内容，不能提供远端写入请求。
+写入针对原生空答案栏，使用 requiredRevisionId；版本冲突停止，未知响应先回读，相同答案不重复插入。
 真实验证与离线测试分离：token 在 OS 凭据库，connection-receipt 在私人目录。
 源码不携带账户、客户端 JSON、课程 ID、材料、缓存或真实验证样本。
