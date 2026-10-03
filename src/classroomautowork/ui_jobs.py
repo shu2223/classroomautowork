@@ -78,7 +78,13 @@ class FrontendJobs:
                 job["status"] = "interrupted"
                 job["message"] = "上次运行已中断。点击重试，会复用已完成的资料和审核包。"
                 for item in job.get("items", []):
-                    if item.get("status") in {"waiting", "preparing", "prepared", "drafting"}:
+                    if item.get("status") in {
+                        "waiting",
+                        "preparing",
+                        "prepared",
+                        "drafting",
+                        "filling_document",
+                    }:
                         item["status"] = "interrupted"
                 atomic_json(path, job)
             self._jobs[job["id"]] = job
@@ -500,7 +506,13 @@ class FrontendJobs:
             with self._lock:
                 if job["status"] in {"paused", "failed"}:
                     for item in job["items"]:
-                        if item["status"] in {"waiting", "preparing", "prepared", "drafting"}:
+                        if item["status"] in {
+                            "waiting",
+                            "preparing",
+                            "prepared",
+                            "drafting",
+                            "filling_document",
+                        }:
                             item["status"] = job["status"]
                 job["finished_at"] = utc_now()
                 job["approval"] = None

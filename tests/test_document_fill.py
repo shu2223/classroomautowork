@@ -291,3 +291,22 @@ def test_docs_oauth_is_separate_and_never_broadens_classroom_reader(tmp_path, mo
     stored[auth.SERVICE] = stored[auth.DOCUMENT_SERVICE]
     with pytest.raises(PermissionDenied):
         auth.credentials_for(settings)
+
+
+def test_concurrent_fill_returns_retryable_message_without_any_write(tmp_path):
+    from filelock import FileLock
+
+    reader, docs = PersonalReader(), DocsFixture()
+    records = tmp_path / "records"
+    records.mkdir()
+    with FileLock(str(records / "fill.lock")), pytest.raises(WorkflowError, match="正在填入"):
+        fill_personal_document(
+            reader,
+            docs,
+            course_id="1",
+            assignment_id="2",
+            document_id="offline-doc",
+            answers=answers(docs.document),
+            record_dir=records,
+        )
+    assert docs.writes == 0

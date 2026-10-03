@@ -8,10 +8,11 @@ import hashlib
 import json
 import re
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
 import httplib2
-from filelock import FileLock
+from filelock import FileLock, Timeout
 from google_auth_httplib2 import AuthorizedHttp
 from googleapiclient.discovery import build
 
@@ -21,6 +22,15 @@ from .local import atomic_json, require_private_path, sha256_file, utc_now
 
 HEADERS = re.compile(r"^(?:[〇○◯×/\s]+|判断の理由|理由|回答|答え|解答|answer|reason)$", re.I)
 PERSONAL = re.compile(r"学籍|氏.?名|姓名|名前|student.?id|\bname\b", re.I)
+
+
+@contextmanager
+def document_lock(path):
+    try:
+        with FileLock(str(path), timeout=1):
+            yield
+    except Timeout as exc:
+        raise WorkflowError("另一项处理正在填入这份文档，请稍后重试；没有重复写入。") from exc
 
 
 def digest(value):
@@ -365,7 +375,7 @@ def fill_personal_document(
         raise WorkflowError("个人文档 ID 无效。")
     record_dir = require_private_path(record_dir)
     record_dir.mkdir(parents=True, exist_ok=True)
-    with FileLock(str(record_dir / "fill.lock"), timeout=1):
+    with document_lock(record_dir / "fill.lock"):
         if document_id not in own_document_ids(reader, course_id, assignment_id):
             raise PermissionDenied(
                 "只允许填入当前作业提交记录里的本人文档，不修改教师模板或课堂资料。"
