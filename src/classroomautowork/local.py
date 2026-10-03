@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -77,7 +78,15 @@ def atomic_json(path: Path, data: dict) -> None:
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
             json.dump(data, stream, ensure_ascii=False, indent=2)
             stream.write("\n")
-        os.replace(temporary, path)
+        for attempt in range(7):
+            try:
+                os.replace(temporary, path)
+                break
+            except PermissionError:
+                if sys.platform != "win32" or attempt == 6:
+                    raise
+                # Windows antivirus/indexers can briefly open a newly written progress file.
+                time.sleep(0.01 * 2**attempt)
     finally:
         Path(temporary).unlink(missing_ok=True)
 

@@ -8,3 +8,7 @@ class ConfigurationError(WorkflowError):
 
 class PermissionDenied(WorkflowError):
     pass
+
+
+class RunCancelled(WorkflowError):
+    """Stop at a safe processing boundary while preserving completed work."""

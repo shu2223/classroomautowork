@@ -2,7 +2,9 @@
 
 ```mermaid
 flowchart LR
-  S[Codex Skill / CLI / 启动器] --> W[Python workflow]
+  UI[本地前端：刷新 / 勾选 / 一键审核] --> J[持久 FrontendJobs]
+  J --> W[Python workflow]
+  S[Codex Skill / CLI] --> W
   W --> G[固定只读 GoogleReader]
   G --> C[Classroom / Drive]
   W --> T[SQLite 任务与来源索引]
@@ -22,6 +24,8 @@ from classroomautowork.workflow import prepare
 
 settings = Settings.load()  # Git 外的真实用户配置；OAuth 必须先完成
 result = prepare(settings, due_before="2026-10-10", progress=print)
+# 明确勾选的作业，不扩展到其他任务；重新读取本人提交状态后处理：
+# result = prepare(settings, targets=[("真实数字课程ID", "真实数字作业ID")])
 for package in result["packages"]:
     print(package["package"], package["can_draft"])
 ```
@@ -29,6 +33,22 @@ for package in result["packages"]:
 prepare 不依赖 argparse，不生成模型答案；连接、附件提取、检索与审核均可独立调用。
 GoogleReader 只公开明确读取方法，没有通用 HTTP 路由或由资料决定的方法名。
 测试可替换 reader，但生产 CLI 没有 fake/mock 成功模式。
+
+## 前端适配与任务
+
+webapp 只监听随机端口的 127.0.0.1。HTML/CSS/JS 都来自本机包，无 CDN。
+API 需要随机本机访问凭证，校验 Host，写操作同时校验 Origin；不接受命令、解释器、权限或任意文件路径。
+所有课程文字以 textContent 呈现，来源链接只作为用户手动打开的链接。
+
+FrontendJobs 把真实待办刷新时间和每批明确选择写入 Git 外的 ui/，一个助手实例只运行一个任务。
+资料准备复用 Store 的跨进程锁及内容缓存；safe-boundary 暂停不会被吞成附件错误。
+重启将未完成的前端记录标成 interrupted，用户重试时重新核对远端状态并复用已完成阶段。
+
+未知或禁止 AI 规则时保存原要求为 needs_user 检查并本地 finalize，不启动模型，不写假初稿。
+允许时 drafting.generate_review 调用本机 Codex CLI，提示通过 stdin 传递，不经过命令 shell。
+不改变模型、沙箱、审批、hook 或规则；程序再次 finalize 验证真实输出，失败不标成完成。
+审核复用要求文件校验值、当前来源与课程规则都仍匹配。预览/导出不暴露未核验初稿，规则变化后要求重新准备。
+ZIP 导出仅包含已知审核文件，拒绝跨目录链接；页面图像只读取已记录的 processed/ PNG。
 
 ## 缓存与恢复
 

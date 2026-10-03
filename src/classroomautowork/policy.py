@@ -31,6 +31,10 @@ class CoursePolicy:
             policy = cls(**json.loads(path.read_text(encoding="utf-8-sig")))
         except (TypeError, ValueError) as exc:
             raise ConfigurationError("Invalid private course configuration.") from exc
+        return policy.validated()
+
+    def validated(self) -> "CoursePolicy":
+        policy = self
         if policy.ai_use not in {"unknown", "forbidden", "limited", "allowed"}:
             raise ConfigurationError("Unknown course AI policy value.")
         if policy.ai_use != "unknown" and not policy.policy_evidence.strip():
@@ -49,6 +53,13 @@ class CoursePolicy:
         if not 72 <= policy.render_dpi <= 200:
             raise ConfigurationError("PDF preview resolution must be 72–200 DPI.")
         return policy
+
+    def save(self, data_dir: Path, course_id: str) -> Path:
+        if not course_id.isdigit():
+            raise ConfigurationError("Course ID must be numeric.")
+        path = require_private_path(data_dir / "courses" / (course_id + ".json"))
+        atomic_json(path, asdict(self.validated()))
+        return path
 
     def draft_gate(self) -> dict:
         return {

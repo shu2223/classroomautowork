@@ -17,7 +17,7 @@ SOURCE_DIRS = (
     "docs/",
     ".github/workflows/",
 )
-SUFFIXES = {".py", ".md", ".toml", ".yml", ".yaml", ".ps1", ".cmd"}
+SUFFIXES = {".py", ".md", ".toml", ".yml", ".yaml", ".ps1", ".cmd", ".vbs", ".html", ".js", ".css"}
 SECRET = re.compile(
     r"GOCSPX-[A-Za-z0-9_-]{10,}|AIza[0-9A-Za-z_-]{30,}|ya29\.[A-Za-z0-9_-]{20,}|-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY|[0-9]{5,}-[A-Za-z0-9_-]+\.apps\.googleusercontent\.com"
 )

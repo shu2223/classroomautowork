@@ -11,7 +11,7 @@ from pathlib import Path
 from .auth import credentials_for
 from .buzz import BuzzConfig, transcribe_media
 from .config import Settings
-from .errors import PermissionDenied, WorkflowError
+from .errors import ConfigurationError, PermissionDenied, RunCancelled, WorkflowError
 from .extract import extract_document, processor_identity
 from .google_read import GoogleReader, drive_attachments
 from .local import atomic_json, sha256_file, utc_now
@@ -194,6 +194,8 @@ def sync_course(
             store.replace_chunks(course_id, source_id, fingerprint([revision, processor]), chunks)
             readable.add(source_id)
             warnings.extend({"source": source_id, "error": x} for x in result.get("warnings", []))
+        except RunCancelled:
+            raise
         except WorkflowError as exc:
             warnings.append({"source": "file:" + file_id, "error": str(exc)})
     store.prune(course_id, readable)
@@ -291,32 +293,46 @@ def prepare(
     due_before: str | None = None,
     include_no_due=False,
     target: tuple[str, str] | None = None,
+    targets: list[tuple[str, str]] | None = None,
     defer_media=False,
     progress=None,
     extra_queries=(),
+    on_assignment=None,
 ) -> dict:
     """Public core entry point. CLI/UI adapters can call this without argparse or MCP."""
     settings = settings.validated()
+    if targets is not None and (target is not None or due_before is not None):
+        raise ConfigurationError("Select specific assignments or a date cutoff, not both.")
     require_connection(settings)
     credentials, _ = credentials_for(settings)
     reader = GoogleReader(credentials)
     with Store(settings.data_dir) as store:
-        if target:
-            course_id, assignment_id = target
-            own = next(
-                (
-                    x
-                    for x in reader.own_submissions(course_id)
-                    if x["courseWorkId"] == assignment_id
-                ),
-                None,
-            )
-            if not own or own.get("state") not in PENDING_STATES:
-                raise WorkflowError(
-                    "Selected assignment is not confirmed pending; inspect its submission state manually."
+        if target or targets is not None:
+            requested = [target] if target else targets
+            if (
+                not requested
+                or len(requested) > 200
+                or any(
+                    len(item) != 2 or not all(isinstance(x, str) and x.isdigit() for x in item)
+                    for item in requested
                 )
+            ):
+                raise ConfigurationError("Select 1–200 actual numeric course/assignment pairs.")
+            requested = list(dict.fromkeys(tuple(item) for item in requested))
+            states = {}
+            for course_id, assignment_id in requested:
+                if course_id not in states:
+                    if progress:
+                        progress(f"正在重新核对选中作业的提交状态：{course_id}")
+                    states[course_id] = {
+                        x["courseWorkId"]: x.get("state") for x in reader.own_submissions(course_id)
+                    }
+                if states[course_id].get(assignment_id) not in PENDING_STATES:
+                    raise WorkflowError(
+                        "Selected assignment is no longer confirmed pending; refresh the list before retrying."
+                    )
             selection = {
-                "assignments": [{"course_id": course_id, "assignment_id": assignment_id}],
+                "assignments": [{"course_id": cid, "assignment_id": aid} for cid, aid in requested],
                 "complete_discovery": True,
                 "needs_confirmation": [],
                 "inaccessible_courses": [],
@@ -335,6 +351,10 @@ def prepare(
         for item in selection["assignments"]:
             cid = item["course_id"]
             try:
+                if progress:
+                    progress(f"正在准备选中作业：{cid}/{item['assignment_id']}")
+                if on_assignment:
+                    on_assignment(item, {"status": "preparing"})
                 if cid not in courses:
                     if progress:
                         progress(f"Syncing course {cid}")
@@ -347,8 +367,14 @@ def prepare(
                 packages.append(
                     {"course_id": cid, "assignment_id": item["assignment_id"], **result}
                 )
+                if on_assignment:
+                    on_assignment(item, result)
+            except RunCancelled:
+                raise
             except WorkflowError as exc:
                 failures.append({**item, "error": str(exc)})
+                if on_assignment:
+                    on_assignment(item, {"status": "failed", "error": str(exc)})
         batch = {
             "status": "prepared_for_codex" if not failures else "partial",
             "finished_at": utc_now(),

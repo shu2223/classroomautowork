@@ -1,7 +1,8 @@
 # classroomautowork
 
 供本机 Codex 使用的 **Skill + Python 工具包 + 私人缓存/持久任务记录**。
-按本地截止日期筛选各课程的待完成作业，收集要求及同课程历史作业、资料和公告，
+通过本地前端刷新所有待完成作业，按课程、关键词或截止日期筛选，勾选后生成审核包。
+收集要求及同课程历史作业、资料和公告，
 处理有权下载的附件，再由 Codex 生成符合课程 AI 规定的初稿、要求检查表、来源证据和待确认问题。
 生成本地审核包后停止，由用户审阅并手动提交。
 
@@ -42,7 +43,27 @@ doctor、依赖安装和离线测试不能证明连接成功；prepare 在真实
 未指定验证作业时从真实待办选择一项；无附件时请指定带附件的真实作业。
 Classroom 待办总览链接不是作业详情 ID。
 
-## 一次启动处理截止日期前的作业
+## 本地前端：刷新 → 勾选 → 生成审核包
+
+Windows 双击 `scripts/start-ui.vbs`，自动打开浏览器界面，不显示命令行窗口。
+其他平台可运行 `classroomaw-ui` 或 `python -m classroomautowork.webapp` 打开同一前端。
+
+1. 点击“刷新待完成作业”：通过现有学校 OAuth 真实读取所有可访问的 ACTIVE 课程，包含无截止日期作业。显示上次实时刷新时间，访问失败与提交状态需确认的项目单独列出。
+2. 按课程、关键词或包含当天的截止日期筛选，逐项勾选或全选当前列表；筛选不会取消其他已经勾选的项目。
+3. 点击“一键生成审核包”：开始前重新核对**所选**作业的本人提交状态，同课程仅同步一次。页面实时显示资料准备、审核、失败和待确认状态。
+4. 点击“查看审核包”：在页面审阅原要求、初稿、要求检查表、待确认问题、真实来源及保留页图、资料缺口，也可下载文字审核包 ZIP。
+
+默认处理授权允许下载的录像并调用本地 Buzz；可明确取消“处理录像”，本轮缺少转录会保留在资料缺口中。
+已完成阶段及审核包会校验后复用；支持暂停、重试、关闭页面后继续查看和助手重启后恢复。
+“审核记录”保存每个批次的勾选项目、实时阶段、缓存统计和结果。
+
+每项作业旁的“课程规则”可填写教师实际 AI 规定、来源、允许用途、使用说明及你提供的真实个人事实，保存到 Git 外的私人配置。
+展开“附件处理上限”可调整单个附件的下载预算与 PDF 页数上限；较大录像会占用更多时间及磁盘。
+未知或禁止生成答案时，按钮只生成原要求的待确认检查表，清楚显示“待你确认”，不会将它标成已完成答案。
+允许的作业通过本机 Codex CLI + Skill 撰写并调用 finalize；沿用用户模型、沙箱、审批、hook 和规则，不设置绕过参数。
+本机服务只监听 127.0.0.1，随机端口及访问凭证仅保存于私人目录；跨站请求和任意本机文件读取被拒绝，不公开托管学校材料。
+
+## 可选 CLI：处理截止日期前的作业
 
 双击 scripts/start-review.cmd，输入包含当天的截止日期。
 启动器先运行只读资料准备，再调用本机 codex exec 读取缓存并生成审核包。
@@ -98,6 +119,9 @@ data_dir/
   snapshots/ attachments/ processed/
   review-packages/<course>/<assignment>/<revision>/
   latest-selection.json / latest-batch.json
+  ui/pending.json            前端真实待办及刷新时间
+  ui/jobs/<job-id>.json       所选作业、进度、失败与审核结果
+  ui/server.json             本机临时地址/访问凭证，不进入 Git
 ```
 
 首次同步生成默认课程配置，ai_use 为 unknown。用户按真实课程规定填写：
@@ -152,7 +176,8 @@ prepare 只完成资料包，不把空模板称为初稿。Skill 阅读真实资
 ## 开发与独立调用
 
 核心入口在 workflow.prepare、workflow.sync_course、extract.extract_document、
-buzz.transcribe_media、search.retrieve、review.finalize。CLI 是薄适配层；
+buzz.transcribe_media、search.retrieve、review.finalize。workflow.prepare 的 targets 参数接受明确作业选择并重新核对提交状态。
+ui_jobs.FrontendJobs 管理持久批次，drafting.generate_review 管理本机 Codex 与审核复用，webapp 仅为本机 HTTP 适配层。CLI 和 UI 复用核心；
 参见 [模块与持久化说明](docs/architecture.md)，以后可以增加适配器而不重写核心。
 
 ```powershell
@@ -164,7 +189,9 @@ uv sync --extra dev --frozen
 ```
 
 离线测试覆盖日期、本人状态/分页、权限撤销、缓存失效与恢复、文档实体、转录时间戳、
-规则、引文和个人事实检查。它们不能证明真实 OAuth、学校 API 或 Buzz 推理成功。
+规则、引文和个人事实检查；还覆盖所选作业隔离、提交状态变化、暂停、持久任务重试、
+Codex 子进程参数与结果核验、阻止未知 AI 规则的答案生成、前端本机访问与跨站边界、审核包导出。
+它们不能证明真实 OAuth、学校 API、模型生成或 Buzz 推理成功。
 
 ## 官方参考
 

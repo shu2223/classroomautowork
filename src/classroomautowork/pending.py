@@ -40,10 +40,13 @@ def discover_pending(
     due_before: str | None = None,
     timezone: str = "Asia/Tokyo",
     include_no_due: bool = False,
+    progress=None,
 ) -> dict:
     cutoff = cutoff_end(due_before, timezone) if due_before else None
     selected, ambiguous, inaccessible = [], [], []
     for course in reader.courses():
+        if progress:
+            progress(f"正在读取课程：{course.get('name') or course['id']}")
         try:
             assignments = reader.assignments(course["id"])
             submissions = {x["courseWorkId"]: x for x in reader.own_submissions(course["id"])}
