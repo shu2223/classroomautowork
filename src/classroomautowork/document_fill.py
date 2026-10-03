@@ -7,6 +7,7 @@ only this module constructs insertText requests, with revision guards and readba
 import hashlib
 import json
 import re
+import unicodedata
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
@@ -281,13 +282,21 @@ def verify_fill(before, after, plan):
     }
 
 
-def legacy_answers(document, draft):
+def legacy_answers(document, draft, *, original_text=None):
     """Migrate a real numbered ○/× draft into its exact existing worksheet layout.
 
     No generated answer, fake citation or generic Markdown dump is permitted here.
     Unrecognized layouts require structured model output instead.
     """
     fields = inspect_form(document)["fields"]
+    if original_text is not None:
+
+        def normalize(text):
+            return re.sub(r"\s+", "", unicodedata.normalize("NFKC", text))
+
+        source = normalize(original_text)
+        if any(normalize(f["context"]) not in source for f in fields):
+            raise WorkflowError("现有初稿的原题与当前文档不一致，请重新读取要求；未修改文档。")
     rows = re.findall(r"(?m)^\|\s*(\d+)\s*\|\s*([〇○◯×])\s*\|\s*([^\n]+)\|\s*$", draft)
     numbered = {
         int(n): (mark, re.sub(r"\s*\[E:[^\]]+\]", "", reason).strip()) for n, mark, reason in rows
@@ -472,8 +481,14 @@ def fill_review(settings, package, *, progress=lambda _: None):
         # One-time migration of previous real ○/× worksheet drafts. It is deterministic,
         # preserves model provenance and never manufactures an extra model invocation.
         if not answers and not structured:
+            requirements = json.loads((package / "requirements.json").read_text(encoding="utf-8"))
+            original_text = "\n".join(
+                s["text"] for s in requirements["sources"] if s.get("source_id") == "file:" + doc_id
+            )
             answers = legacy_answers(
-                docs.get(doc_id), (package / "draft.md").read_text(encoding="utf-8")
+                docs.get(doc_id),
+                (package / "draft.md").read_text(encoding="utf-8"),
+                original_text=original_text,
             )
         if not answers:
             raise WorkflowError("这份个人文档没有已核验的答案栏映射，初稿已保留。")

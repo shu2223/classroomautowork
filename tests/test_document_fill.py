@@ -8,6 +8,7 @@ import pytest
 from classroomautowork.document_fill import (
     fill_personal_document,
     inspect_form,
+    legacy_answers,
     plan_fill,
     verify_fill,
 )
@@ -310,3 +311,15 @@ def test_concurrent_fill_returns_retryable_message_without_any_write(tmp_path):
             record_dir=records,
         )
     assert docs.writes == 0
+
+
+def test_previous_draft_migration_checks_actual_original_questions():
+    document = native_document()
+    draft = "| 1 | 〇 | 理由一 [E:offline] |\n| 2 | × | 理由二 [E:offline] |\n## まとめ\n\n要約。\n"
+    original_text = "[1]例示された状況 [2]別の状況 ■まとめ"
+    migrated = legacy_answers(document, draft, original_text=original_text)
+    assert len(migrated) == 5 and all("[E:" not in a["text"] for a in migrated)
+    with pytest.raises(WorkflowError, match="原题"):
+        legacy_answers(
+            document, draft, original_text=original_text.replace("例示された状況", "変更された状況")
+        )
