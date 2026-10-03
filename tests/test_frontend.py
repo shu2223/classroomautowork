@@ -7,6 +7,7 @@ import sys
 import threading
 import zipfile
 from http.client import HTTPConnection
+from pathlib import Path
 
 import pytest
 from test_workflow import ReaderFixture, prepared_fixture
@@ -79,69 +80,108 @@ def test_pause_is_not_swallowed_as_an_attachment_warning(tmp_path):
         workflow.sync_course(ReaderFixture(), unit_settings(tmp_path), store, "1", progress=cancel)
 
 
-def test_unknown_rule_generates_real_checks_without_invoking_codex(tmp_path, monkeypatch):
-    package, _, _, _ = prepared_fixture(tmp_path, "unknown")
+@pytest.mark.parametrize("policy", ["unknown", "allowed", "forbidden"])
+def test_unchecked_ai_never_invokes_codex_even_if_course_allows_it(tmp_path, monkeypatch, policy):
+    package, _, _, _ = prepared_fixture(tmp_path, policy)
     monkeypatch.setattr(
-        drafting, "codex_command", lambda: pytest.fail("Unknown policy must not launch Codex")
+        drafting, "codex_command", lambda: pytest.fail("Unchecked must not launch Codex")
     )
-    receipt = drafting.generate_review(package)
+    receipt = drafting.generate_review(package, ai_confirmed=False)
     assert receipt["status"] == "needs_user_input" and receipt["draft_sha256"] is None
     review = json.loads((package / "review.json").read_text(encoding="utf-8"))
     requirements = json.loads((package / "requirements.json").read_text(encoding="utf-8"))
     assert [x["requirement"] for x in review["requirement_checks"]] == [
         x["text"] for x in requirements["sources"]
     ]
+    generation = json.loads((package / "codex-generation.json").read_text())
+    assert generation["status"] == "not_invoked" and generation["thread_id"] is None
     assert all(x["status"] == "needs_user" for x in review["requirement_checks"])
-    assert review["questions"]
-    assert drafting.generate_review(package)["reused"]
 
 
-def test_codex_process_contract_keeps_configuration_and_validates_output(tmp_path, monkeypatch):
-    package, review, draft, _ = prepared_fixture(tmp_path)
+def offline_rpc(tmp_path, monkeypatch, package, review):
+    """Protocol fixture, never counted as an actual model or OAuth validation."""
     runtime = tmp_path / "runtime"
     skill = runtime / "skill"
-    skill.mkdir(parents=True)
-    (skill / "SKILL.md").write_text("Unit skill", encoding="utf-8")
+    (skill / "references").mkdir(parents=True)
+    (skill / "SKILL.md").write_text("Offline unit skill", encoding="utf-8")
+    (skill / "references/review-format.md").write_text("Offline format", encoding="utf-8")
     atomic_json(runtime / "runtime.json", {"skill": str(skill)})
     monkeypatch.setattr(drafting, "state_root", lambda: runtime)
-    script = tmp_path / "offline_codex_fixture.py"
+    result = {
+        "review": review,
+        "draft": (package / "draft.md").read_text(encoding="utf-8"),
+        "summary": "Offline unit result",
+        "requirements_complete": True,
+        "missing_sources": [],
+        "used_evidence_ids": review["claim_checks"][0]["evidence_ids"],
+    }
+    atomic_json(tmp_path / "fixture-result.json", result)
+    script = tmp_path / "offline_rpc.py"
     script.write_text(
-        "import json, pathlib, sys\n"
-        "prompt = sys.stdin.read()\n"
-        "p = pathlib.Path(sys.argv[sys.argv.index('--cd')+1])\n"
-        "(p/'review.json').write_bytes((p/'model-review.json').read_bytes())\n"
-        "(p/'unit-command.json').write_text(json.dumps(sys.argv))\n"
-        "print(json.dumps({'type':'item.completed','item':{'type':'command_execution'}}))\n",
+        "import json,pathlib,sys\n"
+        "root=pathlib.Path(__file__).parent\n"
+        "result=json.loads((root/'fixture-result.json').read_text(encoding='utf-8'))\n"
+        "def send(x): print(json.dumps(x),flush=True)\n"
+        "for line in sys.stdin:\n"
+        " r=json.loads(line); m=r.get('method'); p=r.get('params',{})\n"
+        " with (root/'requests.jsonl').open('a') as f: f.write(json.dumps(r)+'\\n')\n"
+        " if 'id' not in r: continue\n"
+        " if m=='initialize': answer={'userAgent':'offline-unit'}\n"
+        " elif m=='thread/start': answer={'thread':{'id':'unit-thread'},'model':p['model'],'modelProvider':'offline','reasoningEffort':p.get('config',{}).get('model_reasoning_effort')}\n"
+        " elif m=='turn/start': answer={'turn':{'id':'unit-turn'}}\n"
+        " else: answer={}\n"
+        " send({'id':r['id'],'result':answer})\n"
+        " if m=='turn/start':\n"
+        "  send({'method':'item/completed','params':{'threadId':'unit-thread','item':{'type':'agentMessage','text':json.dumps(result)}}})\n"
+        "  send({'method':'turn/completed','params':{'threadId':'unit-thread','turn':{'id':'unit-turn','status':'completed'}}})\n",
         encoding="utf-8",
     )
     monkeypatch.setattr(drafting, "codex_command", lambda: [sys.executable, str(script)])
-    result = drafting.generate_review(package)
+
+
+@pytest.mark.parametrize("policy", ["allowed", "unknown"])
+def test_checked_ai_uses_selected_model_preserves_permissions_and_reuses_only_valid_result(
+    tmp_path, monkeypatch, policy
+):
+    package, _, _, review = prepared_fixture(tmp_path, policy)
+    offline_rpc(tmp_path, monkeypatch, package, review)
+    result = drafting.generate_review(package, ai_confirmed=True, model="unit-model", effort="high")
     assert result["status"] == "ready_for_human_review"
-    command = json.loads((package / "unit-command.json").read_text())
-    assert command[-1] == "-" and "--json" in command
-    assert not set(command) & {
-        "-m",
-        "--model",
-        "--ignore-user-config",
-        "--ignore-rules",
-        "--dangerously-bypass-approvals-and-sandbox",
-        "--dangerously-bypass-hook-trust",
+    variant = Path(result["package"])
+    manifest = json.loads((variant / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["policy"]["ai_use"] == policy
+    assert manifest["ai_confirmation"] and manifest["policy"]["can_draft"]
+    requests = [json.loads(x) for x in (tmp_path / "requests.jsonl").read_text().splitlines()]
+    start = next(x["params"] for x in requests if x.get("method") == "thread/start")
+    assert start["model"] == "unit-model" and start["config"] == {"model_reasoning_effort": "high"}
+    assert not set(start) & {
+        "approvalPolicy",
+        "approvalsReviewer",
+        "sandbox",
+        "modelProvider",
+        "baseInstructions",
+        "developerInstructions",
     }
-    # An invalid changed draft is not reusable, even when a previous receipt exists.
-    draft.write_text("changed [E:invented]", encoding="utf-8")
-    assert drafting.reusable_review(package) is None
+    assert drafting.generate_review(package, ai_confirmed=True, model="unit-model", effort="high")[
+        "reused"
+    ]
+    (variant / "draft.md").write_text("changed [E:invented]", encoding="utf-8")
+    assert drafting.reusable_review(variant, model="unit-model", effort="high") is None
+
+
+def test_course_forbidden_blocks_even_when_user_checks_ai(tmp_path, monkeypatch):
+    package, _, _, _ = prepared_fixture(tmp_path, "forbidden")
+    monkeypatch.setattr(
+        drafting, "codex_command", lambda: pytest.fail("Forbidden must not launch Codex")
+    )
+    assert drafting.generate_review(package, ai_confirmed=True)["draft_sha256"] is None
 
 
 def test_cancel_terminates_the_owned_codex_process(tmp_path, monkeypatch):
-    package, _, _, _ = prepared_fixture(tmp_path)
-    skill = tmp_path / "skill"
-    skill.mkdir()
-    (skill / "SKILL.md").write_text("Unit", encoding="utf-8")
-    atomic_json(tmp_path / "runtime.json", {"skill": str(skill)})
-    monkeypatch.setattr(drafting, "state_root", lambda: tmp_path)
+    from classroomautowork import codex_rpc
+
     script = tmp_path / "idle_fixture.py"
     script.write_text("import time\ntime.sleep(30)\n", encoding="utf-8")
-    monkeypatch.setattr(drafting, "codex_command", lambda: [sys.executable, str(script)])
     processes, real_popen = [], subprocess.Popen
 
     def observe(*args, **kwargs):
@@ -149,13 +189,13 @@ def test_cancel_terminates_the_owned_codex_process(tmp_path, monkeypatch):
         processes.append(process)
         return process
 
-    monkeypatch.setattr(drafting.subprocess, "Popen", observe)
+    monkeypatch.setattr(codex_rpc.subprocess, "Popen", observe)
     cancel = threading.Event()
-    timer = threading.Timer(0.7, cancel.set)
+    timer = threading.Timer(0.5, cancel.set)
     timer.start()
     try:
         with pytest.raises(RunCancelled):
-            drafting.generate_review(package, cancelled=cancel.is_set)
+            codex_rpc.CodexClient([sys.executable, str(script)], cancelled=cancel.is_set)
     finally:
         timer.cancel()
     assert processes[0].poll() is not None
@@ -199,18 +239,73 @@ def test_persistent_job_retries_reuses_review_and_rejects_unlisted_selection(tmp
         return {"packages": [result], "cache": {"reused": 1, "processed": 0, "failed": 0}}
 
     monkeypatch.setattr(ui_jobs, "prepare", offline_prepare)
+    monkeypatch.setattr(
+        jobs, "models", lambda: pytest.fail("Materials-only jobs must not need Codex")
+    )
     with pytest.raises(WorkflowError, match="不在真实待办"):
         jobs.start_selected([{"course_id": "1", "assignment_id": "999"}])
     job = jobs.start_selected([{"course_id": "1", "assignment_id": "2"}])
     assert jobs.wait_idle()
-    assert jobs.job(job["id"])["items"][0]["status"] == "needs_user"
+    assert jobs.job(job["id"])["items"][0]["status"] == "materials_ready"
     restarted = FrontendJobs(unit_settings(tmp_path))
     repeated = restarted.retry(job["id"])
     assert restarted.wait_idle()
-    assert restarted.job(repeated["id"])["items"][0]["reused_review"]
+    assert restarted.job(repeated["id"])["ai_confirmed"] is False
+    assert restarted.job(repeated["id"])["items"][0]["status"] == "materials_ready"
     assert calls == [[("1", "2")], [("1", "2")]]
     # The fixture contained an old draft; an unvalidated draft must not appear in the UI.
     assert restarted.package_view(repeated["id"], "1:2")["text"]["draft.md"] == ""
+
+
+def test_http_ai_confirmation_rejects_text_and_retry_preserves_checked_choice(
+    local_server, monkeypatch
+):
+    jobs = local_server.jobs
+    monkeypatch.setattr(jobs, "_run", lambda _: None)
+    selection = [{"course_id": "1", "assignment_id": "2"}]
+    status, _, _ = request(
+        local_server,
+        "/api/review",
+        method="POST",
+        origin=local_server.origin,
+        body={"selected": selection, "ai_confirmed": "true"},
+    )
+    assert status == 400 and not jobs.bootstrap()["jobs"]
+    atomic_json(
+        jobs.root / "codex-models.json",
+        {
+            "default_model": "unit-model",
+            "default_effort": "high",
+            "models": [
+                {"model": "unit-model", "supportedReasoningEfforts": [{"reasoningEffort": "high"}]}
+            ],
+        },
+    )
+    job = jobs.start_selected(selection, ai_confirmed=True, model="unit-model", effort="high")
+    jobs._jobs[job["id"]]["status"] = "failed"
+    jobs._active = None
+    repeated = jobs.retry(job["id"])
+    assert (
+        repeated["ai_confirmed"]
+        and repeated["model"] == "unit-model"
+        and repeated["effort"] == "high"
+    )
+    jobs._active = None
+
+
+def test_approval_accepts_only_current_user_choice(local_server):
+    jobs = local_server.jobs
+    identifier, approval_id = "c" * 32, "d" * 32
+    jobs._jobs[identifier] = {"approval": {"id": approval_id}}
+    jobs._active = identifier
+    with pytest.raises(WorkflowError):
+        jobs.approve(identifier, "e" * 32, "accept")
+    with pytest.raises(WorkflowError):
+        jobs.approve(identifier, approval_id, "acceptForSession")
+    assert jobs.approve(identifier, approval_id, "decline")["status"] == "answered"
+    with pytest.raises(WorkflowError):
+        jobs.approve(identifier, approval_id, "accept")
+    jobs._active = None
 
 
 def test_restart_marks_live_records_interrupted_and_suppresses_private_errors(

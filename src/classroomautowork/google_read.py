@@ -221,26 +221,65 @@ class GoogleReader:
             raise
 
 
+def drive_link(url: str) -> dict | None:
+    """Parse a reference, never fetch a URL supplied by course text."""
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return None
+    if parsed.scheme != "https" or parsed.hostname not in {"drive.google.com", "docs.google.com"}:
+        return None
+    match = re.search(
+        r"/(?:file|document|presentation|spreadsheets)/d/([A-Za-z0-9_-]+)", parsed.path
+    )
+    query = parse_qs(parsed.query)
+    identity = match[1] if match else query.get("id", [""])[0]
+    if re.fullmatch(r"[A-Za-z0-9_-]{10,200}", identity):
+        return {"id": identity, "resourceKey": query.get("resourcekey", [None])[0]}
+    return None
+
+
+def attachment_metadata(reader, reference: dict) -> dict:
+    """Resolve the authenticated ID or its actual Google link, including Drive shortcuts."""
+    candidates = [(reference["id"], reference.get("resourceKey"))]
+    alternate = drive_link(reference.get("alternateLink", ""))
+    if alternate and alternate["id"] != reference["id"]:
+        candidates.append((alternate["id"], alternate.get("resourceKey")))
+    last_error = None
+    for identity, resource_key in candidates:
+        try:
+            metadata = reader.file_metadata(identity, resource_key)
+            seen = {identity}
+            for _ in range(3):
+                if metadata.get("mimeType") != "application/vnd.google-apps.shortcut":
+                    return metadata
+                target = metadata.get("shortcutDetails", {})
+                identity = target.get("targetId")
+                if not identity or identity in seen:
+                    raise WorkflowError("Drive shortcut has a missing or circular target.")
+                seen.add(identity)
+                metadata = reader.file_metadata(identity, target.get("targetResourceKey"))
+            raise WorkflowError("Drive shortcut resolution exceeded the bounded limit.")
+        except PermissionDenied as exc:
+            last_error = exc
+    raise last_error or WorkflowError("No authenticated attachment reference could be read.")
+
+
 def drive_attachments(item: dict):
-    for material in item.get("materials", []):
-        file = material.get("driveFile", {}).get("driveFile")
+    materials = [
+        *item.get("materials", []),
+        *item.get("assignmentSubmission", {}).get("attachments", []),
+    ]
+    for material in materials:
+        wrapper = material.get("driveFile", {})
+        file = wrapper.get("driveFile", wrapper)
         if file and file.get("id"):
             yield file
-        url = material.get("link", {}).get("url", "")
-        parsed = urlparse(url)
-        if parsed.scheme != "https" or parsed.hostname not in {
-            "drive.google.com",
-            "docs.google.com",
-        }:
-            continue
-        match = re.search(
-            r"/(?:file|document|presentation|spreadsheets)/d/([A-Za-z0-9_-]+)", parsed.path
-        )
-        query = parse_qs(parsed.query)
-        identity = match[1] if match else query.get("id", [""])[0]
-        if re.fullmatch(r"[A-Za-z0-9_-]{10,200}", identity):
-            yield {
-                "id": identity,
-                "title": material.get("link", {}).get("title"),
-                "resourceKey": query.get("resourcekey", [None])[0],
-            }
+        link = material.get("link", {})
+        if reference := drive_link(link.get("url", "")):
+            yield {**reference, "title": link.get("title")}
+    for url in re.findall(
+        r"https://[^\s<>\"']+", item.get("description", "") + " " + item.get("text", "")
+    ):
+        if reference := drive_link(url.rstrip("。，、）)]")):
+            yield reference

@@ -813,3 +813,21 @@ transition:none!important}
 .processing-settings>p{margin:5px 0 14px}
 .review-content details{font-size:11px;color:#81978a;margin-top:20px}
 .review-content details summary{cursor:pointer;margin-bottom:14px}
+
+.filters{flex-wrap:wrap}
+.filter-toggle{border:1px solid var(--border);border-radius:7px;padding:9px 12px;background:white;color:#718676;font-size:11px;white-space:nowrap}
+.filter-toggle[aria-pressed=true]{background:#edf5ef;color:var(--green);border-color:#b5d2be}
+.codex-settings{display:flex;align-items:center;flex-wrap:wrap;gap:16px;background:#fff;border:1px solid var(--border);border-radius:11px;padding:18px 22px;margin-bottom:22px}
+.codex-settings>div{flex:1;min-width:180px}
+.codex-settings strong{display:block;font-size:12px;margin-bottom:5px}
+.codex-settings label{display:flex;align-items:center;gap:8px;font-size:11px;color:#718676}
+.codex-settings select{border:1px solid var(--border);border-radius:7px;background:#fff;padding:8px;max-width:300px;font-size:11px}
+.generation-link{display:inline-flex;align-items:center;font-size:11px;margin-top:8px;overflow-wrap:anywhere}
+.approval-card{padding:16px;border:1px solid #dfc693;background:#fffcf3;border-radius:9px;margin-top:16px}
+.approval-card pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:11px;max-height:180px;overflow:auto}
+.approval-actions{display:flex;flex-wrap:wrap;gap:10px;margin-top:12px}
+.job-item{flex-wrap:wrap}
+.job-model{flex-basis:100%;font-size:10px;color:#7d9485}
+@media(max-width:800px){.codex-settings{padding:15px;gap:12px}.codex-settings>div{min-width:100%;}.codex-settings label{flex:1;min-width:130px;flex-direction:column;align-items:stretch}.codex-settings select{max-width:100%;width:100%}}
+
+.ai-choice{display:flex;flex-wrap:wrap;align-items:center;gap:12px;margin:0 0 14px;padding:15px 20px;background:#edf5ef;border:1px solid #b5d2be;border-radius:9px}.ai-choice .checkbox-label{font-size:13px;font-weight:600;color:var(--green)}.policy-fields details>summary{cursor:pointer;padding:12px 0}.ai-choice input{accent-color:var(--green)}

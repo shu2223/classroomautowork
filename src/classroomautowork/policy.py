@@ -8,6 +8,21 @@ from .errors import ConfigurationError
 from .local import atomic_json, require_private_path
 
 
+def confirmed_gate(course_gate: dict, confirmed: bool) -> dict:
+    """A local user choice permits this run; it never invents teacher permission."""
+    if type(confirmed) is not bool:
+        raise ConfigurationError("AI 确认选项必须是勾选或未勾选。")
+    gate = dict(course_gate)
+    gate["can_draft"] = confirmed and gate["ai_use"] != "forbidden"
+    gate["unconfirmed_drafting"] = confirmed and gate["ai_use"] == "unknown"
+    gate["user_drafting_instruction"] = (
+        "用户在本次任务中勾选：我已确认所选作业可以使用 AI。遵守已知教师限制；教师规定来源仍保持原记录。"
+        if confirmed
+        else ""
+    )
+    return gate
+
+
 @dataclass(frozen=True)
 class CoursePolicy:
     ai_use: str = "unknown"  # unknown / forbidden / limited / allowed
@@ -15,6 +30,8 @@ class CoursePolicy:
     limitations: str = ""
     disclosure: str = ""
     personal_facts: list[str] = field(default_factory=list)
+    unconfirmed_drafting: bool = False
+    user_drafting_instruction: str = ""
     max_attachment_bytes: int = 536870912
     max_pdf_pages: int = 1000
     render_dpi: int = 110
@@ -41,6 +58,16 @@ class CoursePolicy:
             raise ConfigurationError("A known AI policy requires the user's source evidence.")
         if policy.ai_use == "limited" and not policy.limitations.strip():
             raise ConfigurationError("Limited AI use requires explicit limits.")
+        if type(policy.unconfirmed_drafting) is not bool or not isinstance(
+            policy.user_drafting_instruction, str
+        ):
+            raise ConfigurationError(
+                "Unknown-rule preference must come from the user's local configuration."
+            )
+        if policy.unconfirmed_drafting and not policy.user_drafting_instruction.strip():
+            raise ConfigurationError(
+                "Drafting with unconfirmed teacher rules requires the user's explicit instruction."
+            )
         if not isinstance(policy.personal_facts, list) or not all(
             isinstance(x, str) for x in policy.personal_facts
         ):
@@ -64,10 +91,13 @@ class CoursePolicy:
     def draft_gate(self) -> dict:
         return {
             "ai_use": self.ai_use,
-            "can_draft": self.ai_use in {"allowed", "limited"},
+            "can_draft": self.ai_use in {"allowed", "limited"}
+            or (self.ai_use == "unknown" and self.unconfirmed_drafting),
+            "unconfirmed_drafting": self.unconfirmed_drafting,
+            "user_drafting_instruction": self.user_drafting_instruction,
             "policy_evidence": self.policy_evidence,
             "limitations": self.limitations,
             "disclosure": self.disclosure,
             "personal_facts": self.personal_facts,
-            "reason": "Check course and assignment rules before drafting. Unknown or forbidden policy blocks an answer draft.",
+            "reason": "Follow actual teacher rules. Unknown rules permit a draft only with an explicit local user instruction; never relabel them as teacher permission.",
         }

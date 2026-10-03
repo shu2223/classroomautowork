@@ -147,7 +147,7 @@ class ReaderFixture:
                 "materials": [
                     {
                         "driveFile": {
-                            "driveFile": {"id": "unit-file", "thumbnailUrl": self.thumbnail}
+                            "driveFile": {"id": "unit-file-01", "thumbnailUrl": self.thumbnail}
                         }
                     }
                 ],
@@ -192,8 +192,64 @@ def test_live_metadata_gate_before_reuse_and_changed_revision(tmp_path):
         assert any("revision 2" in c["text"] for c in store.chunks("1"))
         reader.denied = True
         result = sync_course(reader, settings, store, "1")
-        assert not any(c["source_id"] == "file:unit-file" for c in store.chunks("1"))
+        assert not any(c["source_id"] == "file:unit-file-01" for c in store.chunks("1"))
         assert "no cached attachment" in result["warnings"][0]["error"]
+
+
+def test_own_document_is_required_alternate_id_retries_and_unranked_lecture_stays_searchable(
+    tmp_path,
+):
+    from classroomautowork.errors import PermissionDenied
+
+    class OwnDocumentReader(ReaderFixture):
+        reads = []
+
+        def assignments(self, cid):
+            assignment = super().assignments(cid)[0]
+            assignment["materials"][0]["driveFile"] = {
+                "shareMode": "STUDENT_COPY",
+                "driveFile": {
+                    "id": "unit-denied-template",
+                    "alternateLink": "https://docs.google.com/document/d/unit-reachable-template/edit",
+                },
+            }
+            return [assignment]
+
+        def course_materials(self, _):
+            return [{"id": "9", "title": "Unmatched lecture", "description": "量子力学"}]
+
+        def file_metadata(self, file, key=None):
+            self.reads.append(file)
+            if file == "unit-denied-template":
+                raise PermissionDenied("Offline denied")
+            return super().file_metadata(file, key)
+
+    reader = OwnDocumentReader()
+    submission = {
+        "id": "own-unit",
+        "courseWorkId": "2",
+        "assignmentSubmission": {
+            "attachments": [
+                {
+                    "driveFile": {
+                        "id": "unit-own-document",
+                        "alternateLink": "https://docs.google.com/document/d/unit-own-document/edit",
+                    }
+                }
+            ]
+        },
+    }
+    settings = SimpleNamespace(data_dir=tmp_path)
+    with Store(tmp_path) as store:
+        course = sync_course(reader, settings, store, "1", submissions=[submission])
+        result = prepare_assignment(settings, store, course, "2")
+    package = Path(result["package"])
+    requirements = json.loads((package / "requirements.json").read_text(encoding="utf-8"))
+    evidence = json.loads((package / "evidence.json").read_text(encoding="utf-8"))
+    assert any(x["source_id"] == "file:unit-own-document" for x in requirements["sources"])
+    assert any(x["source_id"] == "material:9" for x in evidence["sources"])
+    assert "unit-denied-template" in reader.reads and "unit-reachable-template" in reader.reads
+    assert not course["warnings"]
 
 
 def prepared_fixture(root, ai_use="allowed"):
@@ -209,7 +265,7 @@ def prepared_fixture(root, ai_use="allowed"):
     package = Path(result["package"])
     sources = json.loads((package / "evidence.json").read_text(encoding="utf-8"))["sources"]
     requirement = next(c for c in sources if c["source_id"] == "coursework:2")
-    evidence = next(c for c in sources if c["source_id"] == "file:unit-file")
+    evidence = next(c for c in sources if c["source_id"] == "file:unit-file-01")
     review = {
         "requirement_checks": [
             {

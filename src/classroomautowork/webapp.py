@@ -17,7 +17,7 @@ from filelock import FileLock, Timeout
 
 from .config import Settings
 from .errors import WorkflowError
-from .local import atomic_json
+from .local import atomic_json, require_private_path, sha256_file
 from .ui_jobs import FILES, FrontendJobs, read_json
 
 ASSETS = Path(__file__).parent / "web"
@@ -74,19 +74,32 @@ class LocalHandler(BaseHTTPRequestHandler):
 
     def _guard(self, mutation=False):
         if self.headers.get("Host") != urlparse(self.server.origin).netloc:
-            self._send(403, {"error": "只允许访问本机助手地址。"})
+            self._deny(403, "只允许访问本机助手地址。")
             return False
         token = self.headers.get("Authorization", "")
         if not secrets.compare_digest(
             token.encode("utf-8"), ("Bearer " + self.server.token).encode("utf-8")
         ):
-            self._send(401, {"error": "页面没有本机访问凭证，请重新打开作业助手快捷方式。"})
+            self._deny(401, "页面没有本机访问凭证，请重新打开作业助手快捷方式。")
             return False
         origin = self.headers.get("Origin")
         if (mutation and origin != self.server.origin) or (origin and origin != self.server.origin):
-            self._send(403, {"error": "拒绝外部网页请求。"})
+            self._deny(403, "拒绝外部网页请求。")
             return False
         return True
+
+    def _deny(self, status, message):
+        # Drain a bounded body so Windows delivers the rejection instead of resetting
+        # a socket with unread request bytes. Never parse rejected request content.
+        if self.command in {"POST", "PUT"}:
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if 0 < length <= 1_000_000:
+                    self.connection.settimeout(1)
+                    self.rfile.read(length)
+            except (ValueError, OSError):
+                pass
+        self._send(status, {"error": message})
 
     def _body(self):
         if self.headers.get("Content-Type", "").split(";")[0] != "application/json":
@@ -122,6 +135,8 @@ class LocalHandler(BaseHTTPRequestHandler):
                 result = {"app": "classroomautowork", "status": "running"}
             elif path == "/api/bootstrap":
                 result = jobs.bootstrap()
+            elif path == "/api/codex/models":
+                result = jobs.models()
             elif match := re.fullmatch(r"/api/jobs/([a-f0-9]{32})", path):
                 result = jobs.job(match[1])
             elif match := re.fullmatch(r"/api/policies/([0-9]+)", path):
@@ -134,7 +149,25 @@ class LocalHandler(BaseHTTPRequestHandler):
                     archive = io.BytesIO()
                     with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as out:
                         total = 0
+                        generation = view.get("generation") or {}
+                        instruction = (
+                            "Classroom 本机资料与结果包\n\n"
+                            + (
+                                "包含实际 AI 初稿：先阅读 draft.md、checklist.md、questions.md，核对来源，再由你手动把认可的内容填入个人 Google 文档并提交。\n"
+                                if view["text"]["draft.md"]
+                                and generation.get("status") == "completed"
+                                else "没有已核验的 AI 答案初稿。这份包用于查看已获取资料、题目、来源和待确认项，不能当作作业已经完成。\n"
+                            )
+                            + f"实际模型：{generation.get('model') or '没有已核验的模型记录'}\n会话：{generation.get('thread_id') or '没有实际会话记录'}\n"
+                            + "codex-generation.json 记录真实模型、回合、输入来源和页图摘要；evidence.json 保存引用证据。\n"
+                            + "sources/ 中为本次已授权下载、实际使用或当前作业必须的原文件/PDF 导出；pages/ 保留相应页图。\n"
+                            + "未知教师规定保持未确认，用户要求继续生成不会被写成教师已经允许。\n"
+                            + "所有内容仅供本机审阅；程序未填写 Google 文档、未提交、未留言。\n"
+                        )
+                        out.writestr("README.txt", instruction)
                         for name in sorted(FILES):
+                            if name == "README.txt":
+                                continue
                             if name == "draft.md" and not view["text"]["draft.md"]:
                                 continue
                             file = jobs.package_file(package, name)
@@ -143,6 +176,50 @@ class LocalHandler(BaseHTTPRequestHandler):
                                 if total > 50_000_000:
                                     raise WorkflowError("审核包文字过大，请在本机目录查看。")
                                 out.writestr(name, file.read_bytes())
+                        used_ids = set(generation.get("used_evidence_ids", []))
+                        chosen = {
+                            x["source_id"]
+                            for x in view["manifest"].get("source_index", [])
+                            if x.get("required") or used_ids.intersection(x.get("evidence_ids", []))
+                        }
+                        portable = []
+                        for source in view["manifest"].get("downloads", []):
+                            if "file:" + source["id"] not in chosen:
+                                continue
+                            file = require_private_path(Path(source["path"]))
+                            if (
+                                not file.is_relative_to(jobs.settings.data_dir / "attachments")
+                                or not re.fullmatch(r"[A-Za-z0-9_-]{10,200}", source["id"])
+                                or sha256_file(file) != source["sha256"]
+                            ):
+                                raise WorkflowError("原文件不在本次授权资料缓存中或内容已变化。")
+                            total += file.stat().st_size
+                            if total > 100_000_000:
+                                raise WorkflowError(
+                                    "审核资料超过 100MB，请在本机目录查看，或缩小本次资料范围。"
+                                )
+                            name = "sources/" + source["id"] + file.suffix
+                            out.writestr(name, file.read_bytes())
+                            portable.append(
+                                {
+                                    "title": source["title"],
+                                    "url": source.get("url"),
+                                    "file": name,
+                                    "sha256": source["sha256"],
+                                }
+                            )
+                        for source in view["evidence"]["sources"]:
+                            if source["source_id"] not in chosen or not source.get("image_path"):
+                                continue
+                            file = jobs.source_image(job_id, key, source["id"])
+                            total += file.stat().st_size
+                            if total > 100_000_000:
+                                raise WorkflowError("审核页图过大，请在本机预览。")
+                            out.writestr("pages/" + source["id"] + ".png", file.read_bytes())
+                        out.writestr(
+                            "portable-source-index.json",
+                            json.dumps(portable, ensure_ascii=False, indent=2),
+                        )
                     self._send(200, archive.getvalue(), "application/zip", attachment=True)
                     return
                 if action and action.startswith("image/"):
@@ -172,11 +249,19 @@ class LocalHandler(BaseHTTPRequestHandler):
                     raise WorkflowError("刷新请求不接受额外参数。")
                 result = jobs.refresh()
             elif path == "/api/review":
-                if set(payload) - {"selected", "defer_media"}:
+                if set(payload) - {"selected", "defer_media", "model", "effort", "ai_confirmed"}:
                     raise WorkflowError("生成请求包含不支持的参数。")
                 result = jobs.start_selected(
-                    payload.get("selected"), defer_media=payload.get("defer_media", False)
+                    payload.get("selected"),
+                    defer_media=payload.get("defer_media", False),
+                    model=payload.get("model"),
+                    effort=payload.get("effort"),
+                    ai_confirmed=payload.get("ai_confirmed", False),
                 )
+            elif match := re.fullmatch(r"/api/jobs/([a-f0-9]{32})/approval", path):
+                if set(payload) != {"id", "decision"}:
+                    raise WorkflowError("审批只接受当前请求 ID 与本次决定。")
+                result = jobs.approve(match[1], payload["id"], payload["decision"])
             elif match := re.fullmatch(r"/api/jobs/([a-f0-9]{32})/(pause|retry)", path):
                 if payload:
                     raise WorkflowError("任务操作不接受额外参数。")

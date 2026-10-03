@@ -6,7 +6,7 @@ from pathlib import Path
 
 from .errors import WorkflowError
 from .local import atomic_json, require_private_path, sha256_file, utc_now
-from .policy import CoursePolicy
+from .policy import CoursePolicy, confirmed_gate
 from .store import Store
 
 
@@ -23,7 +23,10 @@ def finalize(package: Path, review_path: Path, draft_path: Path | None = None) -
         raise WorkflowError("Use an actual prepared review-package directory.")
     root = package.parents[3]
     policy = CoursePolicy.load(root, manifest["course_id"])
-    if policy.draft_gate() != manifest["policy"]:
+    gate = policy.draft_gate()
+    if "ai_confirmation" in manifest:
+        gate = confirmed_gate(gate, manifest["ai_confirmation"])
+    if gate != manifest["policy"]:
         raise WorkflowError("Course policy changed since preparation; prepare the package again.")
     with Store(root) as store:
         current = {x["id"]: x for x in store.chunks(manifest["course_id"])}

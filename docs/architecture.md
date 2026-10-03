@@ -28,6 +28,13 @@ result = prepare(settings, due_before="2026-10-10", progress=print)
 # result = prepare(settings, targets=[("真实数字课程ID", "真实数字作业ID")])
 for package in result["packages"]:
     print(package["package"], package["can_draft"])
+
+# 用户明确确认 AI 后，独立调用生成模块；未确认默认只整理资料：
+from pathlib import Path
+from classroomautowork.drafting import generate_review
+
+receipt = generate_review(Path(result["packages"][0]["package"]),
+                          ai_confirmed=True, model="用户所选真实模型", effort="high")
 ```
 
 prepare 不依赖 argparse，不生成模型答案；连接、附件提取、检索与审核均可独立调用。
@@ -44,9 +51,10 @@ FrontendJobs 把真实待办刷新时间和每批明确选择写入 Git 外的 u
 资料准备复用 Store 的跨进程锁及内容缓存；safe-boundary 暂停不会被吞成附件错误。
 重启将未完成的前端记录标成 interrupted，用户重试时重新核对远端状态并复用已完成阶段。
 
-未知或禁止 AI 规则时保存原要求为 needs_user 检查并本地 finalize，不启动模型，不写假初稿。
-允许时 drafting.generate_review 调用本机 Codex CLI，提示通过 stdin 传递，不经过命令 shell。
-不改变模型、沙箱、审批、hook 或规则；程序再次 finalize 验证真实输出，失败不标成完成。
+AI 确认复选框默认 false，未勾选保存资料与原要求，不调用模型；禁用规则同样阻止生成。
+勾选后 drafting.generate_review 使用 CodexClient 的官方 app-server stdio 协议；从 model/list 与 config/read 读取目录和默认值，创建持久 thread，再用 turn/start 传入文本、实际页图、输出 schema 及用户选择的模型和强度。沿用现有权限、审批、hook 和规则；不覆盖 sandbox 或 approvalPolicy。
+用户确认写入任务及模型独立包的 ai_confirmation，不改写教师 ai_use 和来源；finalize 对当前课程规则应用相同本地确认后比较，课程修改会使旧结果失效。
+仅 turn/completed=completed、结构化输出和来源检查通过后标为初稿待审阅。codex-generation.json 保存实际模型、会话、回合、用量、来源及输入摘要；失败与暂停保留真实状态，不声称模型成功。
 审核复用要求文件校验值、当前来源与课程规则都仍匹配。预览/导出不暴露未核验初稿，规则变化后要求重新准备。
 ZIP 导出仅包含已知审核文件，拒绝跨目录链接；页面图像只读取已记录的 processed/ PNG。
 
