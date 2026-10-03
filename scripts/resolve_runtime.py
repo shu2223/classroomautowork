@@ -4,6 +4,7 @@ import json
 import sys
 from pathlib import Path
 
+from classroomautowork.config import Settings
 from classroomautowork.errors import ConfigurationError, WorkflowError
 from classroomautowork.local import require_private_path, state_root
 
@@ -24,7 +25,13 @@ def resolve_runtime() -> dict:
     settings = require_private_path(root / "settings.json")
     if not settings.is_file():
         raise ConfigurationError("Private settings missing; run classroomaw init.")
-    return {**config, "state_root": str(root), "settings_path": str(settings)}
+    validated = Settings.load(settings)
+    return {
+        **config,
+        "state_root": str(root),
+        "settings_path": str(settings),
+        "data_dir": str(validated.data_dir),
+    }
 
 
 if __name__ == "__main__":

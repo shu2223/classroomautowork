@@ -6,6 +6,7 @@ import shutil
 import sys
 from pathlib import Path
 
+from classroomautowork.config import Settings
 from classroomautowork.local import atomic_json, require_private_path, state_root
 
 
@@ -26,12 +27,17 @@ def main():
         source, destination, dirs_exist_ok=True, ignore=shutil.ignore_patterns("__pycache__")
     )
     root = state_root()
+    settings_path = root / "settings.json"
+    if settings_path.is_file():
+        # Persist resolved paths while this installer can see the MSIX virtual view.
+        # Ordinary terminals must be able to read the same credentials and cache.
+        Settings.load(settings_path).save(settings_path)
     runtime = {
         "python": sys.executable,
         "repository": str(repo),
         "skill": str(destination),
         "state_root": str(root),
-        "settings_path": str(root / "settings.json"),
+        "settings_path": str(settings_path),
     }
     atomic_json(root / "runtime.json", runtime)
     # This machine-local pointer stays outside the source skill and Git.

@@ -54,7 +54,14 @@ def test_powershell_launcher_bootstraps_with_empty_localappdata(tmp_path):
     local.atomic_json(
         private / "runtime.json", {"python": sys.executable, "skill": str(tmp_path / "skill")}
     )
-    local.atomic_json(private / "settings.json", {})
+    local.atomic_json(
+        private / "settings.json",
+        {
+            "school_email": "unit-test@example.invalid",
+            "client_json": str(private / "client.json"),
+            "data_dir": str(private / "data"),
+        },
+    )
     env = {
         **os.environ,
         "LOCALAPPDATA": str(tmp_path / "empty-appdata"),
@@ -79,3 +86,33 @@ def test_powershell_launcher_bootstraps_with_empty_localappdata(tmp_path):
     assert str(private / "settings.json") in result.stdout
     payload = json.loads(result.stdout[result.stdout.index("{") :])
     assert payload["oauth"] == "not_verified_by_doctor"
+
+
+def test_installer_persists_resolved_private_paths(tmp_path):
+    repo = Path(__file__).resolve().parents[1]
+    private = tmp_path / "private"
+    local.atomic_json(
+        private / "settings.json",
+        {
+            "school_email": "unit-test@example.invalid",
+            "client_json": str(private / "oauth/../client.json"),
+            "data_dir": str(private / "old/../data"),
+        },
+    )
+    result = subprocess.run(
+        [sys.executable, str(repo / "scripts/install_skill.py")],
+        env={
+            **os.environ,
+            "CLASSROOMAUTOWORK_HOME": str(private),
+            "CODEX_HOME": str(tmp_path / "codex"),
+        },
+        capture_output=True,
+        timeout=30,
+        encoding="utf-8",
+    )
+    assert result.returncode == 0, result.stderr
+    settings = json.loads((private / "settings.json").read_text(encoding="utf-8"))
+    assert settings["client_json"] == str((private / "client.json").resolve())
+    assert settings["data_dir"] == str((private / "data").resolve())
+    pointer = tmp_path / "codex/skills/classroom-assistant/runtime-location.json"
+    assert json.loads(pointer.read_text(encoding="utf-8"))["state_root"] == str(private.resolve())
