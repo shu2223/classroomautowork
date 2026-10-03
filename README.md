@@ -81,6 +81,10 @@ tiny/base/small/medium/large-v3 可选。tiny 适合快速验证；日语讲课�
 默认状态根目录为 %LOCALAPPDATA%\classroomautowork（Linux 使用 XDG 数据目录）。
 settings.json 的 data_dir 可指向其他 Git 外目录；全局 --config 可选择另一私人设置。
 Windows App 的环境变量可能指向 LocalCache，实际路径以 init 输出和 settings.json 为准。
+启动器自动寻找已安装配置，并向 Python/Skill 传递明确的私人根目录，兼容 Codex App 与普通终端。
+若存在内容不同的多套配置，请设置 CLASSROOMAUTOWORK_HOME 指向所需目录，避免选错账户。
+可用 `scripts\start-review.ps1 -DueBefore 2026-10-10 -ValidateOnly` 检查启动环境；
+`-PrepareOnly` 完成真实资料准备后停止，不启动 Codex 撰写。
 
 ```text
 state root/

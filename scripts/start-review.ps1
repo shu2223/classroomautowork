@@ -1,4 +1,4 @@
-﻿param([string]$DueBefore, [switch]$IncludeNoDue, [switch]$DeferMedia)
+﻿param([string]$DueBefore, [switch]$IncludeNoDue, [switch]$DeferMedia, [switch]$ValidateOnly, [switch]$PrepareOnly)
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()
 $OutputEncoding = [Console]::OutputEncoding
@@ -7,15 +7,29 @@ $caDate = [datetime]::MinValue
 if (-not [datetime]::TryParseExact($DueBefore, 'yyyy-MM-dd', [cultureinfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$caDate)) {
     throw '请输入有效的 YYYY-MM-DD 日期。'
 }
-$caRuntimePath = Join-Path $env:LOCALAPPDATA 'classroomautowork\runtime.json'
-$caRuntime = Get-Content -LiteralPath $caRuntimePath -Raw -Encoding UTF8 | ConvertFrom-Json
-$caArguments = @('-m', 'classroomautowork.cli', 'prepare', '--due-before', $DueBefore)
+$caBootstrap = Join-Path (Split-Path $PSScriptRoot -Parent) '.venv\Scripts\python.exe'
+if (-not (Test-Path -LiteralPath $caBootstrap)) { throw '本机 Python 环境不存在，请重新安装项目依赖。' }
+$caRuntimeJson = & $caBootstrap (Join-Path $PSScriptRoot 'resolve_runtime.py')
+if ($LASTEXITCODE -ne 0) { throw '无法定位本机配置。请使用项目 Python 重新运行 scripts/install_skill.py。' }
+$caRuntime = $caRuntimeJson | ConvertFrom-Json
+$env:CLASSROOMAUTOWORK_HOME = $caRuntime.state_root
+$caSettingsPath = $caRuntime.settings_path
+Write-Host "本机配置：$caSettingsPath"
+if ($ValidateOnly) {
+    & $caRuntime.python -m classroomautowork.cli --config $caSettingsPath doctor
+    if ($LASTEXITCODE -ne 0) { throw '本机环境检查失败。' }
+    exit 0
+}
+$caArguments = @('-m', 'classroomautowork.cli', '--config', $caSettingsPath, 'prepare', '--due-before', $DueBefore)
 if ($IncludeNoDue) { $caArguments += '--include-no-due' }
 if ($DeferMedia) { $caArguments += '--defer-media' }
 & $caRuntime.python @caArguments
 if ($LASTEXITCODE -ne 0) { throw '资料准备失败，请查看错误后重试。已完成阶段会保留。' }
-$caSettingsPath = Join-Path $env:LOCALAPPDATA 'classroomautowork\settings.json'
 $caSettings = Get-Content -LiteralPath $caSettingsPath -Raw -Encoding UTF8 | ConvertFrom-Json
+if ($PrepareOnly) {
+    Write-Host "资料准备完成：$($caSettings.data_dir)\latest-batch.json"
+    exit 0
+}
 if (-not (Get-Command codex -ErrorAction SilentlyContinue)) {
     Write-Host '资料已准备。请在 Codex 中调用 $classroom-assistant，读取 latest-batch.json 并生成审核包。'
     exit 0

@@ -6,7 +6,7 @@ import shutil
 import sys
 from pathlib import Path
 
-from classroomautowork.local import atomic_json, state_root
+from classroomautowork.local import atomic_json, require_private_path, state_root
 
 
 def main():
@@ -25,11 +25,22 @@ def main():
     shutil.copytree(
         source, destination, dirs_exist_ok=True, ignore=shutil.ignore_patterns("__pycache__")
     )
-    runtime = {"python": sys.executable, "repository": str(repo), "skill": str(destination)}
-    atomic_json(state_root() / "runtime.json", runtime)
+    root = state_root()
+    runtime = {
+        "python": sys.executable,
+        "repository": str(repo),
+        "skill": str(destination),
+        "state_root": str(root),
+        "settings_path": str(root / "settings.json"),
+    }
+    atomic_json(root / "runtime.json", runtime)
+    # This machine-local pointer stays outside the source skill and Git.
+    atomic_json(
+        require_private_path(destination / "runtime-location.json"), {"state_root": str(root)}
+    )
     print(
         json.dumps(
-            {"skill": str(destination), "runtime": str(state_root() / "runtime.json")},
+            {"skill": str(destination), "runtime": str(root / "runtime.json")},
             ensure_ascii=False,
         )
     )

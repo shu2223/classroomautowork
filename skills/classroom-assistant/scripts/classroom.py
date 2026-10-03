@@ -8,10 +8,19 @@ from pathlib import Path
 
 
 def main():
-    base = os.environ.get("LOCALAPPDATA") or os.environ.get("XDG_DATA_HOME")
-    root = (
-        Path(base) / "classroomautowork" if base else Path.home() / ".local/share/classroomautowork"
-    )
+    explicit = os.environ.get("CLASSROOMAUTOWORK_HOME")
+    pointer = Path(__file__).resolve().parents[1] / "runtime-location.json"
+    if explicit:
+        root = Path(explicit)
+    elif pointer.is_file():
+        root = Path(json.loads(pointer.read_text(encoding="utf-8"))["state_root"])
+    else:
+        base = os.environ.get("LOCALAPPDATA") or os.environ.get("XDG_DATA_HOME")
+        root = (
+            Path(base) / "classroomautowork"
+            if base
+            else Path.home() / ".local/share/classroomautowork"
+        )
     path = root / "runtime.json"
     if not path.is_file():
         print(
@@ -27,7 +36,9 @@ def main():
         )
         return 2
     return subprocess.call(
-        [str(interpreter), "-m", "classroomautowork.cli", *sys.argv[1:]], shell=False
+        [str(interpreter), "-m", "classroomautowork.cli", *sys.argv[1:]],
+        shell=False,
+        env={**os.environ, "CLASSROOMAUTOWORK_HOME": str(root)},
     )
 
 
