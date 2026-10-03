@@ -33,8 +33,12 @@ for package in result["packages"]:
 from pathlib import Path
 from classroomautowork.drafting import generate_review
 
-receipt = generate_review(Path(result["packages"][0]["package"]),
-                          ai_confirmed=True, model="用户所选真实模型", effort="high")
+receipt = generate_review(
+    Path(result["packages"][0]["package"]),
+    ai_confirmed=True,
+    model="用户所选真实模型",
+    effort="high",
+)
 ```
 
 prepare 不依赖 argparse，不生成模型答案；连接、附件提取、检索与审核均可独立调用。
