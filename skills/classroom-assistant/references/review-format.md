@@ -16,3 +16,5 @@
 `document_answers` 是前端结果 schema 的独立数组，不属于 `review.json`。每项复制原生答案栏的 document_id、field_id 和 context_sha256，并提供适合该栏的单段 text。内部证据标记保留在本机 draft/checklist 中，原文档只填写作业答案。写入后给出原文档审阅入口，证据包下载可选。
 
 `form_answers` 为原表单逐栏答案数组：form_url、entry_id、context_sha256 逐字复制程序字段；values 为原选项或文字，needs_user 和 review_note 单独记录审阅提示。原表单不放内部引用或审核说明。程序负责原生预填并打开，用户在原页面审阅和手动提交；不得将打开浏览器等同于已经回读或保存草稿。
+
+实际 `document_answers.text` 与 `form_answers.values` 中的新写正文不用「・」，用「、」或自然句子连接；原选项、专名、直接引文和可信身份原值不改。仅在当前作业明确要求引用时标注引用；未要求时绝不追加「参照：」「参考：」「出典：」、来源文件名、引用尾注或参考文献列表。正常句子中按题意说明讲义内容可以保留，不另外列来源。本机 draft/review 继续保留完整证据及页码/时间戳，审核解释和统一的真实性声明只放 questions/review_note，必要的事实限定留在相关答案句中。
