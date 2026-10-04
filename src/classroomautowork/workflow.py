@@ -17,6 +17,7 @@ from .google_read import GoogleReader, attachment_metadata, drive_attachments
 from .local import atomic_json, sha256_file, utc_now
 from .pending import PENDING_STATES, discover_pending
 from .policy import CoursePolicy
+from .progress import ProgressUpdate, report
 from .search import retrieve
 from .store import Store, artifact, fingerprint
 
@@ -109,7 +110,15 @@ def sync_course(
         ("announcement", reader.announcements),
     ):
         try:
+            report(
+                progress,
+                "正在读取同课程的"
+                + {"coursework": "历史作业", "material": "课程资料", "announcement": "公告"}[kind],
+                "course_sync",
+            )
             records.extend((kind, stable_source(item)) for item in fetch(course_id))
+        except RunCancelled:
+            raise
         except WorkflowError as exc:
             warnings.append({"source": kind, "error": str(exc)})
     records.extend(("submission", stable_source(item)) for item in submissions)
@@ -138,11 +147,36 @@ def sync_course(
                     "role": "student_document" if kind == "submission" else kind,
                 }
             )
-    for file_id, reference in attachments.items():
+    for number, (file_id, reference) in enumerate(attachments.items(), 1):
+        name = str(reference.get("title") or "课程附件")[:200]
+
+        context = {
+            "file_id": file_id,
+            "filename": name,
+            "attachment_index": number,
+            "attachment_total": len(attachments),
+        }
+
+        def file_progress(update, context=context):
+            details = dict(getattr(update, "details", {"stage": "attachment"}))
+            report(
+                progress,
+                f"{context['filename']} · {update}",
+                **{
+                    **details,
+                    "file_id": context["file_id"],
+                    "filename": context["filename"],
+                    "attachment_index": context["attachment_index"],
+                    "attachment_total": context["attachment_total"],
+                },
+            )
+
         try:
-            if progress:
-                progress(f"Checking attachment {file_id}")
+            file_progress(ProgressUpdate("正在核验访问权限与文件版本", "attachment"))
             metadata = attachment_metadata(reader, reference)
+            name = str(metadata["name"])[:200]
+            context["filename"] = name
+            file_progress(ProgressUpdate("已读取文件信息，正在检查缓存", "attachment"))
             resolved_id = metadata["id"]
             resolutions[file_id] = resolved_id
             if not metadata.get("capabilities", {}).get("canDownload"):
@@ -167,10 +201,15 @@ def sync_course(
             )
 
             def download(key, meta=metadata):
-                result = reader.download(meta, settings.data_dir / "attachments" / key[:24])
+                result = reader.download(
+                    meta,
+                    settings.data_dir / "attachments" / key[:24],
+                    **({"progress": file_progress} if progress else {}),
+                )
                 return {**result, "artifacts": [artifact(Path(result["path"]))]}
 
             raw = store.memo("drive-download", revision, download)
+            file_progress(ProgressUpdate("附件已取得，正在复核版本和下载权限", "attachment"))
             after = reader.file_metadata(resolved_id, metadata.get("resourceKey"))
             if metadata["version"] != after.get("version") or not after.get("capabilities", {}).get(
                 "canDownload"
@@ -205,14 +244,15 @@ def sync_course(
             def process(key, file=path, is_media=media, buzz_config=config):
                 destination = settings.data_dir / "processed" / key[:24]
                 return (
-                    transcribe_media(file, destination, store, buzz_config)
+                    transcribe_media(file, destination, store, buzz_config, progress=file_progress)
                     if is_media
-                    else extract_document(file, destination, policy)
+                    else extract_document(file, destination, policy, progress=file_progress)
                 )
 
             result = store.memo(
                 "media" if media else "document", [content_hash, processor], process
             )
+            file_progress(ProgressUpdate("内容已处理并缓存，继续下一份附件", "attachment_done"))
             source_id = "file:" + resolved_id
             chunks = [
                 {
@@ -482,7 +522,7 @@ def prepare(
                     on_assignment(item, {"status": "preparing"})
                 if cid not in courses:
                     if progress:
-                        progress(f"Syncing course {cid}")
+                        report(progress, "正在同步同课程资料、历史作业与公告", "course_sync")
                     if cid not in own_submissions:
                         own_submissions[cid] = reader.own_submissions(cid)
                     selected_ids = {

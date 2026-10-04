@@ -8,6 +8,62 @@ let token = location.hash.slice(1);
 if (token) { sessionStorage.setItem("classroom-access", token); history.replaceState(null, "", location.pathname); }
 else token = sessionStorage.getItem("classroom-access") || "";
 let polling = null, toastTimer = null;
+let pollInFlight = false;
+const connection = {lastSuccess: 0, error: null};
+
+// Pure progress presentation; exercised by offline state tests.
+function durationLabel(ms) { const s = Math.max(0, Math.floor(ms / 1000)); return s < 60 ? `${s} 秒` : s < 3600 ? `${Math.floor(s / 60)} 分 ${s % 60} 秒` : `${Math.floor(s / 3600)} 小时 ${Math.floor(s % 3600 / 60)} 分`; }
+function ageOf(at, now) { const value = Date.parse(at); return Number.isFinite(value) ? Math.max(0, now - value) : null; }
+function progressView(job, network, now = Date.now()) {
+  const items = job.items || [], p = job.progress || {}, active = activeStates.has(job.status);
+  const item = items.find(x => ["preparing", "prepared", "drafting", "filling_document"].includes(x.status)) || items.find(x => x.status === "waiting");
+  let stage = p.stage || (item?.status === "filling_document" ? "fill" : item?.status === "drafting" ? "ai" : "prepare");
+  if (job.kind === "fill") stage = "fill";
+  if (job.kind === "document_auth") stage = "authorization";
+  if (job.kind === "refresh") stage = "course_sync";
+  if (job.approval) stage = "approval";
+  if (!job.progress && !active && items.some(x => x.status === "failed" && x.generation?.turn_status === "completed")) stage = "validate";
+  const descriptions = {
+    prepare: ["准备题目与课堂资料", "读取作业要求、同课程资料、历史作业和公告；这一阶段还未调用 AI。"],
+    course_sync: ["同步课程内容", "读取学校账户内的课程记录，查找本次作业的来源。"],
+    attachment: ["核验课程附件", "检查文件权限、版本与缓存，只处理新增或修改的材料。"],
+    download: ["下载课程附件", "下载量来自真实收到的字节；大文件可能耗时，之后还要校验完整性。"],
+    download_verify: ["校验附件完整性", "核对下载大小和校验值，避免使用不完整文件。"],
+    extract: ["提取文档文字和页图", "逐页读取内容并保留必要图像，供 Codex 阅读题目与课堂资料。"],
+    transcribe: ["Buzz 正在本机转录录像", "分段识别语音并保存时间戳。单段处理期间计数可能暂时不变，完成后继续更新。"],
+    attachment_done: ["附件内容已准备", "材料已处理并缓存，继续检查其他附件。"],
+    document_inspect: ["读取个人文档的答案栏", "核对原题与表格，保留原有内容并确定可以填写的位置。"],
+    ai: ["Codex 正在阅读与作答", "使用所选模型分析真实题目和资料。AI 没有可测量的总百分比；显示实际活动与会话入口。"],
+    validate: ["核验 AI 结果", "检查来源、格式与题目完整性，通过后才填入文档。"],
+    fill: ["填写并回读 Google 文档", "填写个人作业的答案栏，回读核验后由你审阅并手动提交。"],
+    approval: ["等待你的操作审批", "请在作业助手查看具体请求并批准或拒绝；等待期间不会继续。"],
+    authorization: ["等待 Google 授权", "请在 Google 页面完成学校账户授权，然后返回助手。"],
+  };
+  let [title, explanation] = descriptions[stage] || descriptions.prepare;
+  const legacy = active && !job.approval && !job.progress && /^Checking attachment /.test(job.message || "");
+  if (legacy) { title = "正在处理课程附件"; explanation = "这次由旧版启动，未报告附件内部的子步骤。下载、提取或转录可能耗时，保持任务运行，无需重新开始。"; }
+  const ready = items.filter(x => ["document_ready", "document_needs_user"].includes(x.status)).length;
+  const failed = items.filter(x => x.status === "failed").length;
+  const finished = items.filter(x => ["ready", "document_ready", "document_needs_user", "needs_document", "needs_user", "materials_ready", "failed"].includes(x.status)).length;
+  const stepAt = job.approval?.requested_at || p.started_at || item?.stage_started_at || job.started_at || job.created_at;
+  const activityAt = p.activity_at || item?.generation?.activity_at || job.events?.at(-1)?.at || job.updated_at;
+  const silence = ageOf(activityAt, now);
+  const disconnected = !!network.error || !!(network.lastSuccess && now - network.lastSuccess > 12000);
+  let warning = null;
+  if (active && disconnected) warning = "暂时无法读取新状态；后台任务不一定停止。恢复连接后会自动重连，请先不要重复启动。";
+  else if (active && ["approval", "authorization"].includes(stage)) warning = explanation;
+  else if (active && silence !== null && silence >= (stage === "transcribe" ? 300000 : 120000)) warning = `已有 ${durationLabel(silence)} 没有新进展记录。${stage === "transcribe" ? "一段转录可能较慢，不能仅凭时间认定失败。" : "服务响应正常不代表这一步有进展，可展开处理记录核对。"}`;
+  let measurement = null;
+  if (active && Number.isFinite(p.current) && Number.isFinite(p.total) && p.total > 0 && p.current >= 0 && p.current <= p.total) {
+    const unit = {pages:"页", segments:"段"}[p.unit] || "项", format = v => p.unit === "bytes" ? `${(v / 1048576).toFixed(1)} MB` : String(v);
+    measurement = {value:p.current, max:p.total, text:p.unit === "bytes" ? `已下载 ${format(p.current)} / ${format(p.total)}` : `已完成 ${format(p.current)} / ${format(p.total)} ${unit}`};
+  }
+  if (!active) { title = failed && stage === "validate" ? "结果核验未通过" : labels[job.status] || job.status; explanation = failed ? `本次 ${failed} 项失败；请查看下方具体原因。失败项没有填入文档，可以在原助手补齐资料后重试。` : ready ? "请打开已填入的原文档审阅，最后由你手动提交。" : "请查看各项作业的结果与待处理事项。"; }
+  const index = !active && ready ? 3 : stage === "fill" ? 2 : ["ai", "validate", "approval"].includes(stage) ? 1 : 0;
+  const nowOrEnd = job.finished_at ? Date.parse(job.finished_at) : now;
+  return {active, title, explanation, stage, index, measurement, ready, failed, finished, total:items.length, filename:p.filename || null, attachments:p.attachment_total ? `课程附件 ${p.attachment_index}/${p.attachment_total}` : null, elapsed:ageOf(job.started_at || job.created_at, nowOrEnd), stepElapsed:ageOf(stepAt, nowOrEnd), silence, warning, disconnected, workerAlive:job.runtime?.worker_alive === true, legacy};
+}
+// End pure progress presentation.
 
 function node(tag, text, className) { const el = document.createElement(tag); if (text !== undefined) el.textContent = text; if (className) el.className = className; return el; }
 function icon(name) { const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg"); svg.setAttribute("class", "icon"); svg.setAttribute("aria-hidden", "true"); const use = document.createElementNS(svg.namespaceURI, "use"); use.setAttribute("href", "#i-" + name); svg.append(use); return svg; }
@@ -17,7 +73,13 @@ function toast(message) { clearTimeout(toastTimer); $("toast").textContent = mes
 async function api(path, method = "GET", body) {
   const options = {method, cache: "no-store", credentials: "omit", headers: {Authorization: "Bearer " + token}};
   if (body !== undefined) { options.headers["Content-Type"] = "application/json"; options.body = JSON.stringify(body); }
-  const response = await fetch(path, options);
+  const controller = method === "GET" ? new AbortController() : null;
+  if (controller) options.signal = controller.signal;
+  const timer = controller ? setTimeout(() => controller.abort(), path === "/api/codex/models" ? 90000 : 10000) : null;
+  let response;
+  try { response = await fetch(path, options); }
+  catch (error) { throw new Error(error.name === "AbortError" ? "本机状态读取超时，等待连接恢复。" : error.message); }
+  finally { clearTimeout(timer); }
   if (!response.ok) { const error = await response.json().catch(() => ({})); throw new Error(friendlyError(error.error || "本机连接失败，请重新打开助手。")); }
   return response.headers.get("Content-Type").includes("application/json") ? response.json() : response.blob();
 }
@@ -34,7 +96,7 @@ function filtered() {
   return (state.pending?.assignments || []).filter(item => (!state.hideOverdue || !overdue(item)) && (!course || item.course_id === course) && (!q || normalize((item.title || "") + " " + (item.course_name || "")).includes(q)) && (item.due_local ? (!date || localDay(item.due_local) <= date) : $("includeNoDue").checked));
 }
 function setButtons() {
-  const busy = !!state.active || state.busy; $("authorizeDocuments").disabled = busy; $("authorizeDocuments").hidden = state.documentsAuthorized; $("documentPermissionNote").textContent = state.documentsAuthorized ? "自动填入已授权：答案写入个人副本，你打开原文档审阅并手动提交。" : "首次填入需 Google Docs 读写授权。Google 授权范围涵盖可编辑文档；本程序只填入本人待完成作业副本。";
+  const busy = !!state.active || state.busy || !!state.monitorOnly; $("authorizeDocuments").disabled = busy; $("authorizeDocuments").hidden = state.documentsAuthorized; $("documentPermissionNote").textContent = state.documentsAuthorized ? "自动填入已授权：答案写入个人副本，你打开原文档审阅并手动提交。" : "首次填入需 Google Docs 读写授权。Google 授权范围涵盖可编辑文档；本程序只填入本人待完成作业副本。";
   $("refreshButton").disabled = busy; $("refreshButton").classList.toggle("spinner", !!state.active && state.jobs.find(x => x.id === state.active)?.kind === "refresh");
   $("generateButton").disabled = busy || !state.selected.size || ($("aiConfirmed").checked && (!state.models || state.modelsLoading));
   $("aiConfirmed").disabled = busy;
@@ -55,6 +117,7 @@ function renderCourseFilters() {
   $("courseCount").textContent = courses.size ? courses.size + " 门课程" : "等待刷新";
 }
 function renderDiscovery() {
+  if (state.monitorOnly) return;
   const pending = state.pending, omitted = pending?.needs_confirmation || [], failed = pending?.inaccessible_courses || [];
   $("notice").hidden = !failed.length;
   if (failed.length) $("notice").textContent = `${failed.length} 门课程读取失败，当前不是完整待办列表。请查看下方说明并重试刷新。`;
@@ -95,28 +158,59 @@ function renderPending() {
   renderDiscovery(); setButtons();
 }
 function updateJob(job) { const at = state.jobs.findIndex(x => x.id === job.id); if (at < 0) state.jobs.unshift(job); else state.jobs[at] = job; }
+function jobProgress(job) {
+  const v = progressView(job, connection), box = node("div", undefined, "job-live-detail");
+  box.dataset.jobId = job.id;
+  if (["review", "fill"].includes(job.kind) && job.ai_confirmed) {
+    const steps = node("ol", undefined, "job-steps");
+    for (const [i, title] of ["准备资料", "Codex 作答", "填入答案", "人工审阅"].entries()) { const step = node("li", undefined, i === v.index ? "current" : i < v.index ? "past" : ""); step.append(node("span", i < v.index ? "✓" : String(i + 1)), node("b", title)); steps.append(step); }
+    box.append(steps);
+  }
+  box.append(node("strong", v.title), node("p", v.explanation));
+  if (v.active) { const progress = node("progress", undefined, "job-progress"); progress.setAttribute("aria-label", v.measurement?.text || "当前步骤没有可测量的总进度"); if (v.measurement) { progress.max = v.measurement.max; progress.value = v.measurement.value; } else progress.classList.add("indeterminate"); box.append(progress, node("p", v.measurement?.text || "处理中 · 当前步骤没有可测量的总百分比", "job-measurement")); }
+  if (v.filename) box.append(node("p", `${v.attachments ? v.attachments + " · " : ""}${v.filename}`, "job-file"));
+  if (job.items.length) box.append(node("p", `已处理 ${v.finished}/${v.total} 项 · ${v.ready} 项已填入可审阅${v.failed ? ` · ${v.failed} 项失败` : ""}`, "small"));
+  if (v.active && !v.legacy) box.append(node("p", friendlyError(job.message), "job-current-message"));
+  const times = node("div", undefined, "job-times"); times.append(node("span", `总耗时 ${durationLabel(v.elapsed || 0)}`));
+  if (v.active) times.append(node("span", `本步骤 ${durationLabel(v.stepElapsed || 0)}`), node("span", v.silence === null ? "尚无处理记录" : `最近进展 ${durationLabel(v.silence)}前`), node("span", v.disconnected ? "状态连接中断 · 自动重连中" : `服务连接正常${v.workerAlive ? " · 工作线程仍在运行" : ""}`, "connection-status" + (v.disconnected ? " warning" : "")));
+  box.append(times);
+  const warning = node("p", v.warning || "", "job-warning"); warning.hidden = !v.warning; warning.setAttribute("role", "status"); box.append(warning);
+  return box;
+}
 function jobCard(job, full = false) {
   const card = node("section", undefined, full ? "history-card" : ""); const heading = node("div", undefined, "job-heading"), intro = node("div");
-  intro.append(node("h3", job.kind === "refresh" ? (activeStates.has(job.status) ? "正在同步真实待办" : "刷新待办 · " + labels[job.status]) : `所选 ${job.items.length} 项作业 · ${labels[job.status] || job.status}`), node("p", friendlyError(job.message)));
+  intro.append(node("h3", job.kind === "refresh" ? "同步真实待办" : job.kind === "document_auth" ? "Google 文档授权" : `所选 ${job.items.length} 项作业 · ${labels[job.status] || job.status}`));
   if (full) intro.append(node("span", dateLabel(job.created_at, true), "muted small")); heading.append(intro);
-  if (activeStates.has(job.status)) { const pause = button(job.status === "stopping" ? "正在暂停…" : "暂停", "button secondary small-button", () => jobAction(job.id, "pause")); pause.disabled = job.status === "stopping"; heading.append(pause); }
-  else if (job.kind === "review" || job.status !== "completed") heading.append(button("重试 / 继续", "button secondary small-button", () => jobAction(job.id, "retry")));
+  if (activeStates.has(job.status) && !state.monitorOnly) { const pause = button(job.status === "stopping" ? "正在暂停…" : "暂停", "button secondary small-button", () => jobAction(job.id, "pause")); pause.disabled = job.status === "stopping"; heading.append(pause); }
+  else if (!state.monitorOnly && (job.kind === "review" || job.status !== "completed")) heading.append(button("重试 / 继续", "button secondary small-button", () => jobAction(job.id, "retry")));
   card.append(heading);
-  if (activeStates.has(job.status)) { const progress = node("progress", undefined, "job-progress"); progress.max = Math.max(1, job.items.length * 2); const amount = job.items.reduce((n,x) => n + (x.package ? 1 : 0) + (["ready", "needs_user", "failed"].includes(x.status) ? 1 : 0), 0); if (amount) progress.value = amount; progress.setAttribute("aria-label", "审核进度"); card.append(progress); }
+  card.append(jobProgress(job));
   const items = node("div", undefined, "job-items");
   for (const item of job.items) { const row = node("div", undefined, "job-item"); const title = node("span", item.title || item.assignment_id); if (item.error) title.append(node("p", friendlyError(item.error))); row.append(title, pill(item.status)); if (item.package) row.append(button(item.status === "ready" ? "查看实际初稿" : "查看资料与分析", "text-button", () => openReview(job.id, keyOf(item)))); const g = item.generation; if (g?.thread_id) { const meta = node("div", undefined, "job-model"); meta.append(node("span", `实际模型 ${g.model} · ${g.reasoning_effort || "默认强度"} · ${g.status === "completed" ? "AI 回合完成" : g.status === "running" ? "正在生成" : "尚未成功"} `)); const link = codexLink(g); if (link) meta.append(link); row.append(meta); } else if (item.package) row.append(node("span", "资料已准备 · 没有已核验的 AI 生成记录", "job-model")); for (const d of item.document_fill?.documents || []) { const link = safeLink(d.url, "在原文档审阅 ↗", "button primary small-button"); if (link) row.prepend(link); } if (item.package && g?.status === "completed" && !["document_ready", "document_needs_user"].includes(item.status)) row.append(button("填入已有初稿", "text-button", () => action(`/api/jobs/${job.id}/items/${keyOf(item)}/fill`, {}))); items.append(row); } card.append(items);
-  if (job.approval) { const box = node("section", undefined, "approval-card"); box.append(node("h3", "Codex 请求本次操作审批"), node("p", job.approval.reason), node("pre", job.approval.command || job.approval.cwd), node("p", "此请求来自 Codex 的现有权限规则；批准仅适用于本次，不会扩大长期权限。")); const actions = node("div", undefined, "approval-actions"); for (const [choice, label] of [["accept", "批准本次"], ["decline", "拒绝"], ["cancel", "取消操作"]]) actions.append(button(label, "button secondary small-button", async () => { try { await api(`/api/jobs/${job.id}/approval`, "POST", {id: job.approval.id, decision: choice}); await pollJob(); } catch(error) { toast(error.message); } })); box.append(actions); card.append(box); }
-  if (job.cache) card.append(node("p", `复用 ${job.cache.reused} 个处理阶段 · 新增处理 ${job.cache.processed} · 失败 ${job.cache.failed}`, "small"));
-  if (job.events.length) { const details = node("details"), summary = node("summary", "查看处理记录"), events = node("div", undefined, "event-list"); for (const entry of job.events) { const line = node("div", undefined, "event-line"); line.append(node("time", new Date(entry.at).toLocaleTimeString("zh-CN", {hour: "2-digit", minute: "2-digit", second: "2-digit"})), node("span", entry.message)); events.append(line); } details.append(summary, events); card.append(details); }
+  if (job.approval && !state.monitorOnly) { const box = node("section", undefined, "approval-card"); box.append(node("h3", "Codex 请求本次操作审批"), node("p", job.approval.reason), node("pre", job.approval.command || job.approval.cwd), node("p", "此请求来自 Codex 的现有权限规则；批准仅适用于本次，不会扩大长期权限。")); const actions = node("div", undefined, "approval-actions"); for (const [choice, label] of [["accept", "批准本次"], ["decline", "拒绝"], ["cancel", "取消操作"]]) actions.append(button(label, "button secondary small-button", async () => { try { await api(`/api/jobs/${job.id}/approval`, "POST", {id: job.approval.id, decision: choice}); await pollJob(); } catch(error) { toast(error.message); } })); box.append(actions); card.append(box); }
+  if (job.cache) card.append(node("p", `资料缓存：复用 ${job.cache.reused} 个阶段 · 新增 ${job.cache.processed} · 缓存阶段失败 ${job.cache.failed}`, "small"));
+  if (job.events.length) { const details = node("details"), summary = node("summary", "查看处理记录"), events = node("div", undefined, "event-list"); for (const entry of job.events) { const line = node("div", undefined, "event-line"); line.append(node("time", new Date(entry.at).toLocaleTimeString("zh-CN", {timeZone: state.timezone || "Asia/Tokyo", hour: "2-digit", minute: "2-digit", second: "2-digit"})), node("span", entry.message)); events.append(line); } details.dataset.jobLog = job.id; details.append(summary, events); card.append(details); }
   return card;
 }
 function renderJobs() {
+  const expanded = new Set([...document.querySelectorAll("details[data-job-log][open]")].map(x => x.dataset.jobLog));
   const focus = state.jobs.find(x => x.id === (state.active || state.focus)); $("jobPanel").hidden = !focus || (focus.kind === "refresh" && ["completed", "completed_with_issues"].includes(focus.status)); $("jobPanel").replaceChildren(); if (!$("jobPanel").hidden) $("jobPanel").append(jobCard(focus));
   $("historyList").replaceChildren(); if (!state.jobs.length) $("historyList").append(node("div", "还没有审核记录。刷新待办并勾选作业后，这里会保留处理进度与结果。", "empty-state muted small"));
   for (const job of [...state.jobs].sort((a,b) => b.created_at.localeCompare(a.created_at))) $("historyList").append(jobCard(job, true)); setButtons();
+  for (const details of document.querySelectorAll("details[data-job-log]")) details.open = expanded.has(details.dataset.jobLog);
 }
+function updateProgressClock() {
+  for (const box of document.querySelectorAll(".job-live-detail")) {
+    const job = state.jobs.find(x => x.id === box.dataset.jobId); if (!job || !activeStates.has(job.status)) continue;
+    const v = progressView(job, connection), spans = box.querySelectorAll(".job-times span");
+    if (spans.length === 4) { spans[0].textContent = `总耗时 ${durationLabel(v.elapsed || 0)}`; spans[1].textContent = `本步骤 ${durationLabel(v.stepElapsed || 0)}`; spans[2].textContent = v.silence === null ? "尚无处理记录" : `最近进展 ${durationLabel(v.silence)}前`; spans[3].textContent = v.disconnected ? "状态连接中断 · 自动重连中" : `服务连接正常${v.workerAlive ? " · 工作线程仍在运行" : ""}`; spans[3].classList.toggle("warning", v.disconnected); }
+    const warning = box.querySelector(".job-warning"); warning.textContent = v.warning || ""; warning.hidden = !v.warning;
+  }
+}
+setInterval(updateProgressClock, 1000);
 async function loadState() {
-  const data = await api("/api/bootstrap"); state.documentsAuthorized = !!data.documents_authorized; state.pending = data.pending; state.jobs = data.jobs; state.policies = data.policies; state.active = data.active_job_id; state.timezone = data.timezone; $("accountEmail").textContent = data.account;
+  const data = await api("/api/bootstrap"); connection.lastSuccess = Date.now(); connection.error = null; state.monitorOnly = !!data.monitor_only; state.documentsAuthorized = !!data.documents_authorized; state.pending = data.pending; state.jobs = data.jobs; state.policies = data.policies; state.active = data.active_job_id; state.timezone = data.timezone; $("accountEmail").textContent = data.account;
+  if (state.monitorOnly) { document.body.classList.add("monitor-mode"); $("notice").hidden = false; $("notice").replaceChildren(node("span", "这是只读进度窗口，不会影响原任务。审批和作业操作请返回原作业助手。 ")); const back = node("a", "返回作业助手 ↗"); back.href = data.source_url; back.target = "_blank"; back.rel = "noopener noreferrer"; $("notice").append(back); }
   if (state.pending) { const available = new Set(state.pending.assignments.map(keyOf)); state.selected = new Set([...state.selected].filter(x => available.has(x))); }
   if (!state.focus) state.focus = state.jobs[0]?.id;
   renderCourseFilters(); renderPending(); renderJobs(); if (state.active) startPolling();
@@ -124,9 +218,12 @@ async function loadState() {
 function startPolling() { if (polling) return; polling = setInterval(pollJob, 1400); }
 async function pollJob() {
   if (!state.active) { clearInterval(polling); polling = null; return; }
-  try { const job = await api("/api/jobs/" + state.active); updateJob(job); renderJobs(); if (!activeStates.has(job.status)) { state.active = null; state.focus = job.id; await loadState(); renderPending(); if (job.kind === "refresh") toast(job.status === "failed" ? job.message : `已刷新 ${state.pending?.assignments.length || 0} 项真实待办`); else toast(job.message); } } catch (error) { toast(error.message); }
+  if (pollInFlight) return;
+  pollInFlight = true;
+  try { const job = await api("/api/jobs/" + state.active); connection.lastSuccess = Date.now(); connection.error = null; updateJob(job); renderJobs(); if (!activeStates.has(job.status)) { state.active = null; state.focus = job.id; await loadState(); renderPending(); if (job.kind === "refresh") toast(job.status === "failed" ? job.message : `已刷新 ${state.pending?.assignments.length || 0} 项真实待办`); else toast(job.message); } } catch (error) { connection.error = error.message; renderJobs(); } finally { pollInFlight = false; }
 }
 async function action(path, body) {
+  if (state.monitorOnly) { toast("这是只读进度窗口，请返回原作业助手操作。"); return; }
   if (state.busy) return; state.busy = true; setButtons();
   try { const job = await api(path, "POST", body); updateJob(job); state.active = activeStates.has(job.status) ? job.id : null; state.focus = job.id; renderJobs(); renderPending(); startPolling(); return job; } catch (error) { toast(error.message); } finally { state.busy = false; setButtons(); }
 }
@@ -170,7 +267,7 @@ $("policyForm").addEventListener("submit", async event => { event.preventDefault
 $("quitButton").addEventListener("click", async () => { try { await api("/api/shutdown", "POST", {}); $("notice").textContent = "助手已退出。下次双击快捷方式即可重新打开，任务记录与缓存会保留。"; $("notice").hidden = false; $("refreshButton").disabled = true; $("generateButton").disabled = true; $("quitButton").disabled = true; } catch (error) { toast(error.message); } });
 $("todayLabel").textContent = new Intl.DateTimeFormat("zh-CN", {year: "numeric", month: "long", day: "numeric", weekday: "short"}).format(new Date());
 if (!token) { $("notice").textContent = "请双击“Classroom 作业助手”快捷方式打开本机界面。此页面没有访问学校账户的本机凭证。"; $("notice").hidden = false; $("refreshButton").disabled = true; }
-else { loadState().catch(error => { $("notice").textContent = error.message; $("notice").hidden = false; toast(error.message); }); loadModels(); }
+else { loadState().catch(error => { $("notice").textContent = error.message; $("notice").hidden = false; toast(error.message); }).then(() => { if (!state.monitorOnly) loadModels(); else $("modelStatus").textContent = "只读进度窗口 · 本次实际模型见任务记录"; }); }
 
 $("authorizeDocuments").addEventListener("click", () => action("/api/documents/authorize", {}));
 $("fillDocumentButton").addEventListener("click", () => { const {jobId, key} = state.preview; $("reviewDialog").close(); action(`/api/jobs/${jobId}/items/${key}/fill`, {}); });

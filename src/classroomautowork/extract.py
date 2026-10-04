@@ -15,6 +15,7 @@ from pypdf import PdfReader
 
 from .errors import WorkflowError
 from .local import atomic_json
+from .progress import report
 from .store import artifact
 
 EXTRACTOR_VERSION = "documents-v1.2"
@@ -65,7 +66,8 @@ def _ooxml(path: Path, kind: str) -> list[dict]:
         return chunks
 
 
-def extract_document(path: Path, destination: Path, policy) -> dict:
+def extract_document(path: Path, destination: Path, policy, *, progress=None) -> dict:
+    report(progress, "正在打开文档并提取内容", "extract")
     destination.mkdir(parents=True, exist_ok=True)
     suffix = path.suffix.lower()
     images, warnings = [], []
@@ -80,6 +82,14 @@ def extract_document(path: Path, destination: Path, policy) -> dict:
         chunks = []
         with pdfium.PdfDocument(str(path)) as document:
             for number, page in enumerate(reader.pages, 1):
+                report(
+                    progress,
+                    f"正在提取第 {number}/{len(reader.pages)} 页文字和页图",
+                    "extract",
+                    current=number - 1,
+                    total=len(reader.pages),
+                    unit="pages",
+                )
                 text = (
                     (page.extract_text(extraction_mode="layout") or "")
                     if "/Contents" in page
@@ -103,6 +113,14 @@ def extract_document(path: Path, destination: Path, policy) -> dict:
                     warnings.append(
                         f"page {number}: little extractable text; inspect the retained image."
                     )
+                report(
+                    progress,
+                    f"已保留 {number}/{len(reader.pages)} 页文字和页图",
+                    "extract",
+                    current=number,
+                    total=len(reader.pages),
+                    unit="pages",
+                )
     elif suffix in {".docx", ".pptx"}:
         chunks = _ooxml(path, suffix)
         warnings.append("OOXML text extracted; diagrams/layout remain in the original attachment.")

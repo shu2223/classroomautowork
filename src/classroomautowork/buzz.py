@@ -5,6 +5,7 @@ Five-minute segments are separate persistent tasks, so a long recording resumes 
 """
 
 import json
+import math
 import os
 import re
 import shutil
@@ -16,6 +17,7 @@ import requests
 
 from .errors import ConfigurationError, WorkflowError
 from .local import atomic_json, require_private_path, sha256_file, state_root
+from .progress import report
 from .store import artifact, fingerprint
 
 
@@ -179,7 +181,10 @@ def parse_srt(text: str, offset: float = 0) -> list[dict]:
     return chunks
 
 
-def transcribe_media(path: Path, destination: Path, store, config: BuzzConfig) -> dict:
+def transcribe_media(
+    path: Path, destination: Path, store, config: BuzzConfig, *, progress=None
+) -> dict:
+    report(progress, "正在校验 Buzz 本地后端和模型", "transcribe")
     config.validated()
     destination.mkdir(parents=True, exist_ok=True)
     duration = float(
@@ -209,14 +214,32 @@ def transcribe_media(path: Path, destination: Path, store, config: BuzzConfig) -
         "media": media_hash,
     }
     chunks, artifacts = [], []
+    total = math.ceil(duration / config.segment_seconds)
     for start in range(0, int(duration) + 1, config.segment_seconds):
         if start >= duration:
             break
+        index = start // config.segment_seconds
+        report(
+            progress,
+            f"正在处理录像第 {index + 1}/{total} 段（{start:.0f}–{min(duration, start + config.segment_seconds):.0f} 秒）",
+            "transcribe",
+            current=index,
+            total=total,
+            unit="segments",
+        )
 
-        def segment(key, offset=start):
+        def segment(key, offset=start, index=index):
             folder = destination / key[:24]
             folder.mkdir(parents=True, exist_ok=True)
             wave = folder / "audio.wav"
+            report(
+                progress,
+                f"正在提取第 {index + 1}/{total} 段音轨",
+                "transcribe",
+                current=index,
+                total=total,
+                unit="segments",
+            )
             run_local(
                 [
                     shutil.which("ffmpeg"),
@@ -242,6 +265,14 @@ def transcribe_media(path: Path, destination: Path, store, config: BuzzConfig) -
                 config.timeout_seconds,
             )
             prefix = folder / "transcript"
+            report(
+                progress,
+                f"Buzz 正在本机转录第 {index + 1}/{total} 段，单段完成后更新",
+                "transcribe",
+                current=index,
+                total=total,
+                unit="segments",
+            )
             run_local(
                 [
                     str(config.engine),
@@ -269,6 +300,14 @@ def transcribe_media(path: Path, destination: Path, store, config: BuzzConfig) -
         result = store.memo("transcript-segment", [identity, start], segment)
         chunks.extend(result["chunks"])
         artifacts.extend(result["artifacts"])
+        report(
+            progress,
+            f"已完成并缓存 {index + 1}/{total} 段带时间戳转录",
+            "transcribe",
+            current=index + 1,
+            total=total,
+            unit="segments",
+        )
     output = destination / (fingerprint(identity)[:24] + ".json")
     atomic_json(output, {"chunks": chunks, "identity": identity})
     return {

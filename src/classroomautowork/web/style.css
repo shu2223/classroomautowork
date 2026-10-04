@@ -831,3 +831,22 @@ transition:none!important}
 @media(max-width:800px){.codex-settings{padding:15px;gap:12px}.codex-settings>div{min-width:100%;}.codex-settings label{flex:1;min-width:130px;flex-direction:column;align-items:stretch}.codex-settings select{max-width:100%;width:100%}}
 
 .ai-choice{display:flex;flex-wrap:wrap;align-items:center;gap:12px;margin:0 0 14px;padding:15px 20px;background:#edf5ef;border:1px solid #b5d2be;border-radius:9px}.ai-choice .checkbox-label{font-size:13px;font-weight:600;color:var(--green)}.policy-fields details>summary{cursor:pointer;padding:12px 0}.ai-choice input{accent-color:var(--green)}
+
+.job-live-detail{margin-top:16px;padding:18px;background:#ffffffb8;border:1px solid #dbeadd;border-radius:9px}
+.job-live-detail>strong{display:block;font-size:15px;color:#2c5c43}
+.job-live-detail>p{font-size:12px;line-height:1.8;margin:7px 0;color:#617b69;overflow-wrap:anywhere}
+.job-live-detail .job-measurement{font-weight:600;color:#397453}
+.job-live-detail .job-file{font-size:12px;color:#46634f}
+.job-live-detail .job-current-message{font-size:11px;color:#819287}
+.job-steps{display:flex;list-style:none;padding:0;margin:0 0 18px;gap:12px}
+.job-steps li{display:flex;align-items:center;gap:6px;flex:1;font-size:11px;color:#9eaaa2}
+.job-steps li span{display:grid;place-items:center;border-radius:50%;width:22px;height:22px;background:#eff3f0;flex-shrink:0}
+.job-steps li.current{color:#296848}.job-steps li.current span{background:#296848;color:white}
+.job-steps li.past{color:#619074}.job-steps li.past span{background:#e4f1e9;color:#397453}
+.job-times{display:flex;flex-wrap:wrap;gap:8px 18px;margin-top:12px;font-size:11px;color:#809486}
+.job-times .connection-status{color:#4e8663}.job-times .warning{color:#b78043}
+.job-live-detail .job-warning{padding:11px 13px;background:#fff7e6;border:1px solid #ead8ae;border-radius:7px;color:#937344;font-size:12px;margin:12px 0 0}
+.job-progress.indeterminate{height:7px;opacity:.85}
+.monitor-mode .assignment-section,.monitor-mode .ai-choice,.monitor-mode .codex-settings,.monitor-mode .selection-bar,.monitor-mode .stats{display:none}
+.monitor-mode .job-item .text-button,.monitor-mode .page-heading>button{display:none}
+@media(max-width:800px){.job-live-detail{padding:13px}.job-steps{gap:5px;flex-wrap:wrap}.job-steps li{min-width:40%;padding:4px 0}.job-times{gap:8px 12px}}

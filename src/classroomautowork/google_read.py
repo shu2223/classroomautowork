@@ -17,6 +17,7 @@ from httplib2 import HttpLib2Error
 
 from .errors import PermissionDenied, WorkflowError
 from .local import atomic_json
+from .progress import report
 
 
 def retry_read(operation, attempts: int = 4):
@@ -143,7 +144,7 @@ class GoogleReader:
             request.headers["X-Goog-Drive-Resource-Keys"] = file_id + "/" + resource_key
         return retry_read(request.execute)
 
-    def download(self, metadata: dict, destination: Path) -> dict:
+    def download(self, metadata: dict, destination: Path, *, progress=None) -> dict:
         if not metadata.get("capabilities", {}).get("canDownload"):
             raise PermissionDenied(
                 "Drive capabilities.canDownload is not true; attachment skipped."
@@ -204,9 +205,34 @@ class GoogleReader:
                     and metadata.get("size")
                     and downloader._progress == int(metadata["size"])
                 )
+                last_report = 0
+                total = (
+                    None
+                    if mime.startswith("application/vnd.google-apps.")
+                    else int(metadata.get("size", "0")) or None
+                )
+                report(
+                    progress,
+                    "正在下载附件" if total else "正在导出 Google 文档为 PDF",
+                    "download",
+                    current=downloader._progress,
+                    total=total,
+                    unit="bytes",
+                )
                 while not done:
                     _, done = retry_read(lambda: downloader.next_chunk(num_retries=0))
                     stream.flush()
+                    if done or time.monotonic() - last_report >= 1:
+                        report(
+                            progress,
+                            "正在下载附件",
+                            "download",
+                            current=temporary.stat().st_size,
+                            total=total,
+                            unit="bytes",
+                        )
+                        last_report = time.monotonic()
+            report(progress, "下载已结束，正在校验完整性", "download_verify")
             if temporary.stat().st_size == 0:
                 raise WorkflowError("Attachment download returned an empty file.")
             if not mime.startswith("application/vnd.google-apps."):

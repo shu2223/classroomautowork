@@ -45,11 +45,16 @@ def test_partial_download_resumes_only_matching_drive_revision(tmp_path):
     atomic_json(
         checkpoint, {k: meta.get(k) for k in ("id", "version", "mimeType", "size", "md5Checksum")}
     )
-    result = reader.download(meta, destination)
+    events = []
+    result = reader.download(meta, destination, progress=events.append)
     from pathlib import Path
 
     assert Path(result["path"]).read_bytes() == content
     assert offsets == [5] and not part.exists() and not checkpoint.exists()
+    measured = [x.details for x in events if x.details["stage"] == "download"]
+    assert measured[0]["current"] == 5 and measured[-1]["current"] == len(content)
+    assert all(x["total"] == len(content) for x in measured)
+    assert events[-1].details["stage"] == "download_verify"
     part.write_bytes(b"old revision bytes")
     atomic_json(checkpoint, {"id": "unit", "version": "obsolete"})
     result = reader.download(meta, destination)

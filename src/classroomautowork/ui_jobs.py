@@ -17,6 +17,7 @@ from .google_read import GoogleReader
 from .local import atomic_json, require_private_path, sha256_file, utc_now
 from .pending import discover_pending
 from .policy import CoursePolicy, confirmed_gate
+from .progress import ProgressUpdate
 from .workflow import prepare
 
 ACTIVE = {"queued", "running", "stopping"}
@@ -109,7 +110,7 @@ class FrontendJobs:
                         "timezone": self.settings.timezone,
                         "pending": pending,
                         "policies": policies,
-                        "jobs": jobs,
+                        "jobs": [self._snapshot(x) for x in jobs],
                         "active_job_id": self._active,
                         "submission": "manual_only",
                     }
@@ -120,7 +121,17 @@ class FrontendJobs:
         with self._lock:
             if job_id not in self._jobs:
                 raise WorkflowError("找不到该本机任务记录。")
-            return json.loads(json.dumps(self._jobs[job_id]))
+            return self._snapshot(self._jobs[job_id])
+
+    def _snapshot(self, job):
+        value = json.loads(json.dumps(job))
+        value["runtime"] = {
+            "observed_at": utc_now(),
+            "worker_alive": bool(
+                self._active == job["id"] and self._thread and self._thread.is_alive()
+            ),
+        }
+        return value
 
     def _log(self, job_id, message):
         if self._cancel.is_set():
@@ -128,6 +139,21 @@ class FrontendJobs:
         with self._lock:
             job = self._jobs[job_id]
             job["message"] = str(message)[:500]
+            if isinstance(message, ProgressUpdate):
+                previous = job.get("progress", {})
+                details = dict(message.details)
+                same_step = all(
+                    previous.get(key) == details.get(key) for key in ("stage", "file_id", "item_id")
+                )
+                job["progress"] = {
+                    **details,
+                    "started_at": previous["started_at"]
+                    if same_step and previous.get("started_at")
+                    else utc_now(),
+                    "activity_at": utc_now(),
+                }
+            else:
+                job.pop("progress", None)
             if not job["events"] or job["events"][-1]["message"] != job["message"]:
                 job["events"].append({"at": utc_now(), "message": job["message"]})
                 job["events"] = job["events"][-150:]
@@ -137,6 +163,8 @@ class FrontendJobs:
         with self._lock:
             job = self._jobs[job_id]
             entry = next(x for x in job["items"] if item_key(x) == item_key(target))
+            if values.get("status") and values["status"] != entry.get("status"):
+                entry["stage_started_at"] = utc_now()
             entry.update(values)
             self._save(job)
 
@@ -279,6 +307,7 @@ class FrontendJobs:
                 "thread_id": params.get("threadId"),
             }
             job["message"] = "Codex 正等待你的本次操作审批；课程内容不能自动批准。"
+            job["approval"]["requested_at"] = utc_now()
             self._save(job)
         try:
             for _ in range(4500):
@@ -327,6 +356,7 @@ class FrontendJobs:
         try:
             with self._lock:
                 job["status"] = "running"
+                job["started_at"] = utc_now()
                 self._save(job)
             if job["kind"] == "document_auth":
                 self._log(
@@ -417,6 +447,12 @@ class FrontendJobs:
                     try:
                         forms = []
                         if job.get("ai_confirmed"):
+                            self._log(
+                                job_id,
+                                ProgressUpdate(
+                                    "正在读取个人作业文档的原题和答案栏", "document_inspect"
+                                ),
+                            )
                             forms = prepare_document_forms(self.settings, Path(result["package"]))
                         receipt = generate_review(
                             Path(result["package"]),
@@ -485,9 +521,10 @@ class FrontendJobs:
                     for x in job["items"]
                 )
                 materials = sum(x["status"] == "materials_ready" for x in job["items"])
+                failed = sum(x["status"] == "failed" for x in job["items"])
                 self._log(
                     job_id,
-                    f"处理结束：{ready} 项已填入原文档可审阅，{materials} 项资料包，{needs} 项待补充；没有提交任何作业",
+                    f"处理结束：{ready} 项已填入原文档可审阅，{materials} 项资料包，{needs} 项待补充，{failed} 项失败；没有提交任何作业",
                 )
             with self._lock:
                 job["status"] = status

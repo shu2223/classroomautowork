@@ -169,7 +169,7 @@ class ReaderFixture:
             "capabilities": {"canDownload": not self.denied},
         }
 
-    def download(self, metadata, destination):
+    def download(self, metadata, destination, *, progress=None):
         self.downloads += 1
         destination.mkdir(parents=True)
         path = destination / "unit.txt"

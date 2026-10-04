@@ -6,12 +6,14 @@ import os
 import platform
 import re
 import shutil
+import time
 from pathlib import Path
 
 from .codex_rpc import CodexClient, model_catalog
 from .errors import RunCancelled, WorkflowError
 from .local import atomic_json, require_private_path, sha256_file, state_root, utc_now
 from .policy import confirmed_gate
+from .progress import report
 from .review import finalize
 
 
@@ -425,7 +427,12 @@ def generate_review(
             client.request("thread/name/set", {"threadId": thread_id, "name": title[:200]})
             generation["thread_title"] = title[:200]
             save()
-            progress(f"已创建真实 Codex 会话，模型 {model}；正在阅读题目和课堂资料")
+            report(
+                progress,
+                f"已创建真实 Codex 会话，模型 {model}；正在阅读题目和课堂资料",
+                "ai",
+                item_id=thread_id,
+            )
             turn_params = {
                 "threadId": thread_id,
                 "input": inputs,
@@ -438,11 +445,43 @@ def generate_review(
             generation["turn_id"] = turn["id"]
             save()
             messages = []
+            last_activity_save = 0
             while True:
                 event = client.next_event()
                 method, params = event.get("method"), event.get("params", {})
                 if params.get("threadId") and params["threadId"] != thread_id:
                     continue
+                if params.get("turnId") and params["turnId"] != turn["id"]:
+                    continue
+                # Count real notifications, never persist raw reasoning/tool output as status text.
+                activity_types = {
+                    "reasoning": "Codex 正在分析题目与资料",
+                    "agentMessage": "Codex 正在整理回答",
+                    "commandExecution": "Codex 正在运行资料检查工具",
+                    "mcpToolCall": "Codex 正在执行资料工具",
+                    "webSearch": "Codex 正在检索来源",
+                    "contextCompaction": "Codex 正在整理会话上下文",
+                }
+                if method in {"item/started", "item/completed", "thread/tokenUsage/updated"} or (
+                    method and method.startswith("item/") and method.endswith(("/delta", "Delta"))
+                ):
+                    generation["activity_at"] = utc_now()
+                    generation["activity_count"] = generation.get("activity_count", 0) + 1
+                    if method == "item/started":
+                        generation["activity_label"] = activity_types.get(
+                            params.get("item", {}).get("type"), "Codex 正在处理一项分析任务"
+                        )
+                    elif method == "item/agentMessage/delta":
+                        generation["activity_label"] = "Codex 正在输出回答，完整返回后再核验"
+                    if time.monotonic() - last_activity_save >= 5 or method == "item/started":
+                        save()
+                        report(
+                            progress,
+                            generation.get("activity_label", "已收到 Codex 的活动更新"),
+                            "ai",
+                            item_id=thread_id,
+                        )
+                        last_activity_save = time.monotonic()
                 if method == "item/completed":
                     item = params.get("item", {})
                     if item.get("type") == "agentMessage":
@@ -452,7 +491,12 @@ def generate_review(
                     )
                     generation["events"] = generation["events"][-100:]
                     save()
-                    progress("Codex 已完成一项分析，正在核对实际要求与证据")
+                    report(
+                        progress,
+                        "Codex 已完成一项活动，仍在等待完整回合结果",
+                        "ai",
+                        item_id=thread_id,
+                    )
                 elif method == "thread/tokenUsage/updated":
                     generation["token_usage"] = params.get("tokenUsage")
                     save()
@@ -469,6 +513,7 @@ def generate_review(
                         )
                     generation["turn_status"] = status
                     break
+            report(progress, "AI 回合已结束，正在核验题目、来源和初稿格式", "validate")
             if not messages:
                 raise WorkflowError("Codex 未返回可核验的分析结果，不能宣称生成完成。")
             try:
