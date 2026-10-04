@@ -11,6 +11,7 @@ from .buzz import BuzzConfig, setup_buzz
 from .config import Settings, assignment_ids
 from .document_fill import fill_review
 from .errors import WorkflowError
+from .form_fill import fill_response_forms, prepare_response_forms
 from .google_read import GoogleReader
 from .local import state_root
 from .pending import discover_pending
@@ -181,7 +182,11 @@ def main(argv=None) -> int:
                     "connection": "Run verify to validate assignment and download.",
                 }
             elif args.command == "fill":
-                result = fill_review(settings, args.package)
+                result = (
+                    fill_response_forms(settings, args.package)
+                    if prepare_response_forms(args.package)
+                    else fill_review(settings, args.package)
+                )
             elif args.command == "pending":
                 credentials, _ = credentials_for(settings)
                 result = discover_pending(

@@ -14,3 +14,5 @@
 不要修改 prepared 包内的 manifest、requirements 或 evidence 来绕过检查。资料或规则变化时重新运行 prepare。
 
 `document_answers` 是前端结果 schema 的独立数组，不属于 `review.json`。每项复制原生答案栏的 document_id、field_id 和 context_sha256，并提供适合该栏的单段 text。内部证据标记保留在本机 draft/checklist 中，原文档只填写作业答案。写入后给出原文档审阅入口，证据包下载可选。
+
+`form_answers` 为原表单逐栏答案数组：form_url、entry_id、context_sha256 逐字复制程序字段；values 为原选项或文字，needs_user 和 review_note 单独记录审阅提示。原表单不放内部引用或审核说明。程序负责原生预填并打开，用户在原页面审阅和手动提交；不得将打开浏览器等同于已经回读或保存草稿。

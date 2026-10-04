@@ -2,7 +2,7 @@
 const $ = id => document.getElementById(id);
 const state = {documentsAuthorized: false, pending: null, jobs: [], policies: {}, selected: new Set(), active: null, focus: null, view: "pending", busy: false, preview: null, policyCourse: null, images: [], models: null, modelsLoading: false, hideOverdue: localStorage.getItem("classroom-hide-overdue") === "true"};
 const activeStates = new Set(["queued", "running", "stopping"]);
-const labels = {queued: "等待开始", running: "正在处理", stopping: "正在暂停", waiting: "等待处理", preparing: "读取题目与资料", prepared: "资料已准备", drafting: "Codex 正在分析", ready: "答案已生成 · 待你审阅", filling_document: "正在填入原文档", document_ready: "已填入 · 打开文档审阅", document_needs_user: "已填入可用答案 · 尚有空栏待确认", needs_document: "初稿已保留 · 填入需处理", needs_user: "需要补充", materials_ready: "资料已整理 · 未调用 AI", paused: "已暂停", interrupted: "上次已中断", failed: "处理失败", completed: "处理已结束", completed_with_issues: "部分处理未完成"};
+const labels = {queued: "等待开始", running: "正在处理", stopping: "正在暂停", waiting: "等待处理", preparing: "读取题目与资料", prepared: "资料已准备", drafting: "Codex 正在分析", ready: "答案已生成 · 待你审阅", filling_form: "正在自动填入原表单", form_opened: "已打开预填表单 · 在原表单审阅", needs_form: "初稿已保留 · 表单填入需重试", filling_document: "正在填入原文档", document_ready: "已填入 · 打开文档审阅", document_needs_user: "已填入可用答案 · 尚有空栏待确认", needs_document: "初稿已保留 · 填入需处理", needs_user: "需要补充", materials_ready: "资料已整理 · 未调用 AI", paused: "已暂停", interrupted: "上次已中断", failed: "处理失败", completed: "处理已结束", completed_with_issues: "部分处理未完成"};
 const keyOf = item => item.course_id + ":" + item.assignment_id;
 let token = location.hash.slice(1);
 if (token) { sessionStorage.setItem("classroom-access", token); history.replaceState(null, "", location.pathname); }
@@ -16,9 +16,9 @@ function durationLabel(ms) { const s = Math.max(0, Math.floor(ms / 1000)); retur
 function ageOf(at, now) { const value = Date.parse(at); return Number.isFinite(value) ? Math.max(0, now - value) : null; }
 function progressView(job, network, now = Date.now()) {
   const items = job.items || [], p = job.progress || {}, active = activeStates.has(job.status);
-  const item = items.find(x => ["preparing", "prepared", "drafting", "filling_document"].includes(x.status)) || items.find(x => x.status === "waiting");
-  let stage = p.stage || (item?.status === "filling_document" ? "fill" : item?.status === "drafting" ? "ai" : "prepare");
-  if (job.kind === "fill") stage = "fill";
+  const item = items.find(x => ["preparing", "prepared", "drafting", "filling_document", "filling_form"].includes(x.status)) || items.find(x => x.status === "waiting");
+  let stage = p.stage || (item?.status === "filling_form" ? "form_fill" : item?.status === "filling_document" ? "fill" : item?.status === "drafting" ? "ai" : "prepare");
+  if (job.kind === "fill" && item?.status !== "filling_form") stage = "fill";
   if (job.kind === "document_auth") stage = "authorization";
   if (job.kind === "refresh") stage = "course_sync";
   if (job.approval) stage = "approval";
@@ -33,9 +33,10 @@ function progressView(job, network, now = Date.now()) {
     extract: ["提取文档文字和页图", "逐页读取内容并保留必要图像，供 Codex 阅读题目与课堂资料。"],
     transcribe: ["Buzz 正在本机转录录像", "分段识别语音并保存时间戳。单段处理期间计数可能暂时不变，完成后继续更新。"],
     attachment_done: ["附件内容已准备", "材料已处理并缓存，继续检查其他附件。"],
-    document_inspect: ["核对作业填写方式", "检查有无个人 Google 文档答案栏；Forms 题目已读取，逐题答案在本机审阅后由你填写。"],
+    document_inspect: ["核对作业填写方式", "检查有无个人 Google 文档答案栏；模型逐栏作答后，自动填入个人文档或原表单。"],
     ai: ["Codex 正在阅读与作答", "使用所选模型分析真实题目和资料。AI 没有可测量的总百分比；显示实际活动与会话入口。"],
     validate: ["核验 AI 结果", "检查来源、格式与题目完整性，通过后才填入文档。"],
+    form_fill: ["自动填入原 Google 表单", "核对原题与选项，打开已预填答案的原表单；在原表单审阅，程序不会点击提交。浏览器是否保存草稿以 Google 页面提示为准。"],
     fill: ["填写并回读 Google 文档", "填写个人作业的答案栏，回读核验后由你审阅并手动提交。"],
     approval: ["等待你的操作审批", "请在作业助手查看具体请求并批准或拒绝；等待期间不会继续。"],
     authorization: ["等待 Google 授权", "请在 Google 页面完成学校账户授权，然后返回助手。"],
@@ -43,10 +44,10 @@ function progressView(job, network, now = Date.now()) {
   let [title, explanation] = descriptions[stage] || descriptions.prepare;
   const legacy = active && !job.approval && !job.progress && /^Checking attachment /.test(job.message || "");
   if (legacy) { title = "正在处理课程附件"; explanation = "这次由旧版启动，未报告附件内部的子步骤。下载、提取或转录可能耗时，保持任务运行，无需重新开始。"; }
-  const ready = items.filter(x => ["document_ready", "document_needs_user"].includes(x.status)).length;
+  const ready = items.filter(x => ["document_ready", "document_needs_user", "form_opened"].includes(x.status)).length;
   const localReady = items.filter(x => x.status === "ready").length;
   const failed = items.filter(x => x.status === "failed").length;
-  const finished = items.filter(x => ["ready", "document_ready", "document_needs_user", "needs_document", "needs_user", "materials_ready", "failed"].includes(x.status)).length;
+  const finished = items.filter(x => ["ready", "document_ready", "document_needs_user", "form_opened", "needs_form", "needs_document", "needs_user", "materials_ready", "failed"].includes(x.status)).length;
   const stepAt = job.approval?.requested_at || p.started_at || item?.stage_started_at || job.started_at || job.created_at;
   const activityAt = p.activity_at || item?.generation?.activity_at || job.events?.at(-1)?.at || job.updated_at;
   const silence = ageOf(activityAt, now);
@@ -60,8 +61,8 @@ function progressView(job, network, now = Date.now()) {
     const unit = {pages:"页", segments:"段"}[p.unit] || "项", format = v => p.unit === "bytes" ? `${(v / 1048576).toFixed(1)} MB` : String(v);
     measurement = {value:p.current, max:p.total, text:p.unit === "bytes" ? `已下载 ${format(p.current)} / ${format(p.total)}` : `已完成 ${format(p.current)} / ${format(p.total)} ${unit}`};
   }
-  if (!active) { title = failed && stage === "validate" ? "结果核验未通过" : labels[job.status] || job.status; explanation = failed ? `本次 ${failed} 项失败；请查看下方具体原因。失败项没有填入文档，可以在原助手补齐资料后重试。` : ready ? "请打开已填入的原文档审阅，最后由你手动提交。" : localReady ? "逐题答案已核验。点击查看初稿审阅，Forms 需要你在原表单填写并手动提交。" : "请查看各项作业的结果与待处理事项。"; }
-  const index = !active && (ready || localReady) ? 3 : stage === "fill" ? 2 : ["ai", "validate", "approval"].includes(stage) ? 1 : 0;
+  if (!active) { title = failed && stage === "validate" ? "结果核验未通过" : labels[job.status] || job.status; explanation = failed ? `本次 ${failed} 项失败；请查看下方具体原因。失败项没有填入文档，可以在原助手补齐资料后重试。` : ready ? "请在已填入的原文档或预填原表单审阅，最后由你手动提交。" : localReady ? "逐题答案已核验；请继续自动填写后在原页面审阅，最后手动提交。" : "请查看各项作业的结果与待处理事项。"; }
+  const index = !active && (ready || localReady) ? 3 : ["fill", "form_fill"].includes(stage) ? 2 : ["ai", "validate", "approval"].includes(stage) ? 1 : 0;
   const nowOrEnd = job.finished_at ? Date.parse(job.finished_at) : now;
   return {active, title, explanation, stage, index, measurement, ready, localReady, failed, finished, total:items.length, filename:p.filename || null, attachments:p.attachment_total ? `课程附件 ${p.attachment_index}/${p.attachment_total}` : null, elapsed:ageOf(job.started_at || job.created_at, nowOrEnd), stepElapsed:ageOf(stepAt, nowOrEnd), silence, warning, disconnected, workerAlive:job.runtime?.worker_alive === true, legacy};
 }
@@ -103,7 +104,7 @@ function setButtons() {
   $("generateButton").disabled = busy || !state.selected.size || ($("aiConfirmed").checked && (!state.models || state.modelsLoading));
   $("aiConfirmed").disabled = busy;
   $("generateButton").querySelector("span").textContent = $("aiConfirmed").checked ? "生成答案并准备审阅" : "准备所选资料";
-  $("aiChoiceNote").textContent = $("aiConfirmed").checked ? "已勾选：使用所选模型作答；个人 Google 文档自动填入，Forms 生成逐题答案供你审阅填写，最后均由你手动提交。" : "未勾选：只读取和整理资料，不调用 AI。无需填写规则原文。";
+  $("aiChoiceNote").textContent = $("aiConfirmed").checked ? "已勾选：使用所选模型作答；个人 Google 文档及 Forms 原表单自动填写，你在原页面审阅，最后自己提交。" : "未勾选：只读取和整理资料，不调用 AI。无需填写规则原文。";
   $("modelSelect").disabled = busy || !state.models || state.modelsLoading; $("effortSelect").disabled = busy || !state.models || state.modelsLoading; $("reloadModels").disabled = busy || state.modelsLoading;
   $("selectedCount").textContent = state.selected.size;
   $("clearSelection").disabled = !state.selected.size;
@@ -133,7 +134,7 @@ function renderPending() {
   const pending = state.pending, items = filtered(), latest = latestItems();
   $("totalCount").textContent = pending ? pending.assignments.length : "—"; $("navCount").textContent = pending ? pending.assignments.length : "—";
   $("overdueCount").textContent = pending ? pending.assignments.filter(x => x.due_utc && new Date(x.due_utc) < new Date()).length : "—";
-  $("readyCount").textContent = [...latest.values()].filter(x => ["ready", "document_ready", "document_needs_user"].includes(x.item.status)).length;
+  $("readyCount").textContent = [...latest.values()].filter(x => ["ready", "document_ready", "document_needs_user", "form_opened"].includes(x.item.status)).length;
   $("visibleCount").textContent = items.length;
   $("refreshTime").textContent = pending ? `上次实时刷新 ${dateLabel(pending.refreshed_at, true)} · 列表保留到下次刷新` : "点击刷新，从 Classroom 读取实时待办";
   $("clearFilters").hidden = !($("courseFilter").value || $("searchInput").value || $("dateFilter").value || !$("includeNoDue").checked || state.hideOverdue);
@@ -155,6 +156,7 @@ function renderPending() {
     else side.append(node("span", policy?.ai_use === "forbidden" ? "课程禁止生成答案" : $("aiConfirmed").checked ? "可生成初稿" : "仅准备资料", "pill " + (policy?.can_draft ? "success" : "warning")));
     const actions = node("div", undefined, "row-actions"); const policyButton = button("课程规则", "row-action", () => openPolicy(item.course_id, item.course_name)); policyButton.disabled = !!state.active; actions.append(policyButton);
     if (completed?.item.package) actions.append(button(completed.item.status === "ready" ? "查看初稿" : "查看资料与分析", "row-action", () => openReview(completed.job.id, key)));
+    for (const f of completed?.item.form_fill?.forms || []) { const link = safeLink(f.url, "在原表单审阅答案 ↗", "row-action"); if (link) actions.prepend(link); }
     for (const d of completed?.item.document_fill?.documents || []) { const link = safeLink(d.url, "打开已填入的文档 ↗", "row-action"); if (link) actions.prepend(link); } side.append(actions); row.append(label, side); list.append(row);
   }
   renderDiscovery(); setButtons();
@@ -165,7 +167,7 @@ function jobProgress(job) {
   box.dataset.jobId = job.id;
   if (["review", "fill"].includes(job.kind) && job.ai_confirmed) {
     const steps = node("ol", undefined, "job-steps");
-    for (const [i, title] of ["准备资料", "Codex 作答", "准备审阅", "人工审阅"].entries()) { const step = node("li", undefined, i === v.index ? "current" : i < v.index ? "past" : ""); step.append(node("span", i < v.index ? "✓" : String(i + 1)), node("b", title)); steps.append(step); }
+    for (const [i, title] of ["准备资料", "Codex 作答", "自动填写", "原页面审阅"].entries()) { const step = node("li", undefined, i === v.index ? "current" : i < v.index ? "past" : ""); step.append(node("span", i < v.index ? "✓" : String(i + 1)), node("b", title)); steps.append(step); }
     box.append(steps);
   }
   box.append(node("strong", v.title), node("p", v.explanation));
@@ -188,7 +190,7 @@ function jobCard(job, full = false) {
   card.append(heading);
   card.append(jobProgress(job));
   const items = node("div", undefined, "job-items");
-  for (const item of job.items) { const row = node("div", undefined, "job-item"); const title = node("span", item.title || item.assignment_id); if (item.error) title.append(node("p", friendlyError(item.error))); row.append(title, pill(item.status)); if (item.package) row.append(button(item.status === "ready" ? "查看实际初稿" : "查看资料与分析", "text-button", () => openReview(job.id, keyOf(item)))); const g = item.generation; if (g?.thread_id) { const meta = node("div", undefined, "job-model"); meta.append(node("span", `实际模型 ${g.model} · ${g.reasoning_effort || "默认强度"} · ${g.status === "completed" ? "AI 回合完成" : g.status === "running" ? "正在生成" : "尚未成功"} `)); const link = codexLink(g); if (link) meta.append(link); row.append(meta); } else if (item.package) row.append(node("span", "资料已准备 · 没有已核验的 AI 生成记录", "job-model")); for (const d of item.document_fill?.documents || []) { const link = safeLink(d.url, "在原文档审阅 ↗", "button primary small-button"); if (link) row.prepend(link); } if (item.package && g?.status === "completed" && item.status === "needs_document") row.append(button("填入已有初稿", "text-button", () => action(`/api/jobs/${job.id}/items/${keyOf(item)}/fill`, {}))); items.append(row); } card.append(items);
+  for (const item of job.items) { const row = node("div", undefined, "job-item"); const title = node("span", item.title || item.assignment_id); if (item.error) title.append(node("p", friendlyError(item.error))); row.append(title, pill(item.status)); if (item.package) row.append(button(item.status === "ready" ? "查看实际初稿" : "查看资料与分析", "text-button", () => openReview(job.id, keyOf(item)))); const g = item.generation; if (g?.thread_id) { const meta = node("div", undefined, "job-model"); meta.append(node("span", `实际模型 ${g.model} · ${g.reasoning_effort || "默认强度"} · ${g.status === "completed" ? "AI 回合完成" : g.status === "running" ? "正在生成" : "尚未成功"} `)); const link = codexLink(g); if (link) meta.append(link); row.append(meta); } else if (item.package) row.append(node("span", "资料已准备 · 没有已核验的 AI 生成记录", "job-model")); for (const f of item.form_fill?.forms || []) { const link = safeLink(f.url, "在原表单审阅答案 ↗", "button primary small-button"); if (link) row.prepend(link); const saved = safeLink(f.original_url, "继续已保存的草稿 ↗", "text-button"); if (saved) row.append(saved); } for (const d of item.document_fill?.documents || []) { const link = safeLink(d.url, "在原文档审阅 ↗", "button primary small-button"); if (link) row.prepend(link); } if (item.package && g?.status === "completed" && ["needs_document", "needs_form"].includes(item.status)) row.append(button("填入已有初稿", "text-button", () => action(`/api/jobs/${job.id}/items/${keyOf(item)}/fill`, {}))); items.append(row); } card.append(items);
   if (job.approval && !state.monitorOnly) { const box = node("section", undefined, "approval-card"); box.append(node("h3", "Codex 请求本次操作审批"), node("p", job.approval.reason), node("pre", job.approval.command || job.approval.cwd), node("p", "此请求来自 Codex 的现有权限规则；批准仅适用于本次，不会扩大长期权限。")); const actions = node("div", undefined, "approval-actions"); for (const [choice, label] of [["accept", "批准本次"], ["decline", "拒绝"], ["cancel", "取消操作"]]) actions.append(button(label, "button secondary small-button", async () => { try { await api(`/api/jobs/${job.id}/approval`, "POST", {id: job.approval.id, decision: choice}); await pollJob(); } catch(error) { toast(error.message); } })); box.append(actions); card.append(box); }
   if (job.cache) card.append(node("p", `资料缓存：复用 ${job.cache.reused} 个阶段 · 新增 ${job.cache.processed} · 缓存阶段失败 ${job.cache.failed}`, "small"));
   if (job.events.length) { const details = node("details"), summary = node("summary", "查看处理记录"), events = node("div", undefined, "event-list"); for (const entry of job.events) { const line = node("div", undefined, "event-line"); line.append(node("time", new Date(entry.at).toLocaleTimeString("zh-CN", {timeZone: state.timezone || "Asia/Tokyo", hour: "2-digit", minute: "2-digit", second: "2-digit"})), node("span", entry.message)); events.append(line); } details.dataset.jobLog = job.id; details.append(summary, events); card.append(details); }
@@ -246,11 +248,14 @@ async function openReview(jobId, key) {
     const filled = data.document_fill?.documents?.[0];
     const attached = data.requirements.student_submission?.assignmentSubmission?.attachments?.find(x => x.driveFile)?.driveFile;
     const responseForm = data.requirements.response_forms?.[0];
-    const original = safeLink(filled?.url || attached?.alternateLink || responseForm?.url, filled ? "打开已填入的文档 ↗" : attached ? "打开原作业文档 ↗" : "打开原作业表单 ↗", "button primary");
+    const prefilled = data.form_fill?.forms?.[0];
+    const original = safeLink(filled?.url || prefilled?.url || attached?.alternateLink || responseForm?.url, filled ? "打开已填入的文档 ↗" : prefilled ? "打开预填答案表单 ↗" : attached ? "打开原作业文档 ↗" : "打开原作业表单 ↗", "button primary");
     $("originalDocumentAction").replaceChildren(); if (original) $("originalDocumentAction").append(original);
-    $("fillDocumentButton").hidden = !data.text["draft.md"] || !!filled || (!!responseForm && !attached);
+    $("fillDocumentButton").hidden = !data.text["draft.md"] || !!filled || (!!responseForm && !data.generation?.form_answers_sha256);
     if (filled) $("reviewStatus").textContent = `已自动填入并回读核验 · ${g.model} · 尚未提交`;
-    else if (responseForm && data.text["draft.md"] && g?.status === "completed") $("reviewStatus").textContent += " · 表单逐题答案在初稿中，需本人确认并填写";
+    else if (prefilled) $("reviewStatus").textContent += ` · 原表单已准备 ${prefilled.prefilled_fields} 栏预填答案，请在原表单审阅`;
+    if (prefilled) { const note = node("p", "预填入口会重新带入候选答案；已在 Google 中修改过的内容请从下方原始链接继续审阅。浏览器草稿保存状态以 Google 页面为准。", "small"); $("originalDocumentAction").append(note); const saved = safeLink(prefilled.original_url, "继续 Google 中保存的草稿 ↗"); if (saved) $("originalDocumentAction").append(saved); for (const question of prefilled.needs_user || []) $("originalDocumentAction").append(node("p", question, "small warning")); }
+    $("fillDocumentButton").textContent = responseForm ? "自动填入原表单" : "填入已有初稿";
     renderTab("assignment"); $("reviewDialog").showModal();
   } catch (error) { toast(error.message); }
 }

@@ -15,7 +15,7 @@ from test_workflow import ReaderFixture, prepared_fixture
 from classroomautowork import drafting, ui_jobs, workflow
 from classroomautowork.config import Settings
 from classroomautowork.errors import RunCancelled, WorkflowError
-from classroomautowork.local import atomic_json
+from classroomautowork.local import atomic_json, sha256_file
 from classroomautowork.store import Store
 from classroomautowork.ui_jobs import FrontendJobs
 from classroomautowork.webapp import LocalServer
@@ -137,6 +137,27 @@ def offline_rpc(tmp_path, monkeypatch, package, review):
         encoding="utf-8",
     )
     monkeypatch.setattr(drafting, "codex_command", lambda: [sys.executable, str(script)])
+
+
+def test_multiline_actual_protocol_result_is_reusable_on_windows(tmp_path, monkeypatch):
+    package, _, _, review = prepared_fixture(tmp_path)
+    offline_rpc(tmp_path, monkeypatch, package, review)
+    script = tmp_path / "offline_rpc.py"
+    script.write_text(
+        script.read_text(encoding="utf-8").replace(
+            "'text':json.dumps(result)", "'text':json.dumps(result,indent=2)"
+        ),
+        encoding="utf-8",
+    )
+    receipt = drafting.generate_review(
+        package, ai_confirmed=True, model="unit-model", effort="high"
+    )
+    variant = Path(receipt["package"])
+    assert b"\n" in (variant / "codex-result.json").read_bytes()
+    assert sha256_file(variant / "codex-result.json") == receipt["generation"]["result_sha256"]
+    assert drafting.reusable_review(variant) is not None
+    (variant / "codex-result.json").write_bytes(b"tampered actual result")
+    assert drafting.reusable_review(variant) is None
 
 
 @pytest.mark.parametrize("policy", ["allowed", "unknown"])

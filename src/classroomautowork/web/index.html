@@ -24,7 +24,7 @@
 <main>
 <header class="topbar"><span id="breadcrumb">工作台 <span>/</span> 待完成作业</span><span id="todayLabel" class="muted small"></span></header>
 <section id="pendingView">
-<div class="page-heading"><div><div class="eyebrow">YOUR CLASSROOM, ORGANIZED</div><h1>读取题目，作答后直接审阅。</h1><p>使用所选 Codex 模型与授课资料。个人文档自动填入，表单答案逐题审阅。</p></div><button id="refreshButton" class="button primary"><svg class="icon"><use href="#i-refresh"/></svg><span>刷新待完成作业</span></button></div>
+<div class="page-heading"><div><div class="eyebrow">YOUR CLASSROOM, ORGANIZED</div><h1>读取题目，作答后直接审阅。</h1><p>使用所选 Codex 模型与授课资料。个人文档和原表单自动填写，打开原页面审阅。</p></div><button id="refreshButton" class="button primary"><svg class="icon"><use href="#i-refresh"/></svg><span>刷新待完成作业</span></button></div>
 <div class="stats"><div class="stat-card"><span class="stat-icon mint"><svg class="icon"><use href="#i-book"/></svg></span><div><span>待完成作业</span><strong id="totalCount">—</strong></div><span class="stat-note" id="courseCount">等待刷新</span></div><div class="stat-card"><span class="stat-icon peach"><svg class="icon"><use href="#i-clock"/></svg></span><div><span>已逾期</span><strong id="overdueCount">—</strong></div><span class="stat-note">仍需你确认补交</span></div><div class="stat-card"><span class="stat-icon lavender"><svg class="icon"><use href="#i-check"/></svg></span><div><span>初稿待审阅</span><strong id="readyCount">0</strong></div><span class="stat-note">提交由你决定</span></div></div>
 <div id="notice" class="notice" hidden></div>
 <section id="jobPanel" class="job-panel" hidden aria-live="polite"></section>
@@ -38,7 +38,7 @@
 <div id="assignmentList" class="assignment-list"><div class="empty-state"><div class="empty-icon"><svg class="icon"><use href="#i-book"/></svg></div><h3>先把你的待办带进来</h3><p>点击右上方“刷新待完成作业”。<br>读取真实作业后，就可以自由勾选。</p><div class="empty-steps"><span><b>01</b> 刷新待办</span><span><b>02</b> 勾选作业</span><span><b>03</b> 审阅初稿</span></div></div></div>
 </section>
 <details id="discoveryDetails" class="discovery-details" hidden><summary id="discoverySummary"></summary><div id="discoveryContent"></div></details>
-<div class="manual-note"><svg class="icon"><use href="#i-check"/></svg><span>资料准备、AI 分析和实际初稿分别显示。勾选确认后才调用 AI；有真实初稿才标为待审阅。个人 Google 文档可自动填入；Forms 逐题答案需你审阅填写。所有作业最后均由你手动提交。</span></div>
+<div class="manual-note"><svg class="icon"><use href="#i-check"/></svg><span>资料准备、AI 分析和实际初稿分别显示。勾选确认后才调用 AI；有真实初稿才标为待审阅。个人 Google 文档和 Forms 原表单自动填写；在原页面检查答案。所有作业最后均由你手动提交。</span></div>
 </section>
 <section id="historyView" hidden><div class="page-heading"><div><div class="eyebrow">REVIEW HISTORY</div><h1>每一步，都有记录。</h1><p>查看审核结果，或从上次暂停的位置继续。</p></div></div><div id="historyList" class="history-list"></div></section>
 <footer class="selection-bar"><div class="selection-summary"><span id="selectedCount" class="selected-number">0</span><div><strong>项作业已选择</strong><button id="clearSelection" class="text-button small">清空选择</button></div></div><div class="selection-actions"><label class="checkbox-label media-option"><input id="processMedia" aria-label="处理录像" type="checkbox" checked>处理录像<span class="muted small">可能较耗时</span></label><button id="generateButton" class="button primary" disabled><svg class="icon"><use href="#i-spark"/></svg><span>准备所选资料</span><svg class="icon"><use href="#i-arrow"/></svg></button></div></footer>

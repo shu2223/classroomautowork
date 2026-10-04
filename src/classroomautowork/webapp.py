@@ -153,7 +153,7 @@ class LocalHandler(BaseHTTPRequestHandler):
                         instruction = (
                             "Classroom 本机资料与结果包\n\n"
                             + (
-                                "包含实际 AI 初稿：先阅读 draft.md、checklist.md、questions.md，核对来源，再由你手动把认可的内容填入个人 Google 文档并提交。\n"
+                                "包含实际 AI 初稿：程序自动填入个人文档或打开原生预填表单，请在原作业页面审阅，再由你手动提交。检查表和证据包仅供辅助。\n"
                                 if view["text"]["draft.md"]
                                 and generation.get("status") == "completed"
                                 else "没有已核验的 AI 答案初稿。这份包用于查看已获取资料、题目、来源和待确认项，不能当作作业已经完成。\n"
@@ -162,7 +162,7 @@ class LocalHandler(BaseHTTPRequestHandler):
                             + "codex-generation.json 记录真实模型、回合、输入来源和页图摘要；evidence.json 保存引用证据。\n"
                             + "sources/ 中为本次已授权下载、实际使用或当前作业必须的原文件/PDF 导出；pages/ 保留相应页图。\n"
                             + "未知教师规定保持未确认，用户要求继续生成不会被写成教师已经允许。\n"
-                            + "所有内容仅供本机审阅；程序未填写 Google 文档、未提交、未留言。\n"
+                            + "document-fill.json / form-fill.json 记录实际填入或浏览器打开状态；程序不提交、不留言。\n"
                         )
                         out.writestr("README.txt", instruction)
                         for name in sorted(FILES):

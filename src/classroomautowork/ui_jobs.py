@@ -13,6 +13,7 @@ from .config import Settings
 from .document_fill import fill_review, prepare_document_forms
 from .drafting import codex_command, generate_review
 from .errors import ConfigurationError, RunCancelled, WorkflowError
+from .form_fill import fill_response_forms, prepare_response_forms
 from .google_read import GoogleReader
 from .local import atomic_json, require_private_path, sha256_file, utc_now
 from .pending import discover_pending
@@ -32,9 +33,12 @@ FILES = {
     "questions.md",
     "codex-summary.md",
     "codex-generation.json",
+    "codex-result.json",
     "README.txt",
     "document-fill.json",
     "document-answers.json",
+    "form-answers.json",
+    "form-fill.json",
 }
 POLICY_FIELDS = {
     "ai_use",
@@ -85,6 +89,7 @@ class FrontendJobs:
                         "prepared",
                         "drafting",
                         "filling_document",
+                        "filling_form",
                     }:
                         item["status"] = "interrupted"
                 atomic_json(path, job)
@@ -371,6 +376,9 @@ class FrontendJobs:
                 status = "completed"
             elif job["kind"] == "fill":
                 for item in job["items"]:
+                    if prepare_response_forms(Path(item["package"])):
+                        self._fill_response_item(job_id, item, Path(item["package"]))
+                        continue
                     self._item(job_id, item, status="filling_document")
                     try:
                         result = fill_review(
@@ -393,7 +401,7 @@ class FrontendJobs:
                         self._item(job_id, item, status="needs_document", error=str(exc))
                 status = (
                     "completed"
-                    if all(x["status"] == "document_ready" for x in job["items"])
+                    if all(x["status"] in {"document_ready", "form_opened"} for x in job["items"])
                     else "completed_with_issues"
                 )
             elif job["kind"] == "refresh":
@@ -450,7 +458,7 @@ class FrontendJobs:
                             self._log(
                                 job_id,
                                 ProgressUpdate(
-                                    "正在确认作业是否有可填写的个人 Google 文档；Forms 题目已在要求来源中读取",
+                                    "正在核对原文档答案栏与表单逐栏映射，模型作答后将自动填写",
                                     "document_inspect",
                                 ),
                             )
@@ -507,18 +515,29 @@ class FrontendJobs:
                                 raise
                             except WorkflowError as exc:
                                 self._item(job_id, result, status="needs_document", error=str(exc))
+                        if (
+                            job.get("ai_confirmed")
+                            and receipt.get("draft_sha256")
+                            and prepare_response_forms(Path(receipt["package"]))
+                        ):
+                            self._fill_response_item(job_id, result, Path(receipt["package"]))
                     except RunCancelled:
                         raise
                     except WorkflowError as exc:
                         self._item(job_id, result, status="failed", error=str(exc))
                 status = (
                     "completed_with_issues"
-                    if any(x["status"] in {"failed", "needs_document"} for x in job["items"])
+                    if any(
+                        x["status"] in {"failed", "needs_document", "needs_form"}
+                        for x in job["items"]
+                    )
                     else "completed"
                 )
                 ready = sum(x["status"] == "document_ready" for x in job["items"])
+                form_opened = sum(x["status"] == "form_opened" for x in job["items"])
                 needs = sum(
-                    x["status"] in {"needs_user", "document_needs_user", "needs_document"}
+                    x["status"]
+                    in {"needs_user", "document_needs_user", "needs_document", "needs_form"}
                     for x in job["items"]
                 )
                 materials = sum(x["status"] == "materials_ready" for x in job["items"])
@@ -526,7 +545,7 @@ class FrontendJobs:
                 failed = sum(x["status"] == "failed" for x in job["items"])
                 self._log(
                     job_id,
-                    f"处理结束：{ready} 项已填入原文档可审阅，{local_ready} 项本机答案可审阅，{materials} 项资料包，{needs} 项待补充，{failed} 项失败；没有提交任何作业",
+                    f"处理结束：{ready} 项原文档已填入，{form_opened} 项已打开自动预填原表单，{local_ready} 项本机答案，{materials} 项资料包，{needs} 项待补充，{failed} 项失败；请在原文档或原表单审阅并手动提交",
                 )
             with self._lock:
                 job["status"] = status
@@ -565,6 +584,25 @@ class FrontendJobs:
         if thread:
             thread.join(timeout)
         return self._active is None
+
+    def _fill_response_item(self, job_id, item, package):
+        self._item(job_id, item, status="filling_form")
+        try:
+            result = fill_response_forms(
+                self.settings, package, progress=lambda msg: self._log(job_id, msg)
+            )
+            self._item(
+                job_id,
+                item,
+                status="form_opened",
+                form_fill=result,
+                error=None,
+                generation=read_json(package / "codex-generation.json"),
+            )
+        except RunCancelled:
+            raise
+        except WorkflowError as exc:
+            self._item(job_id, item, status="needs_form", error=str(exc))
 
     def policy(self, course_id):
         pending = read_json(self.root / "pending.json", {"assignments": []})
@@ -664,6 +702,7 @@ class FrontendJobs:
             "policy_changed": changed,
             "generation": generation,
             "document_fill": read_json(package / "document-fill.json"),
+            "form_fill": read_json(package / "form-fill.json") if not changed else None,
         }
 
     @staticmethod
