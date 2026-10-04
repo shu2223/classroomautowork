@@ -1,6 +1,6 @@
 """Callable orchestration: live read, incremental processing, retrieval, review handoff.
 
-The only remote adapter is GoogleReader's explicit read-only surface. Course text never
+Remote reads use explicit Google API adapters and the bounded Forms GET reader. Course text never
 becomes a command, executable path, configuration, scope, approval or account selection.
 """
 
@@ -13,6 +13,7 @@ from .buzz import BuzzConfig, transcribe_media
 from .config import Settings
 from .errors import ConfigurationError, PermissionDenied, RunCancelled, WorkflowError
 from .extract import extract_document, processor_identity
+from .form_read import PARSER_VERSION, form_chunks, form_references, read_form
 from .google_read import GoogleReader, attachment_metadata, drive_attachments
 from .local import atomic_json, sha256_file, utc_now
 from .pending import PENDING_STATES, discover_pending
@@ -20,6 +21,7 @@ from .policy import CoursePolicy
 from .progress import ProgressUpdate, report
 from .search import retrieve
 from .store import Store, artifact, fingerprint
+from .student import StudentProfile
 
 MEDIA = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".mp3", ".wav", ".m4a", ".ogg", ".flac"}
 
@@ -123,6 +125,7 @@ def sync_course(
             warnings.append({"source": kind, "error": str(exc)})
     records.extend(("submission", stable_source(item)) for item in submissions)
     attachments, origins, resolutions, downloads = {}, {}, {}, {}
+    linked_forms, form_origins, response_forms = {}, {}, {}
     for kind, item in records:
         source_id = kind + ":" + item.get("id", item.get("courseWorkId", ""))
         revision = fingerprint(item)
@@ -135,6 +138,19 @@ def sync_course(
         store.memo("classroom-snapshot", [course_id, source_id, revision], snapshot)
         store.replace_chunks(course_id, source_id, revision, text_chunks(item, kind))
         readable.add(source_id)
+        for url in form_references(item):
+            form_id = "form:" + fingerprint(url)[:24]
+            linked_forms[form_id] = url
+            form_origins.setdefault(form_id, []).append(
+                {
+                    "source_id": source_id,
+                    "url": item.get("alternateLink"),
+                    "assignment_id": item.get(
+                        "courseWorkId", item.get("id") if kind == "coursework" else None
+                    ),
+                    "role": kind,
+                }
+            )
         for file in drive_attachments(item):
             attachments[file["id"]] = file
             origins.setdefault(file["id"], []).append(
@@ -147,6 +163,59 @@ def sync_course(
                     "role": "student_document" if kind == "submission" else kind,
                 }
             )
+    for source_id, url in list(linked_forms.items())[:100]:
+        try:
+            report(progress, "正在只读读取 Google Forms 全部页面的题目与选项", "form_read")
+            form = read_form(url)
+            revision = fingerprint(form)
+
+            def save_form(key, value=form):
+                path = settings.data_dir / "forms" / key[:24] / "questions.json"
+                atomic_json(path, value)
+                return {
+                    "path": str(path),
+                    "chunks": form_chunks(value),
+                    "artifacts": [artifact(path)],
+                }
+
+            result = store.memo("form-questions", [revision, PARSER_VERSION], save_form)
+            store.replace_chunks(course_id, source_id, revision, result["chunks"])
+            readable.add(source_id)
+            response_forms[source_id] = {
+                "source_id": source_id,
+                "title": form["title"],
+                "url": url,
+                "page_count": form["page_count"],
+                "question_count": len(form["questions"]),
+                "read_complete": form["read_complete"],
+            }
+            report(
+                progress,
+                f"已读取表单 {form['page_count']} 页、{len(form['questions'])} 个题目或身份栏，题目已加入要求来源",
+                "form_read",
+            )
+            warnings.extend(
+                {"source": source_id, "url": url, "error": warning} for warning in form["warnings"]
+            )
+        except RunCancelled:
+            raise
+        except WorkflowError as exc:
+            warnings.append(
+                {
+                    "source": source_id,
+                    "url": url,
+                    "origins": form_origins[source_id],
+                    "error": str(exc),
+                }
+            )
+    for source_id, url in list(linked_forms.items())[100:]:
+        warnings.append(
+            {
+                "source": source_id,
+                "url": url,
+                "error": "课程表单数量超过本次 100 份只读预算，未读取。",
+            }
+        )
     for number, (file_id, reference) in enumerate(attachments.items(), 1):
         name = str(reference.get("title") or "课程附件")[:200]
 
@@ -292,6 +361,8 @@ def sync_course(
         "attachment_origins": origins,
         "attachment_resolutions": resolutions,
         "downloads": downloads,
+        "response_forms": response_forms,
+        "form_origins": form_origins,
         "resource_index": [
             {
                 "source_id": kind + ":" + item.get("id", item.get("courseWorkId", "")),
@@ -315,6 +386,16 @@ def prepare_assignment(
     chunks = store.chunks(course_id)
     submission = course.get("submissions", {}).get(assignment_id)
     requirement_ids = {"coursework:" + assignment_id}
+    response_forms = [
+        value
+        for source_id, value in course.get("response_forms", {}).items()
+        if any(
+            origin.get("assignment_id") == assignment_id
+            for origin in course.get("form_origins", {}).get(source_id, [])
+        )
+    ]
+    requirement_ids.update(value["source_id"] for value in response_forms)
+    student_profile = asdict(StudentProfile.load(settings.data_dir))
     required_files = set()
     for original, origins in course.get("attachment_origins", {}).items():
         if any(x.get("assignment_id") == assignment_id for x in origins):
@@ -362,6 +443,7 @@ def prepare_assignment(
             if "file:" + course.get("attachment_resolutions", {}).get(original, "") == source_id
             for x in values
         ]
+        parents.extend(course.get("form_origins", {}).get(source_id, []))
         source_index.append(
             {
                 "source_id": source_id,
@@ -382,6 +464,8 @@ def prepare_assignment(
             "schema": 2,
             "source_index": source_index,
             "downloads": course.get("downloads", {}),
+            "response_forms": response_forms,
+            "student_profile": student_profile,
         }
     )
     path = settings.data_dir / "review-packages" / course_id / assignment_id / identity[:24]
@@ -404,6 +488,8 @@ def prepare_assignment(
             "assignment_id": assignment_id,
             "assignment": assignment,
             "student_submission": submission,
+            "student_profile": student_profile,
+            "response_forms": response_forms,
             "source_index": source_index,
             "downloads": list(course.get("downloads", {}).values()),
             "recommended_evidence_ids": list(
@@ -427,6 +513,7 @@ def prepare_assignment(
             {
                 "original_assignment": assignment,
                 "student_submission": submission,
+                "response_forms": response_forms,
                 "sources": requirements,
             },
         )

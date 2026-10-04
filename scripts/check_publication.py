@@ -3,10 +3,12 @@
 import json
 import re
 import subprocess
+from dataclasses import asdict
 from pathlib import Path
 
 from classroomautowork.config import Settings
 from classroomautowork.errors import WorkflowError
+from classroomautowork.student import StudentProfile
 
 ROOT_FILES = {"LICENSE", "README.md", ".gitignore", ".gitattributes", "pyproject.toml", "uv.lock"}
 SOURCE_DIRS = (
@@ -32,6 +34,9 @@ def main():
     try:
         settings = Settings.load()
         sensitive.append(settings.school_email)
+        sensitive.extend(
+            value for value in asdict(StudentProfile.load(settings.data_dir)).values() if value
+        )
         installed = json.loads(settings.client_json.read_text(encoding="utf-8-sig"))["installed"]
         sensitive.extend(installed[k] for k in ("client_id", "client_secret") if installed.get(k))
         path = settings.data_dir / "connection-receipt.json"

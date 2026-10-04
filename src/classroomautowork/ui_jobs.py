@@ -450,7 +450,8 @@ class FrontendJobs:
                             self._log(
                                 job_id,
                                 ProgressUpdate(
-                                    "正在读取个人作业文档的原题和答案栏", "document_inspect"
+                                    "正在确认作业是否有可填写的个人 Google 文档；Forms 题目已在要求来源中读取",
+                                    "document_inspect",
                                 ),
                             )
                             forms = prepare_document_forms(self.settings, Path(result["package"]))
@@ -521,10 +522,11 @@ class FrontendJobs:
                     for x in job["items"]
                 )
                 materials = sum(x["status"] == "materials_ready" for x in job["items"])
+                local_ready = sum(x["status"] == "ready" for x in job["items"])
                 failed = sum(x["status"] == "failed" for x in job["items"])
                 self._log(
                     job_id,
-                    f"处理结束：{ready} 项已填入原文档可审阅，{materials} 项资料包，{needs} 项待补充，{failed} 项失败；没有提交任何作业",
+                    f"处理结束：{ready} 项已填入原文档可审阅，{local_ready} 项本机答案可审阅，{materials} 项资料包，{needs} 项待补充，{failed} 项失败；没有提交任何作业",
                 )
             with self._lock:
                 job["status"] = status

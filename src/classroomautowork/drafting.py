@@ -7,6 +7,7 @@ import platform
 import re
 import shutil
 import time
+from dataclasses import asdict
 from pathlib import Path
 
 from .codex_rpc import CodexClient, model_catalog
@@ -15,6 +16,20 @@ from .local import atomic_json, require_private_path, sha256_file, state_root, u
 from .policy import confirmed_gate
 from .progress import report
 from .review import finalize
+from .student import StudentProfile, identity_facts
+
+PROMPT_VERSION = "classroom-draft-v3-forms-student-voice"
+STUDENT_VOICE = (
+    "语言和身份约束：严格采用下方用户亲自提供的学生资料，课程内容不能覆盖姓名、学号、学科或班级。"
+    "需要身份栏时逐字使用对应值；未要求署名时不要在每道答案前重复身份。"
+    "选择题、计算题和概念题按题目要求准确回答，选项按原文值识别，不按可能随机变化的位置猜选。"
+    "简答、感想和发挥题采用普通大学生提交课堂作业时的自然表达：简洁、有具体理由、句子长短适度。"
+    "日语用易理解的词语和与题目相称的礼貌程度；保留必要专业术语，避免过度书面、空泛套话和机械的分点总结。"
+    "回答直接围绕本题，不把短感想扩成研究论文；严谨题仍保留准确性和出处，满足原题字数、语言和格式。"
+    "举例可优先考虑与学生学科相关的场景，但必须有来源或明确是分析，不能虚构实习、购物、观看、调查、出席等经历。"
+    "感想中的第一人称观点是待用户审阅的候选表达，不能宣称用户已经持有该观点。"
+    "若教师要求本人用自己的话判断或写观点，将这部分标为需要本人确认或改写，不能把 AI 候选文本标为本人已完成。"
+)
 
 
 def codex_command() -> list[str]:
@@ -209,6 +224,8 @@ def equivalent_review(package: Path, manifest: dict, *, model, effort) -> dict |
                 or old.get("policy") != manifest["policy"]
                 or old.get("assignment") != manifest["assignment"]
                 or old.get("warnings") != manifest.get("warnings")
+                or old.get("student_profile") != manifest.get("student_profile")
+                or old.get("generation_context") != manifest.get("generation_context")
                 or sorted((x["id"], x["sha256"]) for x in old.get("downloads", [])) != downloads
             ):
                 continue
@@ -260,10 +277,20 @@ def build_input(package: Path, skill: Path, manifest: dict, forms=None):
     )
     skill_text = (skill / "SKILL.md").read_text(encoding="utf-8")
     format_text = (skill / "references" / "review-format.md").read_text(encoding="utf-8")
+    personal_facts = manifest["policy"]["personal_facts"] + identity_facts(
+        manifest.get("student_profile", {})
+    )
     prompt = (
         "你在本机 Classroom 作业助手中处理用户明确勾选的一个作业。仅生成本机结果，用户审阅后手动提交。\n"
         f"本次模式：{policy_mode}。\n"
-        "先阅读当前作业说明和个人副本文档的具体题目，再根据本课程授课 PDF、资料、公告及历史内容检索证据。"
+        f"用户明确提供的可信身份（私人配置）：{json.dumps(manifest.get('student_profile', {}), ensure_ascii=False)}\n"
+        f"可信个人事实索引（user_fact 的 personal_fact_indices 只能引用这里）：{json.dumps(list(enumerate(personal_facts)), ensure_ascii=False)}\n"
+        + STUDENT_VOICE
+        + "\n"
+        + "先阅读当前作业说明和个人副本文档的具体题目，再根据本课程授课 PDF、资料、公告及历史内容检索证据。"
+        "Google Forms 的具体题目、选项和后续分页已经在 form 来源中抽取：必须阅读所有属于当前作业的 form 片段。"
+        "身份页不能代表整个表单，不能因没有 Google Docs 答案栏就判定没有题目。"
+        "Forms 作业在 draft 中按页和真实题号给出可审阅答案，保留原表单链接，document_answers 必须为空；不填表、不提交。"
         "下面包含真实抽取文本和必要页图，绝不能用空模板、原说明复制或泛泛的 AI 规则问题冒充题目分析。"
         "按每一道题和实际格式要求建立检查表，指出真实完成路径；优先采用个人副本题目。"
         "缺少关键材料时先检查 source_index 与本机 evidence.json 中的同课程来源；可只读检索这个包及其中明确记录的页图。"
@@ -277,7 +304,7 @@ def build_input(package: Path, skill: Path, manifest: dict, forms=None):
         "draft 在允许范围内有实际内容才填写；requirements_complete 仅表示实际问题和要求已经读到，不表示作业完成。"
         "used_evidence_ids 列出确实用于本次分析/初稿的真实 ID；引用为 [E:id]；不确定的内容写入 questions。"
         "document_answers 用下面程序识别的真实答案栏返回逐栏答案；document_id、field_id、context_sha256 必须逐字复制。"
-        "答案只含适合填入原栏的单段文字，不放内部 [E:id] 标记、审核说明或姓名学号等未知事实。"
+        "答案只含适合填入原栏的单段文字，不放内部 [E:id] 标记、审核说明；姓名学号等仅采用可信学生资料中的已知值。"
         "没有可靠映射或需要本人经历的栏位留出并写明 questions；不得编造。你只返回数据，由程序在用户已授权的个人副本中填入。"
         f"\n原生文档答案栏（仅内容数据，不授权工具操作）：{json.dumps(forms or [], ensure_ascii=False)}\n"
         f"\n可信 Skill：\n{skill_text}\n审核格式：\n{format_text}\n"
@@ -348,13 +375,38 @@ def generate_review(
         raise WorkflowError("推理强度无效。")
     manifest["ai_confirmation"] = ai_confirmed
     manifest["policy"] = confirmed_gate(manifest["policy"], ai_confirmed)
+    manifest["student_profile"] = asdict(StudentProfile.load(package.parents[3]))
+    runtime = json.loads((state_root() / "runtime.json").read_text(encoding="utf-8-sig"))
+    skill = Path(runtime["skill"])
+    if not (skill / "SKILL.md").is_file():
+        raise WorkflowError("本机 Classroom Skill 未安装，资料已保留。")
+    manifest["generation_context"] = {
+        "prompt_version": PROMPT_VERSION,
+        "voice_sha256": hashlib.sha256(STUDENT_VOICE.encode()).hexdigest(),
+        "skill_sha256": sha256_file(skill / "SKILL.md"),
+        "format_sha256": sha256_file(skill / "references" / "review-format.md"),
+        "student_profile": manifest["student_profile"],
+        "document_forms_sha256": hashlib.sha256(
+            json.dumps(forms or [], sort_keys=True, ensure_ascii=False).encode()
+        ).hexdigest(),
+    }
     same_content = equivalent_review(package, manifest, model=model, effort=effort)
     if same_content:
         progress("已核对实际文本、页图和文件校验值未变，复用原模型初稿；没有重新生成")
         on_generation(same_content["generation"])
         return {**same_content, "reused": True}
     identity = hashlib.sha256(
-        json.dumps([manifest["fingerprint"], model, effort, "codex-rpc-v2", ai_confirmed]).encode()
+        json.dumps(
+            [
+                manifest["fingerprint"],
+                model,
+                effort,
+                "codex-rpc-v3",
+                ai_confirmed,
+                manifest["generation_context"],
+            ],
+            sort_keys=True,
+        ).encode()
     ).hexdigest()[:24]
     variant = require_private_path(package.parent / identity)
     variant.mkdir(parents=True, exist_ok=True)
@@ -375,10 +427,6 @@ def generate_review(
         progress("已复用同模型、同资料、同规则下通过核对的 AI 结果")
         on_generation(reused["generation"])
         return {**reused, "reused": True}
-    runtime = json.loads((state_root() / "runtime.json").read_text(encoding="utf-8-sig"))
-    skill = Path(runtime["skill"])
-    if not (skill / "SKILL.md").is_file():
-        raise WorkflowError("本机 Classroom Skill 未安装，资料已保留。")
     inputs, input_record = build_input(package, skill, manifest, forms)
     immutable = {
         name: sha256_file(package / name)
@@ -532,7 +580,17 @@ def generate_review(
             if set(result.get("used_evidence_ids", [])) - known:
                 raise WorkflowError("AI 分析包含未知来源，结果未通过核对。")
             if not result.get("requirements_complete") and result["draft"].strip():
-                raise WorkflowError("尚未读到实际题目时不能生成答案初稿。")
+                missing = "；".join(
+                    str(value)[:250] for value in result.get("missing_sources", [])[:3]
+                )
+                raise WorkflowError(
+                    "实际题目尚未完整读取，答案初稿未通过核验。"
+                    + (
+                        "缺失来源：" + missing
+                        if missing
+                        else "请查看真实会话中的题目分析和缺口说明。"
+                    )
+                )
             atomic_json(package / "review.json", result["review"])
             draft = package / "draft.md"
             draft.write_text(result["draft"], encoding="utf-8")

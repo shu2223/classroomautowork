@@ -22,4 +22,6 @@ assert.equal(v.index,0); assert.equal(v.ready,0); assert.equal(v.measurement,nul
 v = progressView({...job,status:'completed',items:[{status:'document_ready'}],finished_at:'2026-01-01T00:08:00Z'},network,now);
 assert.equal(v.ready,1); assert.equal(v.finished,1); assert.equal(v.index,3); assert.equal(v.elapsed,480000);
 console.log('Production progress-state checks passed');
-
+v = progressView({...job,status:'completed',items:[{status:'ready'}],finished_at:'2026-01-01T00:08:00Z'},network,now);
+assert.equal(v.localReady,1); assert.equal(v.ready,0); assert.equal(v.finished,1); assert.equal(v.index,3);
+assert.match(v.explanation,/原表单/);
