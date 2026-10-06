@@ -15,6 +15,7 @@ from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload
 from httplib2 import HttpLib2Error
 
+from .attachment_cache import download_revision
 from .errors import PermissionDenied, WorkflowError
 from .local import atomic_json
 from .progress import report
@@ -188,8 +189,10 @@ class GoogleReader:
             and not mime.startswith("application/vnd.google-apps.")
         ):
             try:
-                resume = json.loads(checkpoint.read_text(encoding="utf-8")) == revision
-            except ValueError:
+                resume = download_revision(
+                    json.loads(checkpoint.read_text(encoding="utf-8"))
+                ) == download_revision(revision)
+            except (ValueError, TypeError, AttributeError, KeyError):
                 pass
         if not resume:
             temporary.unlink(missing_ok=True)
@@ -198,7 +201,7 @@ class GoogleReader:
             with temporary.open("ab" if resume else "wb") as stream:
                 downloader = MediaIoBaseDownload(stream, request, chunksize=1024 * 1024)
                 # google-api-python-client 2.x supports Range reads using this offset.
-                # The offset is only restored when the exact Drive revision matches.
+                # Resume only the same binary content; metadata-only versions can change.
                 downloader._progress = temporary.stat().st_size if resume else 0
                 done = bool(
                     resume

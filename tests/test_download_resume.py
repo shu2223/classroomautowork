@@ -3,13 +3,15 @@
 import hashlib
 from types import SimpleNamespace
 
+import pytest
 from httplib2 import Response
 
 from classroomautowork.google_read import GoogleReader
 from classroomautowork.local import atomic_json
 
 
-def test_partial_download_resumes_only_matching_drive_revision(tmp_path):
+@pytest.mark.parametrize("change", ["none", "metadata_only", "content", "invalid_checkpoint"])
+def test_partial_download_resumes_only_matching_drive_content(tmp_path, change):
     content = b"unit-data-for-range"
     offsets = []
 
@@ -42,17 +44,21 @@ def test_partial_download_resumes_only_matching_drive_revision(tmp_path):
     part = destination / (identity + ".txt.part")
     part.write_bytes(content[:5])
     checkpoint = part.with_suffix(part.suffix + ".json")
-    atomic_json(
-        checkpoint, {k: meta.get(k) for k in ("id", "version", "mimeType", "size", "md5Checksum")}
-    )
+    previous = {k: meta.get(k) for k in ("id", "version", "mimeType", "size", "md5Checksum")}
+    if change == "metadata_only":
+        previous["version"] = "older"
+    elif change == "content":
+        previous["md5Checksum"] = "0" * 32
+    atomic_json(checkpoint, None if change == "invalid_checkpoint" else previous)
     events = []
     result = reader.download(meta, destination, progress=events.append)
     from pathlib import Path
 
     assert Path(result["path"]).read_bytes() == content
-    assert offsets == [5] and not part.exists() and not checkpoint.exists()
+    expected_offset = 0 if change in {"content", "invalid_checkpoint"} else 5
+    assert offsets == [expected_offset] and not part.exists() and not checkpoint.exists()
     measured = [x.details for x in events if x.details["stage"] == "download"]
-    assert measured[0]["current"] == 5 and measured[-1]["current"] == len(content)
+    assert measured[0]["current"] == expected_offset and measured[-1]["current"] == len(content)
     assert all(x["total"] == len(content) for x in measured)
     assert events[-1].details["stage"] == "download_verify"
     part.write_bytes(b"old revision bytes")

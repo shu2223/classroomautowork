@@ -69,12 +69,37 @@ class Store:
                 return False
         return True
 
-    def memo(self, kind: str, identity, operation) -> dict:
+    def find_cached(self, kind, matches):
+        for row in self.db.execute(
+            "SELECT result FROM tasks WHERE kind=? AND status='done' ORDER BY updated_at DESC",
+            (kind,),
+        ):
+            try:
+                result = json.loads(row["result"])
+                if isinstance(result, dict) and matches(result) and self._valid(result):
+                    return result
+            except (OSError, ValueError, KeyError, TypeError):
+                continue
+        return None
+
+    def memo(self, kind: str, identity, operation, *, reuse=None) -> dict:
         key = fingerprint([kind, identity])
         row = self.db.execute("SELECT * FROM tasks WHERE key=?", (key,)).fetchone()
         if row and row["status"] == "done":
             result = json.loads(row["result"])
             if self._valid(result):
+                self.stats["reused"] += 1
+                return result
+        if reuse:
+            result = reuse()
+            if result is not None and self._valid(result):
+                self.db.execute(
+                    """INSERT INTO tasks(key,kind,status,attempts,result,updated_at)
+                    VALUES(?,?,'done',1,?,?) ON CONFLICT(key) DO UPDATE SET
+                    status='done',result=excluded.result,error=NULL,updated_at=excluded.updated_at""",
+                    (key, kind, json.dumps(result, ensure_ascii=False), utc_now()),
+                )
+                self.db.commit()
                 self.stats["reused"] += 1
                 return result
         self.db.execute(

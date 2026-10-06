@@ -8,6 +8,7 @@ import json
 from dataclasses import asdict
 from pathlib import Path
 
+from .attachment_cache import content_signature, download_revision, legacy_download
 from .auth import credentials_for
 from .buzz import BuzzConfig, transcribe_media
 from .config import Settings
@@ -267,13 +268,11 @@ def sync_course(
                 suffix in MEDIA or metadata["mimeType"].startswith(("video/", "audio/"))
             ):
                 raise WorkflowError("Media processing explicitly deferred for this run.")
-            if not metadata.get("version"):
+            if not metadata.get("version") and not content_signature(metadata):
                 raise WorkflowError(
                     "Drive revision is unavailable; cannot establish an incremental cache key."
                 )
-            revision = fingerprint(
-                {k: metadata.get(k) for k in ("id", "version", "mimeType", "size", "md5Checksum")}
-            )
+            revision = download_revision(metadata)
 
             def download(key, meta=metadata):
                 result = reader.download(
@@ -283,12 +282,22 @@ def sync_course(
                 )
                 return {**result, "artifacts": [artifact(Path(result["path"]))]}
 
-            raw = store.memo("drive-download", revision, download)
+            reused_before = store.stats["reused"]
+            raw = store.memo(
+                "drive-download",
+                revision,
+                download,
+                reuse=lambda meta=metadata: legacy_download(store, meta),
+            )
+            if store.stats["reused"] > reused_before:
+                file_progress(
+                    ProgressUpdate("附件内容未变，已复用完整本地文件；无需下载", "attachment")
+                )
             file_progress(ProgressUpdate("附件已取得，正在复核版本和下载权限", "attachment"))
             after = reader.file_metadata(resolved_id, metadata.get("resourceKey"))
-            if metadata["version"] != after.get("version") or not after.get("capabilities", {}).get(
-                "canDownload"
-            ):
+            if download_revision(metadata) != download_revision(after) or not after.get(
+                "capabilities", {}
+            ).get("canDownload"):
                 raise WorkflowError(
                     "Attachment changed or permission was removed during processing; rerun."
                 )
