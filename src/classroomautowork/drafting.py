@@ -476,6 +476,11 @@ def generate_review(
         progress("已复用同模型、同资料、同规则下通过核对的 AI 结果")
         on_generation(reused["generation"])
         return {**reused, "reused": True}
+    recovered = recover_completed_result(package, model=model, effort=effort, forms=forms)
+    if recovered:
+        progress("已重新核验上次实际完成的 Codex 答案，没有重新调用 AI")
+        on_generation(recovered["generation"])
+        return {**recovered, "reused": True}
     inputs, input_record = build_input(package, skill, manifest, forms)
     immutable = {
         name: sha256_file(package / name)
@@ -630,6 +635,36 @@ def generate_review(
         )
         save()
         raise
+
+
+def recover_completed_result(package: Path, *, model, effort, forms=None):
+    """Retry local validation only when the same completed turn and bytes survive."""
+    try:
+        generation = json.loads((package / "codex-generation.json").read_text(encoding="utf-8"))
+        result_path = package / "codex-result.json"
+        if (
+            generation.get("status") != "failed"
+            or generation.get("turn_status") != "completed"
+            or generation.get("model") != model
+            or generation.get("reasoning_effort") != effort
+            or generation.get("result_file") != "codex-result.json"
+            or sha256_file(result_path) != generation.get("result_sha256")
+            or not generation.get("source_files_sha256")
+        ):
+            return None
+        result_text = result_path.read_text(encoding="utf-8")
+        previous_error = generation.pop("error", "")
+        receipt = accept_model_result(
+            package, generation, json.loads(result_text), result_text, forms
+        )
+        generation.update(
+            validation_recovered_at=utc_now(), previous_validation_error=previous_error
+        )
+        atomic_json(package / "codex-generation.json", generation)
+        atomic_json(package / "review-receipt.json", receipt)
+        return receipt
+    except (WorkflowError, OSError, ValueError, KeyError):
+        return None
 
 
 def accept_model_result(

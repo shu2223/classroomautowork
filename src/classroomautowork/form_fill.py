@@ -21,6 +21,7 @@ from .local import atomic_json, require_private_path, sha256_file, utc_now
 from .policy import CoursePolicy, confirmed_gate
 from .progress import ProgressUpdate
 from .student import StudentProfile
+from .user_answers import load_user_answers, merge_answers
 
 SUPPORTED = {"short_text", "paragraph", "single_choice", "dropdown", "checkbox", "scale"}
 
@@ -86,9 +87,9 @@ def validate_answers(forms: list[dict], answers: list[dict], profile=None) -> li
         if answer.get("context_sha256") != form["context_sha256"]:
             raise WorkflowError("表单原题已变化，不能沿用旧答案填写。")
         values = answer.get("values")
-        if values == [] and not field["required"]:
-            # An explicitly unanswered optional feedback field is not an invalid answer.
-            # Preserve it blank without discarding all of the usable assignment answers.
+        if values == [] and (not field["required"] or answer.get("needs_user") is True):
+            # Missing personal facts remain blank and appear in the software's question
+            # editor. They must not invalidate other usable answers or invent a value.
             continue
         if (
             question["type"] not in SUPPORTED
@@ -193,6 +194,10 @@ def fill_response_forms(settings, package: Path, *, progress=lambda _: None, ope
         json.loads(answers_path.read_text(encoding="utf-8"))["answers"],
         StudentProfile.load(settings.data_dir),
     )
+    user_record = load_user_answers(
+        settings.data_dir, manifest, forms, StudentProfile.load(settings.data_dir)
+    )
+    answers = merge_answers(answers, user_record["answers"])
     plans = []
     for form in forms:
         progress(ProgressUpdate("正在核对原表单题目与自动填写的栏位", "form_fill"))
@@ -230,7 +235,13 @@ def fill_response_forms(settings, package: Path, *, progress=lambda _: None, ope
     record = {
         "status": "prefill_prepared",
         "forms": plans,
-        "answers_sha256": sha256_file(answers_path),
+        "answers_sha256": hashlib.sha256(
+            (sha256_file(answers_path) + user_record["sha256"]).encode()
+        ).hexdigest()
+        if user_record["answers"]
+        else sha256_file(answers_path),
+        "user_answers_sha256": user_record["sha256"],
+        "user_answer_count": len(user_record["answers"]),
         "submission": "manual_only",
         "created_at": utc_now(),
         "generation": {

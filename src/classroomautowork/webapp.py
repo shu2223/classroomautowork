@@ -270,7 +270,7 @@ class LocalHandler(BaseHTTPRequestHandler):
                     raise WorkflowError("文档授权请求不接受额外参数。")
                 result = jobs.authorize_documents()
             elif match := re.fullmatch(
-                r"/api/jobs/([a-f0-9]{32})/items/([0-9]+:[0-9]+)/(supplement|continue|followup|questions)",
+                r"/api/jobs/([a-f0-9]{32})/items/([0-9]+:[0-9]+)/(supplement|continue|followup|questions|answers)",
                 path,
             ):
                 job_id, key, operation = match.groups()
@@ -278,6 +278,8 @@ class LocalHandler(BaseHTTPRequestHandler):
                     if payload:
                         raise WorkflowError("接收补充不接受其他会话 ID 或操作指令。")
                     result = jobs.import_followup(job_id, key)
+                elif operation == "answers":
+                    result = jobs.save_form_inputs(job_id, key, payload)
                 elif operation == "questions":
                     result = jobs.import_questions(job_id, key, payload)
                 else:

@@ -29,3 +29,19 @@ v = progressView({...job,items:[{status:'filling_form'}],message:'Opening native
 assert.equal(v.stage,'form_fill'); assert.equal(v.index,2); assert.match(v.explanation,/不会点击提交/);
 v = progressView({...job,status:'completed',items:[{status:'form_opened'}]},network,now);
 assert.equal(v.ready,1); assert.equal(v.index,3); assert.match(v.explanation,/预填原表单审阅/);
+
+const editorCode = source.slice(source.indexOf('function supplementFields('), source.indexOf('function renderAnswerInputs('));
+const {supplementFields} = vm.runInNewContext(editorCode + '\n({supplementFields});');
+const form = {url:'unit-form', context_sha256:'unit-context', questions:[
+  {page:2,title:'2) Actual situation',fields:[{entry_id:'20',choices:['A','B・C']}]},
+  {page:1,title:'1) Known identity',fields:[{entry_id:'10',choices:[]}]},
+  {page:2,title:'1) Other situation',fields:[{entry_id:'30',choices:[]}]}
+]};
+const base = {response_fields:[form], model_form_answers:[{form_url:form.url,entry_id:'10',values:['Known user identity']}]};
+let fields = supplementFields(base);
+assert.equal(fields.length,2); assert.equal(fields[0].field.entry_id,'30');
+assert.equal(fields[1].field.choices[1],'B・C'); assert.equal(fields[1].supplied,undefined);
+fields = supplementFields({...base,user_form_answers:{answers:[{form_url:form.url,entry_id:'10',values:['Known user identity']} ]}});
+assert.equal(fields.length,3); assert.equal(fields[0].supplied.values[0],'Known user identity');
+assert.equal(supplementFields(null).length,0);
+console.log('Production native-question editor checks passed');

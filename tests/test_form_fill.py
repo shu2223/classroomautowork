@@ -86,6 +86,18 @@ def test_empty_optional_feedback_does_not_discard_real_assignment_answers():
     assert query["entry.202"] == ["A"] and "entry.204" not in query
 
 
+def test_missing_required_personal_fact_stays_blank_without_discarding_other_answers():
+    form = native_form()
+    missing = answer(form, "200", needs_user=True)
+    missing["values"] = []
+    validated = form_fill.validate_answers([form], [missing, answer(form)])
+    query = parse_qs(urlparse(form_fill.prefill_url(form, validated)).query)
+    assert query["entry.202"] == ["A"] and "entry.200" not in query
+    missing["needs_user"] = False
+    with pytest.raises(WorkflowError):
+        form_fill.validate_answers([form], [missing, answer(form)])
+
+
 def test_already_submitted_assignment_does_not_allow_browser_filling():
     reader = SimpleNamespace(
         own_submissions=lambda _: [{"courseWorkId": "2", "state": "TURNED_IN"}],

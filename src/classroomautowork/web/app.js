@@ -324,15 +324,15 @@ async function openSupplement(jobId, key) {
     const item = job.items.find(x => keyOf(x) === key);
     if (!item) throw new Error("找不到这项作业");
     const data = item.package ? await api(`/api/jobs/${jobId}/items/${key}`) : null; const supplement = data?.supplement || await api(`/api/jobs/${jobId}/items/${key}/supplement`);
-    state.supplement = {jobId, key, model: state.models?.models.some(x=>x.model === $("modelSelect").value) ? $("modelSelect").value : job.model || null, effort: $("effortSelect").value || job.effort || null};
+    state.supplement = {jobId, key, model: state.models?.models.some(x=>x.model === $("modelSelect").value) ? $("modelSelect").value : job.model || null, effort: $("effortSelect").value || job.effort || null, actualModel:data?.generation?.model || item.generation?.model, actualEffort:data?.generation?.reasoning_effort || item.generation?.reasoning_effort, editors: [], savedText:supplement.text || "", savedFacts:supplement.personal_facts || []};
     $("supplementTitle").textContent = item.title || key;
     $("supplementText").value = supplement.text || "";
     $("supplementFacts").value = (supplement.personal_facts || []).join("\n");
+    renderAnswerInputs(data); updateSupplementActions();
     $("supplementQuestions").replaceChildren(); if (data?.review?.questions?.length || item.error) $("supplementQuestions").append(node("strong", "上次处理留下的问题（本次继续会重新核验）"));
     for (const question of data?.review?.questions || []) $("supplementQuestions").append(node("p", question));
     if (item.error) $("supplementQuestions").append(node("p", friendlyError(item.error))); if (item.browser_read?.thread_id) { const readLink = codexLink(item.browser_read); if (readLink) { readLink.textContent = "打开登录题目读取会话 ↗"; $("supplementQuestions").append(readLink); } }
     $("supplementAi").checked = !!job.ai_confirmed;
-    $("supplementModel").textContent = `继续使用模型：${state.supplement.model || "未选择（只整理资料）"} · ${state.supplement.effort || "默认强度"}。可先关闭窗口在主界面选择其他模型。`;
     $("supplementError").hidden = true;
     $("followupNote").textContent = "已在这项作业的 Codex 会话里补充过？点击读取已完成的回复，随后继续核验与作答。";
     $("receiveFollowup").disabled = !item.generation?.thread_id || !!state.active;
@@ -352,6 +352,8 @@ async function supplementAction(button, operation) {
 }
 async function saveSupplement(continueRun) {
   const {jobId, key, model, effort} = state.supplement;
+  if (state.supplement.editors.length && !supplementNotesChanged()) return saveFormInputs(continueRun);
+  if (state.supplement.editors.length) await saveFormInputs(false, false);
   const payload = {text: $("supplementText").value, personal_facts: $("supplementFacts").value.split("\n").map(x=>x.trim()).filter(Boolean)};
   if (continueRun) Object.assign(payload, {ai_confirmed: $("supplementAi").checked, model, effort});
   await api(`/api/jobs/${jobId}/items/${key}/${continueRun ? "continue" : "supplement"}`, "POST", payload);
@@ -359,7 +361,57 @@ async function saveSupplement(continueRun) {
   if (continueRun) setView("history");
   toast(continueRun ? "补充已保存，正在继续处理这项作业" : "补充已保存到本机，下次处理时使用");
 }
+// Original native fields and choices are data; none can change destinations or permissions.
+function supplementFields(data) {
+  const known = new Map((data?.model_form_answers || []).filter(x=>x.values?.length).map(x=>[`${x.form_url}:${x.entry_id}`, x]));
+  const supplied = new Map((data?.user_form_answers?.answers || []).map(x=>[`${x.form_url}:${x.entry_id}`, x]));
+  return (data?.response_fields || []).flatMap(form=>form.questions.flatMap(question=>question.fields.map(field=>({form, question, field, supplied: supplied.get(`${form.url}:${field.entry_id}`), generated: known.has(`${form.url}:${field.entry_id}`)})))).filter(x=>!x.generated || x.supplied).sort((a,b)=>a.question.page - b.question.page || a.question.title.localeCompare(b.question.title, "ja", {numeric:true}));
+}
+function renderAnswerInputs(data) {
+  const section = $("answerInputsSection"), content = $("answerInputs"); content.replaceChildren();
+  const fields = supplementFields(data); section.hidden = !fields.length && !data?.response_fields_error;
+  $("answerInputNote").textContent = data?.response_fields_error || "按原题填写或选择。回答只保存在本机，自动带入原表单；个人情况采用你提供的内容，提交由你操作。";
+  $("extraSupplement").open = !fields.length;
+  for (const {form, question, field, supplied} of fields) {
+    const group = node("div", undefined, "answer-field"), id = `answer-input-${state.supplement.editors.length}`;
+    const label = node("label", `第 ${question.page} 页 · ${question.title}${field.required ? "（必填）" : "（选填）"}`); label.htmlFor = id; group.append(label);
+    if (question.description) group.append(node("p", question.description, "small muted"));
+    let control, read;
+    if (["single_choice", "dropdown", "scale"].includes(question.type) && field.choices.length) {
+      control = node("select"); const empty = node("option", "请选择你的真实情况"); empty.value = ""; control.append(empty);
+      for (const value of field.choices) { const option = node("option", value); option.value = value; control.append(option); }
+      control.value = supplied?.values?.[0] || ""; read = ()=>control.value ? [control.value] : [];
+    } else if (["short_text", "paragraph"].includes(question.type)) {
+      control = node(question.type === "paragraph" ? "textarea" : "input"); if (question.type === "paragraph") control.rows = 3; else control.type = "text";
+      control.maxLength = 20000; control.value = supplied?.values?.[0] || ""; control.placeholder = "在这里填写你的回答"; read = ()=>control.value.trim() ? [control.value.trim()] : [];
+    } else if (question.type === "checkbox" && field.choices.length) {
+      control = node("fieldset", undefined, "answer-options"); const options = [];
+      for (const value of field.choices) { const option = node("label", undefined, "checkbox-label"), input = node("input"); input.type = "checkbox"; input.value = value; input.checked = supplied?.values?.includes(value) || false; option.append(input, node("span", value)); control.append(option); options.push(input); }
+      read = ()=>options.filter(x=>x.checked).map(x=>x.value);
+    } else { group.append(node("p", "此题需要在原表单使用原生控件填写。", "small muted")); content.append(group); continue; }
+    control.id = id; group.append(control); content.append(group);
+    state.supplement.editors.push({form_url:form.url, entry_id:field.entry_id, context_sha256:form.context_sha256, read});
+  }
+}
+function supplementNotesChanged() { return $("supplementText").value !== state.supplement.savedText || JSON.stringify($("supplementFacts").value.split("\n").map(x=>x.trim()).filter(Boolean)) !== JSON.stringify(state.supplement.savedFacts); }
+function updateSupplementActions() {
+  const answersOnly = state.supplement.editors.length && !supplementNotesChanged();
+  $("saveSupplement").textContent = answersOnly ? "保存回答" : "保存补充";
+  $("continueSupplement").textContent = answersOnly ? "保存回答并自动填入" : "保存并继续处理";
+  $("supplementAiRow").hidden = !!answersOnly;
+  const s = state.supplement;
+  $("supplementModel").textContent = answersOnly ? `已有答案来自 ${s.actualModel || "任务所选模型"} · ${s.actualEffort || "默认强度"}。只合并你的回答，不重新调用 AI。` : `继续使用模型：${s.model || "未选择（只整理资料）"} · ${s.effort || "默认强度"}。可先关闭窗口在主界面选择其他模型。`;
+}
+async function saveFormInputs(apply, close = true) {
+  const {jobId, key, editors} = state.supplement;
+  const answers = editors.map(({read, ...mapping})=>({...mapping, values:read()})).filter(x=>x.values.length);
+  const result = await api(`/api/jobs/${jobId}/items/${key}/answers`, "POST", {answers, apply});
+  if (!close) return result;
+  $("supplementDialog").close(); await loadState(); if (apply) setView("history");
+  toast(result.apply_queued ? "回答已保存，当前任务结束后自动填入；不会提交" : apply ? "回答已保存，正在自动填入原表单；不会提交" : "逐题回答已保存到本机");
+}
 $("supplementButton").addEventListener("click", () => openSupplement(state.preview.jobId, state.preview.key));
+for (const id of ["supplementText", "supplementFacts"]) $(id).addEventListener("input", updateSupplementActions);
 $("saveSupplement").addEventListener("click", event => supplementAction(event.currentTarget, () => saveSupplement(false)));
 $("supplementForm").addEventListener("submit", event => { event.preventDefault(); supplementAction(event.submitter, () => saveSupplement(true)); });
 $("receiveFollowup").addEventListener("click", event => supplementAction(event.currentTarget, async () => {
@@ -368,6 +420,7 @@ $("receiveFollowup").addEventListener("click", event => supplementAction(event.c
   await api(`/api/jobs/${jobId}/items/${key}/supplement`, "POST", {text: $("supplementText").value, personal_facts: $("supplementFacts").value.split("\n").map(x=>x.trim()).filter(Boolean)});
   const result = await api(`/api/jobs/${jobId}/items/${key}/followup`, "POST", {});
   $("supplementText").value = result.supplement.text;
+  updateSupplementActions();
   $("followupNote").textContent = `已接收实际回合 ${result.followup.turn_id} · 模型 ${result.followup.model || "原会话"}。点击保存并继续，重新核验来源并作答。`;
   toast("已接收 Codex 补充，尚未提交");
 }));

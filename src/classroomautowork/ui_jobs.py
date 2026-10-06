@@ -23,7 +23,9 @@ from .local import atomic_json, require_private_path, sha256_file, utc_now
 from .pending import discover_pending
 from .policy import CoursePolicy, confirmed_gate
 from .progress import ProgressUpdate
+from .student import StudentProfile
 from .supplements import load_supplement, normalized, save_supplement
+from .user_answers import load_user_answers, save_user_answers
 from .workflow import prepare
 
 ACTIVE = {"queued", "running", "stopping"}
@@ -99,6 +101,20 @@ class FrontendJobs:
                         item["status"] = "interrupted"
                 atomic_json(path, job)
             self._jobs[job["id"]] = job
+        queued = read_json(self.root / "answer-fill-requests.json", {})
+        self._answer_requests = (
+            {
+                key: job_id
+                for key, job_id in queued.items()
+                if isinstance(key, str)
+                and re.fullmatch(r"[0-9]+:[0-9]+", key)
+                and isinstance(job_id, str)
+                and job_id in self._jobs
+            }
+            if isinstance(queued, dict)
+            else {}
+        )
+        self._next_answer_fill()
 
     def _save(self, job):
         job["updated_at"] = utc_now()
@@ -409,6 +425,60 @@ class FrontendJobs:
             "page_count": form["page_count"],
             "read_complete": form["read_complete"],
         }
+
+    def save_form_inputs(self, job_id, key, values):
+        if set(values) != {"answers", "apply"} or type(values["apply"]) is not bool:
+            raise WorkflowError("补充答案只接受逐栏回答及是否立即填入。")
+        package = self.package_path(job_id, key)
+        manifest = read_json(package / "manifest.json")
+        forms = prepare_response_forms(package)
+        record = save_user_answers(
+            self.settings.data_dir,
+            manifest,
+            forms,
+            StudentProfile.load(self.settings.data_dir),
+            values["answers"],
+        )
+        with self._lock:
+            if values["apply"]:
+                active = self._jobs.get(self._active, {})
+                target = (
+                    self._active
+                    if any(item_key(x) == key for x in active.get("items", []))
+                    else job_id
+                )
+                self._answer_requests[key] = target
+                atomic_json(self.root / "answer-fill-requests.json", self._answer_requests)
+                if not self._active:
+                    started = self._next_answer_fill()
+                    if started:
+                        return started
+            return {
+                "status": "saved",
+                "answer_count": len(record["answers"]),
+                "processing_active": bool(self._active),
+                "apply_queued": values["apply"],
+            }
+
+    def _next_answer_fill(self):
+        """Drain explicit, durable UI fill requests after work finishes; never start AI."""
+        with self._lock:
+            if self._active:
+                return None
+            for key, job_id in list(self._answer_requests.items()):
+                source = self._jobs.get(job_id, {})
+                if source.get("status") not in {"completed", "completed_with_issues", "failed"}:
+                    continue  # Pausing/interruption does not automatically resume work.
+                del self._answer_requests[key]
+                atomic_json(self.root / "answer-fill-requests.json", self._answer_requests)
+                try:
+                    return self.fill_existing(job_id, key)
+                except WorkflowError as exc:
+                    item = next((x for x in source.get("items", []) if item_key(x) == key), None)
+                    if item:
+                        item.update(status="needs_form", error=str(exc))
+                        self._save(source)
+            return None
 
     def _request_approval(self, job_id, method, params):
         identifier = uuid.uuid4().hex
@@ -723,6 +793,13 @@ class FrontendJobs:
                     self._save(job)
                 finally:
                     self._active = None
+                    if job["status"] in {"completed", "completed_with_issues"}:
+                        for item in job["items"]:
+                            key = item_key(item)
+                            if key in self._answer_requests:
+                                self._answer_requests[key] = job_id
+                        atomic_json(self.root / "answer-fill-requests.json", self._answer_requests)
+                        self._next_answer_fill()
 
     def wait_idle(self, timeout=30):
         thread = self._thread
@@ -739,7 +816,9 @@ class FrontendJobs:
             self._item(
                 job_id,
                 item,
-                status="form_opened",
+                status="needs_user"
+                if any(f["remaining_fields"] for f in result["forms"])
+                else "form_opened",
                 form_fill=result,
                 error=None,
                 generation=read_json(package / "codex-generation.json"),
@@ -842,6 +921,21 @@ class FrontendJobs:
                 text[name] = ""
                 continue
             text[name] = path.read_text(encoding="utf-8") if path.is_file() else ""
+        fields_error = None
+        try:
+            response_fields = prepare_response_forms(package)
+        except WorkflowError as exc:
+            response_fields, fields_error = [], str(exc)
+        try:
+            user_form_answers = load_user_answers(
+                self.settings.data_dir,
+                manifest,
+                response_fields,
+                StudentProfile.load(self.settings.data_dir),
+            )
+        except WorkflowError as exc:
+            user_form_answers = {"answers": [], "sha256": None}
+            fields_error = str(exc)
         return {
             "manifest": manifest,
             "text": text,
@@ -851,6 +945,12 @@ class FrontendJobs:
             "receipt": receipt,
             "policy_changed": changed,
             "supplement": supplement,
+            "response_fields": response_fields,
+            "model_form_answers": read_json(package / "form-answers.json", {"answers": []})[
+                "answers"
+            ],
+            "user_form_answers": user_form_answers,
+            "response_fields_error": fields_error,
             "generation": generation,
             "document_fill": read_json(package / "document-fill.json"),
             "form_fill": read_json(package / "form-fill.json") if not changed else None,
