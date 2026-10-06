@@ -27,6 +27,13 @@ function completedSuccessor(job, jobs) {
   const item = latest?.items.find(x=>keyOf(x) === key);
   return ["form_opened", "document_ready"].includes(item?.status) ? {job:latest,item} : null;
 }
+function aiActivity(generation) {
+  if (!generation?.thread_id || !/^[a-f0-9-]{36}$/i.test(generation.thread_id)) return null;
+  const completed = (generation.events || []).filter(x=>x.status === "completed");
+  const tools = completed.filter(x=>["commandExecution", "mcpToolCall", "webSearch", "imageView", "dynamicToolCall"].includes(x.type)).length;
+  const updates = Number.isSafeInteger(generation.activity_count) && generation.activity_count > 0 ? generation.activity_count : 0;
+  return {generation, text:[updates ? `已收到 ${updates.toLocaleString("zh-CN")} 次实际活动更新` : "真实会话已创建，等待模型活动更新", tools ? `已完成 ${tools} 次工具活动` : null].filter(Boolean).join(" · ")};
+}
 function progressView(job, network, now = Date.now()) {
   const items = job.items || [], p = job.progress || {}, active = activeStates.has(job.status);
   const item = items.find(x => ["preparing", "prepared", "drafting", "filling_document", "filling_form"].includes(x.status)) || items.find(x => x.status === "waiting");
@@ -63,13 +70,19 @@ function progressView(job, network, now = Date.now()) {
   const needsInput = items.filter(x => ["needs_user", "document_needs_user", "needs_document", "needs_form"].includes(x.status)).length;
   const finished = items.filter(x => ["ready", "document_ready", "document_needs_user", "form_opened", "needs_form", "needs_document", "needs_user", "materials_ready", "failed"].includes(x.status)).length;
   const stepAt = job.approval?.requested_at || p.started_at || item?.stage_started_at || job.started_at || job.created_at;
-  const activityAt = p.activity_at || item?.generation?.activity_at || job.events?.at(-1)?.at || job.updated_at;
+  const ai = active && stage === "ai" ? aiActivity(item?.generation) : null;
+  if (ai && job.status === "running") {
+    title = ai.generation.activity_label || "Codex 会话已启动，等待模型响应";
+    explanation = "活动计数来自本次模型的真实通知，不能换算成完成百分比。点击下方按钮可直接查看本次 Codex 会话。";
+  }
+  const activityAt = [p.activity_at, item?.generation?.activity_at, job.events?.at(-1)?.at, job.updated_at].filter(x=>Number.isFinite(Date.parse(x))).sort((a,b)=>Date.parse(b)-Date.parse(a))[0];
   const silence = ageOf(activityAt, now);
   const disconnected = !!network.error || !!(network.lastSuccess && now - network.lastSuccess > 12000);
   let warning = null;
   if (active && disconnected) warning = "暂时无法读取新状态；后台任务不一定停止。恢复连接后会自动重连，请先不要重复启动。";
   else if (active && ["approval", "authorization"].includes(stage)) warning = explanation;
   else if (active && silence !== null && silence >= (stage === "transcribe" ? 300000 : 120000)) warning = `已有 ${durationLabel(silence)} 没有新进展记录。${stage === "transcribe" ? "一段转录可能较慢，不能仅凭时间认定失败。" : "服务响应正常不代表这一步有进展，可展开处理记录核对。"}`;
+  if (ai && warning && !disconnected) warning = `已有 ${durationLabel(silence)} 未收到新的模型活动通知。会话已创建，但尚未确认本次回合完成；请打开本次 Codex 会话查看，不能仅凭服务连接正常认定模型有进展。`;
   let measurement = null;
   if (active && Number.isFinite(p.current) && Number.isFinite(p.total) && p.total > 0 && p.current >= 0 && p.current <= p.total) {
     const unit = {pages:"页", segments:"段"}[p.unit] || "项", format = v => p.unit === "bytes" ? `${(v / 1048576).toFixed(1)} MB` : String(v);
@@ -82,7 +95,7 @@ function progressView(job, network, now = Date.now()) {
   if (next?.count) { stage = "input"; title = `处理已结束 · 等待补充 ${next.count} 项信息`; explanation = `已准备 ${prefilled} 栏候选答案。还有 ${next.count} 项个人信息需要你提供，重试不会自动补齐。点击“${next.label}”，保存后自动带入原表单；不会提交。`; }
   const index = stage === "input" ? 2 : !active && (ready || localReady) ? 3 : ["fill", "form_fill"].includes(stage) ? 2 : ["ai", "validate", "approval"].includes(stage) ? 1 : 0;
   const nowOrEnd = job.finished_at ? Date.parse(job.finished_at) : now;
-  return {active, title, explanation, stage, index, measurement, ready, localReady, failed, finished, total:items.length, filename:p.filename || null, attachments:p.attachment_total ? `课程附件 ${p.attachment_index}/${p.attachment_total}` : null, elapsed:ageOf(job.started_at || job.created_at, nowOrEnd), stepElapsed:ageOf(stepAt, nowOrEnd), silence, warning, disconnected, workerAlive:job.runtime?.worker_alive === true, legacy};
+  return {active, title, explanation, stage, index, measurement, ai, ready, localReady, failed, finished, total:items.length, filename:p.filename || null, attachments:p.attachment_total ? `课程附件 ${p.attachment_index}/${p.attachment_total}` : null, elapsed:ageOf(job.started_at || job.created_at, nowOrEnd), stepElapsed:ageOf(stepAt, nowOrEnd), silence, warning, disconnected, workerAlive:job.runtime?.worker_alive === true, legacy};
 }
 // End pure progress presentation.
 
@@ -191,7 +204,19 @@ function jobProgress(job) {
   }
   box.append(node("strong", v.title), node("p", v.explanation));
   const next = resumeTarget(job); if (next && !state.monitorOnly) box.append(button(next.label, "button primary input-needed-button", ()=>openSupplement(job.id,next.key)));
-  if (v.active) { const progress = node("progress", undefined, "job-progress"); progress.setAttribute("aria-label", v.measurement?.text || "当前步骤没有可测量的总进度"); if (v.measurement) { progress.max = v.measurement.max; progress.value = v.measurement.value; } else progress.classList.add("indeterminate"); box.append(progress, node("p", v.measurement?.text || "处理中 · 当前步骤没有可测量的总百分比", "job-measurement")); }
+  if (v.active) {
+    const progress = node(v.measurement ? "progress" : "div", undefined, "job-progress");
+    progress.setAttribute("aria-label", v.measurement?.text || "活动指示，不代表完成百分比");
+    if (v.measurement) { progress.max = v.measurement.max; progress.value = v.measurement.value; }
+    else { progress.classList.add("indeterminate"); const sweep = node("span", undefined, "job-progress-sweep"); sweep.style.animationDelay = `-${Date.now() % 1800}ms`; progress.append(sweep); progress.setAttribute("aria-hidden", "true"); }
+    box.append(progress, node("p", v.measurement?.text || (v.ai ? v.ai.text : "正在处理 · 当前步骤没有可测量的总百分比"), "job-measurement"));
+  }
+  if (v.ai) {
+    const g = v.ai.generation, session = node("div", undefined, "job-session");
+    session.append(node("span", `${g.thread_title || "本次 Codex 会话"} · ${g.model || "等待核验模型"} · ${g.reasoning_effort || "默认强度"}`, "job-session-meta"));
+    const link = codexLink(g); if (link) { link.textContent = "打开本次 Codex 会话 ↗"; link.className = "button secondary small-button"; session.append(link); }
+    box.append(session);
+  }
   if (v.filename) box.append(node("p", `${v.attachments ? v.attachments + " · " : ""}${v.filename}`, "job-file"));
   if (job.items.length) box.append(node("p", `已处理 ${v.finished}/${v.total} 项 · ${v.ready} 项已填入可审阅${v.localReady ? ` · ${v.localReady} 项本机答案可审阅` : ""}${v.failed ? ` · ${v.failed} 项失败` : ""}`, "small"));
   if (v.active && !v.legacy) box.append(node("p", friendlyError(job.message), "job-current-message"));

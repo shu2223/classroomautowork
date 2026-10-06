@@ -11,6 +11,27 @@ v = progressView({...job,progress:{stage:'download',current:0,total:10,unit:'byt
 assert.equal(v.measurement.value,0); assert.equal(v.warning,null);
 v = progressView({...job,items:[{status:'drafting'}],message:'AI running'},network,now);
 assert.equal(v.stage,'ai'); assert.equal(v.measurement,null); assert.equal(v.index,1);
+assert.equal(v.ai,null); // A live worker alone must not claim a model session exists.
+const generation = {thread_id:'00000000-0000-0000-0000-000000000001',status:'running',model:'unit-model',activity_count:12,activity_at:'2026-01-01T00:09:59Z',activity_label:'Codex 正在输出回答，完整返回后再核验',events:[{type:'userMessage',status:'completed'},{type:'commandExecution',status:'completed'},{type:'commandExecution',status:'failed'},{type:'reasoning',status:'completed'}]};
+const aiJob = {...job,message:'Model active',progress:{stage:'ai',activity_at:'2026-01-01T00:00:00Z'},items:[{status:'drafting',generation}]};
+v = progressView(aiJob,network,now);
+assert.equal(v.measurement,null); assert.match(v.title,/输出回答/);
+assert.equal(v.silence,1000); assert.equal(v.warning,null); // Prefer the newest real model activity over an old stage log.
+assert.match(v.ai.text,/12 次实际活动更新/); assert.match(v.ai.text,/1 次工具活动/);
+v = progressView({...aiJob,items:[{status:'drafting',generation:{...generation,activity_at:'2026-01-01T00:00:00Z'}}]},network,now);
+assert.match(v.warning,/未收到新的模型活动通知/); assert.match(v.warning,/不能仅凭服务连接正常/);
+v = progressView({...aiJob,status:'completed'},network,now); assert.equal(v.ai,null);
+const uiCode = source.slice(source.indexOf('function jobProgress('),source.indexOf('function jobCard('));
+function element(tag,text,className) { return {tag,textContent:text,className,children:[],attributes:{},dataset:{},style:{},classList:{add(value){this.value=value;}},append(...children){this.children.push(...children);},setAttribute(key,value){this.attributes[key]=value;}}; }
+const {jobProgress} = vm.runInNewContext(uiCode+'\n({jobProgress});',{progressView,connection:network,node:element,Date:{now:()=>now},state:{monitorOnly:false},resumeTarget,codexLink:g=>g?.thread_id ? element('a','Session') : null,friendlyError:x=>x,durationLabel:x=>String(x)});
+let detail = jobProgress(aiJob), bar = detail.children.find(x=>x.className === 'job-progress');
+assert.equal(bar.tag,'div'); assert.equal(bar.children[0].className,'job-progress-sweep');
+assert.equal(bar.value,undefined); assert.match(bar.children[0].style.animationDelay,/^-\d+ms$/);
+const session = detail.children.find(x=>x.className === 'job-session');
+assert.match(session.children[1].textContent,/打开本次 Codex 会话/);
+detail = jobProgress({...job,progress:{stage:'download',current:3,total:10,unit:'bytes'}});
+bar = detail.children.find(x=>x.className === 'job-progress'); assert.equal(bar.tag,'progress'); assert.equal(bar.value,3); assert.equal(bar.max,10);
+console.log('Real model activity, stale-status warnings and live session rendering checks passed');
 v = progressView({...job,progress:{stage:'transcribe',current:1,total:3,unit:'segments',activity_at:'2026-01-01T00:02:00Z'}},network,now);
 assert.equal(v.measurement.value,1); assert.match(v.warning,/不能仅凭时间/);
 v = progressView({...job,approval:{requested_at:'2026-01-01T00:09:00Z'}},network,now);

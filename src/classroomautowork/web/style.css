@@ -854,7 +854,12 @@ transition:none!important}
 .job-times{display:flex;flex-wrap:wrap;gap:8px 18px;margin-top:12px;font-size:11px;color:#809486}
 .job-times .connection-status{color:#4e8663}.job-times .warning{color:#b78043}
 .job-live-detail .job-warning{padding:11px 13px;background:#fff7e6;border:1px solid #ead8ae;border-radius:7px;color:#937344;font-size:12px;margin:12px 0 0}
-.job-progress.indeterminate{height:7px;opacity:.85}
+.job-progress.indeterminate{height:7px;background:#dceade;border-radius:8px;overflow:hidden}
+.job-progress-sweep{display:block;height:100%;width:25%;border-radius:8px;background:#5b9574;animation:job-sweep 1.8s linear infinite}
+@keyframes job-sweep{from{transform:translateX(-110%)}to{transform:translateX(410%)}}
+.job-session{display:flex;align-items:center;flex-wrap:wrap;gap:12px;margin:13px 0;padding:12px;background:#edf5ef;border:1px solid #dbeadd;border-radius:7px}
+.job-session-meta{flex:1;font-size:12px;color:#397453;overflow-wrap:anywhere}
+@media(prefers-reduced-motion:reduce){.job-progress-sweep{animation:none;transform:translateX(150%)}}
 .monitor-mode .assignment-section,.monitor-mode .ai-choice,.monitor-mode .codex-settings,.monitor-mode .selection-bar,.monitor-mode .stats{display:none}
 .monitor-mode .job-item .text-button,.monitor-mode .page-heading>button{display:none}
 @media(max-width:800px){.job-live-detail{padding:13px}.job-steps{gap:5px;flex-wrap:wrap}.job-steps li{min-width:40%;padding:4px 0}.job-times{gap:8px 12px}}
