@@ -14,6 +14,19 @@ const connection = {lastSuccess: 0, error: null};
 // Pure progress presentation; exercised by offline state tests.
 function durationLabel(ms) { const s = Math.max(0, Math.floor(ms / 1000)); return s < 60 ? `${s} 秒` : s < 3600 ? `${Math.floor(s / 60)} 分 ${s % 60} 秒` : `${Math.floor(s / 3600)} 小时 ${Math.floor(s % 3600 / 60)} 分`; }
 function ageOf(at, now) { const value = Date.parse(at); return Number.isFinite(value) ? Math.max(0, now - value) : null; }
+function inputAction(item) {
+  if (!item.package || !["needs_user", "document_needs_user"].includes(item.status)) return null;
+  const count = (item.form_fill?.forms || []).flatMap(f=>f.remaining_fields || []).filter(f=>f.required).length;
+  return {key:keyOf(item), count, label:count ? `填写 ${count} 项信息` : "补充并继续"};
+}
+function resumeTarget(job) { return activeStates.has(job.status) ? null : (job.items || []).map(inputAction).find(Boolean) || null; }
+function completedSuccessor(job, jobs) {
+  if (!resumeTarget(job) || job.items.length !== 1) return null;
+  const key = keyOf(job.items[0]);
+  const latest = [...jobs].filter(x=>["fill", "review"].includes(x.kind) && x.created_at > job.created_at && x.items.some(item=>keyOf(item) === key)).sort((a,b)=>b.created_at.localeCompare(a.created_at))[0];
+  const item = latest?.items.find(x=>keyOf(x) === key);
+  return ["form_opened", "document_ready"].includes(item?.status) ? {job:latest,item} : null;
+}
 function progressView(job, network, now = Date.now()) {
   const items = job.items || [], p = job.progress || {}, active = activeStates.has(job.status);
   const item = items.find(x => ["preparing", "prepared", "drafting", "filling_document", "filling_form"].includes(x.status)) || items.find(x => x.status === "waiting");
@@ -63,7 +76,11 @@ function progressView(job, network, now = Date.now()) {
     measurement = {value:p.current, max:p.total, text:p.unit === "bytes" ? `已下载 ${format(p.current)} / ${format(p.total)}` : `已完成 ${format(p.current)} / ${format(p.total)} ${unit}`};
   }
   if (!active) { title = needsInput && !failed && !ready && !localReady ? "等待你补充后继续" : failed && stage === "validate" ? "结果核验未通过" : labels[job.status] || job.status; explanation = failed ? `本次 ${failed} 项失败；请查看下方具体原因。失败项没有填入文档，可以在原助手补齐资料后重试。` : ready ? "请在已填入的原文档或预填原表单审阅，最后由你手动提交。" : localReady ? "逐题答案已核验；请继续自动填写后在原页面审阅，最后手动提交。" : needsInput ? `本次 ${needsInput} 项需要补充。点击作业旁的“补充并继续”，输入资料或接收已完成的 Codex 对话，再继续自动作答。` : "请查看各项作业的结果与待处理事项。"; }
-  const index = !active && (ready || localReady) ? 3 : ["fill", "form_fill"].includes(stage) ? 2 : ["ai", "validate", "approval"].includes(stage) ? 1 : 0;
+  const next = resumeTarget(job);
+  const inputItem = next && items.find(x=>keyOf(x) === next.key);
+  const prefilled = (inputItem?.form_fill?.forms || []).reduce((n,f)=>n+(f.prefilled_fields || 0),0);
+  if (next?.count) { stage = "input"; title = `处理已结束 · 等待补充 ${next.count} 项信息`; explanation = `已准备 ${prefilled} 栏候选答案。还有 ${next.count} 项个人信息需要你提供，重试不会自动补齐。点击“${next.label}”，保存后自动带入原表单；不会提交。`; }
+  const index = stage === "input" ? 2 : !active && (ready || localReady) ? 3 : ["fill", "form_fill"].includes(stage) ? 2 : ["ai", "validate", "approval"].includes(stage) ? 1 : 0;
   const nowOrEnd = job.finished_at ? Date.parse(job.finished_at) : now;
   return {active, title, explanation, stage, index, measurement, ready, localReady, failed, finished, total:items.length, filename:p.filename || null, attachments:p.attachment_total ? `课程附件 ${p.attachment_index}/${p.attachment_total}` : null, elapsed:ageOf(job.started_at || job.created_at, nowOrEnd), stepElapsed:ageOf(stepAt, nowOrEnd), silence, warning, disconnected, workerAlive:job.runtime?.worker_alive === true, legacy};
 }
@@ -157,6 +174,7 @@ function renderPending() {
     else side.append(node("span", $("aiConfirmed").checked ? "可生成初稿" : "仅准备资料", "pill " + (policy?.can_draft ? "success" : "warning")));
     const actions = node("div", undefined, "row-actions"); const policyButton = button("课程规则", "row-action", () => openPolicy(item.course_id, item.course_name)); policyButton.disabled = !!state.active; actions.append(policyButton);
     if (completed?.item.package) actions.append(button(completed.item.status === "ready" ? "查看初稿" : "查看资料与分析", "row-action", () => openReview(completed.job.id, key)));
+    const nextInput = completed && inputAction(completed.item); if (nextInput) actions.prepend(button(nextInput.label, "button primary small-button", ()=>openSupplement(completed.job.id,key)));
     for (const f of completed?.item.form_fill?.forms || []) { const link = safeLink(f.url, "在原表单审阅答案 ↗", "row-action"); if (link) actions.prepend(link); }
     for (const d of completed?.item.document_fill?.documents || []) { const link = safeLink(d.url, "打开已填入的文档 ↗", "row-action"); if (link) actions.prepend(link); } side.append(actions); row.append(label, side); list.append(row);
   }
@@ -168,10 +186,11 @@ function jobProgress(job) {
   box.dataset.jobId = job.id;
   if (["review", "fill"].includes(job.kind) && job.ai_confirmed) {
     const steps = node("ol", undefined, "job-steps");
-    for (const [i, title] of ["准备资料", "Codex 作答", "自动填写", "原页面审阅"].entries()) { const step = node("li", undefined, i === v.index ? "current" : i < v.index ? "past" : ""); step.append(node("span", i < v.index ? "✓" : String(i + 1)), node("b", title)); steps.append(step); }
+    for (const [i, title] of ["准备资料", "Codex 作答", v.stage === "input" ? "等待你填写信息" : "自动填写", "原页面审阅"].entries()) { const step = node("li", undefined, i === v.index ? "current" : i < v.index ? "past" : ""); step.append(node("span", i < v.index ? "✓" : String(i + 1)), node("b", title)); steps.append(step); }
     box.append(steps);
   }
   box.append(node("strong", v.title), node("p", v.explanation));
+  const next = resumeTarget(job); if (next && !state.monitorOnly) box.append(button(next.label, "button primary input-needed-button", ()=>openSupplement(job.id,next.key)));
   if (v.active) { const progress = node("progress", undefined, "job-progress"); progress.setAttribute("aria-label", v.measurement?.text || "当前步骤没有可测量的总进度"); if (v.measurement) { progress.max = v.measurement.max; progress.value = v.measurement.value; } else progress.classList.add("indeterminate"); box.append(progress, node("p", v.measurement?.text || "处理中 · 当前步骤没有可测量的总百分比", "job-measurement")); }
   if (v.filename) box.append(node("p", `${v.attachments ? v.attachments + " · " : ""}${v.filename}`, "job-file"));
   if (job.items.length) box.append(node("p", `已处理 ${v.finished}/${v.total} 项 · ${v.ready} 项已填入可审阅${v.localReady ? ` · ${v.localReady} 项本机答案可审阅` : ""}${v.failed ? ` · ${v.failed} 项失败` : ""}`, "small"));
@@ -183,15 +202,18 @@ function jobProgress(job) {
   return box;
 }
 function jobCard(job, full = false) {
-  const card = node("section", undefined, full ? "history-card" : ""); const heading = node("div", undefined, "job-heading"), intro = node("div");
-  intro.append(node("h3", job.kind === "refresh" ? "同步真实待办" : job.kind === "document_auth" ? "Google 文档授权" : `所选 ${job.items.length} 项作业 · ${labels[job.status] || job.status}`));
+  const card = node("section", undefined, full ? "history-card" : ""); card.dataset.jobCard = job.id; const heading = node("div", undefined, "job-heading"), intro = node("div");
+  const later = completedSuccessor(job,state.jobs), next = later ? null : resumeTarget(job);
+  intro.append(node("h3", job.kind === "refresh" ? "同步真实待办" : job.kind === "document_auth" ? "Google 文档授权" : `所选 ${job.items.length} 项作业 · ${later ? "后续已补齐（历史记录）" : next ? "等待你补充" : labels[job.status] || job.status}`));
   if (full) intro.append(node("span", dateLabel(job.created_at, true), "muted small")); heading.append(intro);
   if (activeStates.has(job.status) && !state.monitorOnly) { const pause = button(job.status === "stopping" ? "正在暂停…" : "暂停", "button secondary small-button", () => jobAction(job.id, "pause")); pause.disabled = job.status === "stopping"; heading.append(pause); }
+  else if (!state.monitorOnly && later) heading.append(button("查看最新结果", "button secondary", ()=>showJob(later.job.id)));
+  else if (!state.monitorOnly && next) heading.append(button(next.label, "button primary", () => openSupplement(job.id,next.key)));
   else if (!state.monitorOnly && (job.kind === "review" || job.status !== "completed")) heading.append(button("重试 / 继续", "button secondary small-button", () => jobAction(job.id, "retry")));
   card.append(heading);
-  card.append(jobProgress(job));
+  if (later) { const note = node("div", undefined, "job-live-detail"); note.append(node("strong", "旧记录中的缺口已在后续处理补齐"),node("p", `最新结果：${dateLabel(later.job.created_at,true)}。这条记录保留当时的处理状态，无需再次填写。`)); card.append(note); } else card.append(jobProgress(job));
   const items = node("div", undefined, "job-items");
-  for (const item of job.items) { const row = node("div", undefined, "job-item"); const title = node("span", item.title || item.assignment_id); if (item.error) title.append(node("p", friendlyError(item.error))); row.append(title, pill(item.status)); if (item.package) row.append(button(item.status === "ready" ? "查看实际初稿" : "查看资料与分析", "text-button", () => openReview(job.id, keyOf(item)))); const g = item.generation; if (g?.thread_id) { const meta = node("div", undefined, "job-model"); meta.append(node("span", `实际模型 ${g.model} · ${g.reasoning_effort || "默认强度"} · ${g.status === "completed" ? "AI 回合完成" : g.status === "running" ? "正在生成" : "尚未成功"} `)); const link = codexLink(g); if (link) meta.append(link); row.append(meta); } else if (item.package) row.append(node("span", "资料已准备 · 没有已核验的 AI 生成记录", "job-model")); for (const f of item.form_fill?.forms || []) { const link = safeLink(f.url, "在原表单审阅答案 ↗", "button primary small-button"); if (link) row.prepend(link); const saved = safeLink(f.original_url, "继续已保存的草稿 ↗", "text-button"); if (saved) row.append(saved); } for (const d of item.document_fill?.documents || []) { const link = safeLink(d.url, "在原文档审阅 ↗", "button primary small-button"); if (link) row.prepend(link); } if (item.package && g?.status === "completed" && ["needs_document", "needs_form"].includes(item.status)) row.append(button("填入已有初稿", "text-button", () => action(`/api/jobs/${job.id}/items/${keyOf(item)}/fill`, {}))); if (item.browser_read?.thread_id) { const readLink = codexLink(item.browser_read); if (readLink) { readLink.textContent = "查看登录题目读取会话 ↗"; row.append(readLink); } } row.append(button("补充并继续", "text-button", () => openSupplement(job.id, keyOf(item)))); items.append(row); } card.append(items);
+  for (const item of job.items) { const row = node("div", undefined, "job-item"); const title = node("span", item.title || item.assignment_id); if (item.error) title.append(node("p", friendlyError(item.error))); row.append(title, later ? node("span", "历史状态：" + (labels[item.status] || item.status), "pill") : pill(item.status)); if (item.package) row.append(button(item.status === "ready" ? "查看实际初稿" : "查看资料与分析", "text-button", () => openReview(job.id, keyOf(item)))); const g = item.generation; if (g?.thread_id) { const meta = node("div", undefined, "job-model"); meta.append(node("span", `实际模型 ${g.model} · ${g.reasoning_effort || "默认强度"} · ${g.status === "completed" ? "AI 回合完成" : g.status === "running" ? "正在生成" : "尚未成功"} `)); const link = codexLink(g); if (link) meta.append(link); row.append(meta); } else if (item.package) row.append(node("span", "资料已准备 · 没有已核验的 AI 生成记录", "job-model")); for (const f of (later?.item.form_fill || item.form_fill)?.forms || []) { const link = safeLink(f.url, "在原表单审阅答案 ↗", "button primary small-button"); if (link) row.prepend(link); const saved = safeLink(f.original_url, "继续已保存的草稿 ↗", "text-button"); if (saved) row.append(saved); } for (const d of (later?.item.document_fill || item.document_fill)?.documents || []) { const link = safeLink(d.url, "在原文档审阅 ↗", "button primary small-button"); if (link) row.prepend(link); } if (item.package && g?.status === "completed" && ["needs_document", "needs_form"].includes(item.status)) row.append(button("填入已有初稿", "text-button", () => action(`/api/jobs/${job.id}/items/${keyOf(item)}/fill`, {}))); if (item.browser_read?.thread_id) { const readLink = codexLink(item.browser_read); if (readLink) { readLink.textContent = "查看登录题目读取会话 ↗"; row.append(readLink); } } const input = inputAction(item); if (!state.monitorOnly && !later) row.append(button(input?.label || "补充并继续", input ? "button primary small-button" : "text-button", () => openSupplement(job.id, keyOf(item)))); items.append(row); } card.append(items);
   if (job.approval && !state.monitorOnly) { const box = node("section", undefined, "approval-card"); box.append(node("h3", "Codex 请求本次操作审批"), node("p", job.approval.reason), node("pre", job.approval.command || job.approval.cwd), node("p", "此请求来自 Codex 的现有权限规则；批准仅适用于本次，不会扩大长期权限。")); const actions = node("div", undefined, "approval-actions"); for (const [choice, label] of [["accept", "批准本次"], ["decline", "拒绝"], ["cancel", "取消操作"]]) actions.append(button(label, "button secondary small-button", async () => { try { await api(`/api/jobs/${job.id}/approval`, "POST", {id: job.approval.id, decision: choice}); await pollJob(); } catch(error) { toast(error.message); } })); box.append(actions); card.append(box); }
   if (job.cache) card.append(node("p", `资料缓存：复用 ${job.cache.reused} 个阶段 · 新增 ${job.cache.processed} · 缓存阶段失败 ${job.cache.failed}`, "small"));
   if (job.events.length) { const details = node("details"), summary = node("summary", "查看处理记录"), events = node("div", undefined, "event-list"); for (const entry of job.events) { const line = node("div", undefined, "event-line"); line.append(node("time", new Date(entry.at).toLocaleTimeString("zh-CN", {timeZone: state.timezone || "Asia/Tokyo", hour: "2-digit", minute: "2-digit", second: "2-digit"})), node("span", entry.message)); events.append(line); } details.dataset.jobLog = job.id; details.append(summary, events); card.append(details); }
@@ -204,6 +226,7 @@ function renderJobs() {
   for (const job of [...state.jobs].sort((a,b) => b.created_at.localeCompare(a.created_at))) $("historyList").append(jobCard(job, true)); setButtons();
   for (const details of document.querySelectorAll("details[data-job-log]")) details.open = expanded.has(details.dataset.jobLog);
 }
+function showJob(id) { state.focus=id; setView("history"); renderJobs(); document.querySelector(`section[data-job-card="${id}"]`)?.scrollIntoView({block:"center",behavior:"smooth"}); }
 function updateProgressClock() {
   for (const box of document.querySelectorAll(".job-live-detail")) {
     const job = state.jobs.find(x => x.id === box.dataset.jobId); if (!job || !activeStates.has(job.status)) continue;
@@ -231,9 +254,9 @@ async function pollJob() {
 async function action(path, body) {
   if (state.monitorOnly) { toast("这是只读进度窗口，请返回原作业助手操作。"); return; }
   if (state.busy) return; state.busy = true; setButtons();
-  try { const job = await api(path, "POST", body); updateJob(job); state.active = activeStates.has(job.status) ? job.id : null; state.focus = job.id; renderJobs(); renderPending(); startPolling(); return job; } catch (error) { toast(error.message); } finally { state.busy = false; setButtons(); }
+  try { const job = await api(path, "POST", body); updateJob(job); state.active = activeStates.has(job.status) ? job.id : null; state.focus = job.id; renderJobs(); renderPending(); if (job.next_action === "supplement") await openSupplement(job.id, job.supplement_key); else startPolling(); return job; } catch (error) { toast(error.message); } finally { state.busy = false; setButtons(); }
 }
-async function jobAction(id, verb) { await action(`/api/jobs/${id}/${verb}`, {}); }
+async function jobAction(id, verb) { const next = verb === "retry" && resumeTarget(state.jobs.find(x=>x.id === id) || {}); if (next) return openSupplement(id,next.key); await action(`/api/jobs/${id}/${verb}`, {}); }
 function renderEfforts(preferred) { const model = state.models.models.find(x => x.model === $("modelSelect").value); $("effortSelect").replaceChildren(); const labels = {none: "无", minimal: "最少", low: "低", medium: "中", high: "高", xhigh: "很高", max: "最高", ultra: "极高"}; for (const value of model?.supportedReasoningEfforts || []) { const option = node("option", labels[value.reasoningEffort] || value.reasoningEffort); option.value = value.reasoningEffort; $("effortSelect").append(option); } if (!$("effortSelect").children.length) { const option = node("option", "沿用模型默认"); option.value = ""; $("effortSelect").append(option); } const selected = preferred || model?.defaultReasoningEffort; if ([...$("effortSelect").options].some(x => x.value === selected)) $("effortSelect").value = selected; }
 async function loadModels() { state.modelsLoading = true; setButtons(); $("modelStatus").textContent = "正在从本机 Codex 读取模型与当前配置…"; try { const catalog = await api("/api/codex/models"); state.models = catalog; $("modelSelect").replaceChildren(); for (const model of catalog.models) { const option = node("option", model.displayName || model.model); option.value = model.model; $("modelSelect").append(option); } const saved = localStorage.getItem("classroom-model"); const selected = catalog.models.some(x => x.model === saved) ? saved : catalog.default_model; if (catalog.models.some(x => x.model === selected)) $("modelSelect").value = selected; renderEfforts(saved === selected ? localStorage.getItem("classroom-effort") : selected === catalog.default_model ? catalog.default_effort : null); $("modelStatus").textContent = "来自本机 Codex 目录与配置；实际模型、会话和生成记录会保存在每份结果中。"; } catch (error) { state.models = null; $("modelStatus").textContent = error.message; toast(error.message); } finally { state.modelsLoading = false; setButtons(); } }
 function setView(view) { state.view = view; $("pendingView").hidden = view !== "pending"; $("historyView").hidden = view !== "history"; $("navPending").classList.toggle("active", view === "pending"); $("navHistory").classList.toggle("active", view === "history"); $("breadcrumb").textContent = "工作台 / " + (view === "pending" ? "待完成作业" : "审核记录"); }
@@ -319,6 +342,7 @@ $("authorizeDocuments").addEventListener("click", () => action("/api/documents/a
 $("fillDocumentButton").addEventListener("click", () => { const {jobId, key} = state.preview; $("reviewDialog").close(); action(`/api/jobs/${jobId}/items/${key}/fill`, {}); });
 
 async function openSupplement(jobId, key) {
+  if (state.monitorOnly) { toast("这是只读进度窗口，请返回原作业助手填写信息。"); return; }
   try {
     const job = state.jobs.find(x => x.id === jobId) || await api(`/api/jobs/${jobId}`);
     const item = job.items.find(x => keyOf(x) === key);

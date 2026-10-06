@@ -301,6 +301,16 @@ class FrontendJobs:
         job = self.job(job_id)
         if job["status"] in ACTIVE:
             raise WorkflowError("任务仍在运行。")
+        missing = next(
+            (
+                x
+                for x in job["items"]
+                if x.get("package") and x["status"] in {"needs_user", "document_needs_user"}
+            ),
+            None,
+        )
+        if missing:
+            return {**job, "next_action": "supplement", "supplement_key": item_key(missing)}
         if job["kind"] == "refresh":
             return self.refresh()
         if job["kind"] == "document_auth":

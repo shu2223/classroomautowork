@@ -2,7 +2,7 @@
 const fs = require('node:fs'), vm = require('node:vm'), assert = require('node:assert/strict'), path = require('node:path');
 const source = fs.readFileSync(path.join(__dirname, '../src/classroomautowork/web/app.js'), 'utf8');
 const code = source.split('// Pure progress presentation;')[1].split('// End pure progress presentation.')[0];
-const {progressView} = vm.runInNewContext('// ' + code + '\n({progressView});', {activeStates:new Set(['queued','running','stopping']), labels:{failed:'失败',completed:'结束'}});
+const {progressView,resumeTarget,completedSuccessor} = vm.runInNewContext('// ' + code + '\n({progressView,resumeTarget,completedSuccessor});', {activeStates:new Set(['queued','running','stopping']), labels:{failed:'失败',completed:'结束'},keyOf:x=>x.course_id+':'+x.assignment_id});
 const now = Date.parse('2026-01-01T00:10:00Z'), network = {lastSuccess:now,error:null};
 const job = {status:'running',kind:'review',items:[{status:'preparing'}],created_at:'2026-01-01T00:00:00Z',updated_at:'2026-01-01T00:00:00Z',message:'Checking attachment offline-id',events:[]};
 let v = progressView(job, network, now);
@@ -45,3 +45,23 @@ fields = supplementFields({...base,user_form_answers:{answers:[{form_url:form.ur
 assert.equal(fields.length,3); assert.equal(fields[0].supplied.values[0],'Known user identity');
 assert.equal(supplementFields(null).length,0);
 console.log('Production native-question editor checks passed');
+
+const missing = {course_id:'1',assignment_id:'2',status:'needs_user',package:'unit-private-package',form_fill:{forms:[{prefilled_fields:7,remaining_fields:Array.from({length:6},()=>({required:true,title:'Actual original field'}))}]}};
+const waiting = {...job,status:'completed_with_issues',kind:'fill',items:[missing]};
+const completedLater = {...waiting,id:'unit-later',created_at:'2026-01-02T00:00:00Z',status:'completed',items:[{...missing,status:'form_opened'}]};
+assert.equal(completedSuccessor(waiting,[waiting,completedLater]).job.id,'unit-later');
+assert.equal(completedSuccessor(waiting,[waiting,{...completedLater,items:[{...missing,status:'needs_form'}]}]),null);
+v = progressView(waiting,network,now);
+assert.equal(v.active,false); assert.equal(v.stage,'input'); assert.equal(v.index,2);
+assert.match(v.title,/处理已结束/); assert.match(v.explanation,/7 栏/); assert.match(v.explanation,/6 项/);
+assert.equal(resumeTarget(waiting).label,'填写 6 项信息');
+assert.equal(resumeTarget({...waiting,status:'running'}),null);
+assert.equal(resumeTarget({...waiting,items:[{...missing,status:'needs_form'}]}),null);
+const retryCode = source.slice(source.indexOf('async function jobAction('),source.indexOf('function renderEfforts('));
+const opened=[],requests=[];
+const {jobAction} = vm.runInNewContext(retryCode+'\n({jobAction});',{state:{jobs:[{...waiting,id:'unit-job'}]},resumeTarget,openSupplement:async(...args)=>opened.push(args),action:async(...args)=>requests.push(args)});
+(async()=>{
+  await jobAction('unit-job','retry'); assert.equal(opened.length,1); assert.equal(opened[0][1],'1:2'); assert.equal(requests.length,0);
+  await jobAction('unit-job','pause'); assert.equal(requests[0][0],'/api/jobs/unit-job/pause');
+  console.log('Missing-input retry opens editor without another processing request');
+})().catch(error=>{console.error(error);process.exitCode=1;});

@@ -154,3 +154,31 @@ def test_explicit_deferred_fill_survives_restart_and_paused_work_stays_paused(
     atomic_json(jobs.root / "answer-fill-requests.json", {"1:2": job_id})
     restored = FrontendJobs(unit_settings(tmp_path))
     assert restored._answer_requests == {"1:2": job_id} and len(filled) == 1
+
+
+def test_retry_needing_personal_inputs_returns_editor_without_starting_work(tmp_path, monkeypatch):
+    jobs = FrontendJobs(unit_settings(tmp_path))
+    identifier = "b" * 32
+    jobs._jobs[identifier] = {
+        "id": identifier,
+        "kind": "fill",
+        "status": "completed_with_issues",
+        "items": [
+            {
+                "course_id": "1",
+                "assignment_id": "2",
+                "status": "needs_user",
+                "package": "unit-private-package",
+            }
+        ],
+    }
+    monkeypatch.setattr(
+        jobs,
+        "_start",
+        lambda *_args, **_kwargs: pytest.fail(
+            "Missing information cannot be retried automatically"
+        ),
+    )
+    response = jobs.retry(identifier)
+    assert response["id"] == identifier and response["next_action"] == "supplement"
+    assert response["supplement_key"] == "1:2" and jobs._active is None and len(jobs._jobs) == 1
