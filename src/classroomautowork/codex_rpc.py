@@ -24,6 +24,7 @@ class CodexClient:
             else {"start_new_session": True}
         )
         self.active_turn = None
+        self.approval_wait_seconds = 0
         self.process = subprocess.Popen(
             [*command, "app-server", "--listen", "stdio://"],
             stdin=subprocess.PIPE,
@@ -66,12 +67,14 @@ class CodexClient:
         self.process.stdin.write(json.dumps(message, ensure_ascii=True) + "\n")
         self.process.stdin.flush()
 
-    def _next(self, deadline=None):
+    def _next(self, deadline=None, timeout_message=None):
         while True:
             if self.cancelled():
                 raise RunCancelled("已暂停 Codex，资料和会话记录已保留。")
             if deadline and time.monotonic() > deadline:
-                raise WorkflowError("Codex 接口响应超时，请重试；已保存的资料不会丢失。")
+                raise WorkflowError(
+                    timeout_message or "Codex 接口响应超时，请重试；已保存的资料不会丢失。"
+                )
             try:
                 event = self.events.get(timeout=0.2)
             except queue.Empty:
@@ -84,7 +87,12 @@ class CodexClient:
                     "item/commandExecution/requestApproval",
                     "item/fileChange/requestApproval",
                 }:
+                    before = time.monotonic()
                     decision = self.approval(method, params) if self.approval else "cancel"
+                    waited = time.monotonic() - before
+                    self.approval_wait_seconds += waited
+                    if deadline is not None:
+                        deadline += waited
                     if decision not in {"accept", "decline", "cancel"}:
                         decision = "cancel"
                     self.send({"id": event["id"], "result": {"decision": decision}})
@@ -123,8 +131,13 @@ class CodexClient:
                 return result
             self.pending.append(event)
 
-    def next_event(self):
-        event = self.pending.popleft() if self.pending else self._next()
+    def next_event(self, *, timeout=None, timeout_message=None):
+        deadline = time.monotonic() + timeout if timeout is not None else None
+        event = (
+            self.pending.popleft()
+            if self.pending
+            else self._next(deadline, timeout_message=timeout_message)
+        )
         if event.get("method") == "turn/completed":
             self.active_turn = None
         return event

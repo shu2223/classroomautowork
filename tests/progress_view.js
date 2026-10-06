@@ -18,6 +18,9 @@ v = progressView(aiJob,network,now);
 assert.equal(v.measurement,null); assert.match(v.title,/输出回答/);
 assert.equal(v.silence,1000); assert.equal(v.warning,null); // Prefer the newest real model activity over an old stage log.
 assert.match(v.ai.text,/12 次实际活动更新/); assert.match(v.ai.text,/1 次工具活动/);
+v = progressView({...aiJob,events:[{at:'2026-01-01T00:04:00Z',message:'Codex 正在输出回答，完整返回后再核验'}]},network,now);
+assert.match(v.warning,/等待时间异常/); assert.match(v.warning,/不代表答案能正常完成/);
+assert.equal(v.active,true); // An alert must not cancel a user-preserved running turn.
 v = progressView({...aiJob,items:[{status:'drafting',generation:{...generation,activity_at:'2026-01-01T00:00:00Z'}}]},network,now);
 assert.match(v.warning,/未收到新的模型活动通知/); assert.match(v.warning,/不能仅凭服务连接正常/);
 v = progressView({...aiJob,status:'completed'},network,now); assert.equal(v.ai,null);

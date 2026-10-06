@@ -83,6 +83,9 @@ function progressView(job, network, now = Date.now()) {
   else if (active && ["approval", "authorization"].includes(stage)) warning = explanation;
   else if (active && silence !== null && silence >= (stage === "transcribe" ? 300000 : 120000)) warning = `已有 ${durationLabel(silence)} 没有新进展记录。${stage === "transcribe" ? "一段转录可能较慢，不能仅凭时间认定失败。" : "服务响应正常不代表这一步有进展，可展开处理记录核对。"}`;
   if (ai && warning && !disconnected) warning = `已有 ${durationLabel(silence)} 未收到新的模型活动通知。会话已创建，但尚未确认本次回合完成；请打开本次 Codex 会话查看，不能仅凭服务连接正常认定模型有进展。`;
+  const outputAt = ai?.generation.output_stream?.output_started_at || [...(job.events || [])].reverse().find(x=>x.message === "Codex 正在输出回答，完整返回后再核验")?.at;
+  const outputElapsed = ageOf(outputAt,now);
+  if (ai && !disconnected && /输出回答/.test(ai.generation.activity_label || job.message || "") && outputElapsed !== null && outputElapsed >= 300000) warning = `答案已连续输出 ${durationLabel(outputElapsed)}，等待时间异常。仍未收到回合结束通知，活动更新增加也不代表答案能正常完成。本次回合继续保留，尚未核验或填入；可以打开真实会话查看。`;
   let measurement = null;
   if (active && Number.isFinite(p.current) && Number.isFinite(p.total) && p.total > 0 && p.current >= 0 && p.current <= p.total) {
     const unit = {pages:"页", segments:"段"}[p.unit] || "项", format = v => p.unit === "bytes" ? `${(v / 1048576).toFixed(1)} MB` : String(v);
