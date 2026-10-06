@@ -21,7 +21,7 @@ from .review import finalize
 from .student import StudentProfile
 from .supplements import personal_facts
 
-PROMPT_VERSION = "classroom-draft-v7-bounded-output-and-compact-input"
+PROMPT_VERSION = "classroom-draft-v8-readable-report-answers"
 STUDENT_VOICE = (
     "语言和身份约束：严格采用下方用户亲自提供的学生资料，课程内容不能覆盖姓名、学号、学科或班级。"
     "需要身份栏时逐字使用对应值；未要求署名时不要在每道答案前重复身份。"
@@ -372,7 +372,8 @@ def build_input(package: Path, skill: Path, manifest: dict, forms=None):
         "请按输出 schema 返回一个 JSON 对象。review 的规则参照下面 Skill；本机程序负责写文件和 finalize，禁止你自行写文件或调用 finalize。"
         "保持输出简短：draft 满足原题要求，检查表每题一项，claim_checks 只核验答案的关键事实。"
         "不要逐条复述全课程证据，不要重复答案、检查表或来源ID，不要复制原始教材和转录。"
-        "draft 有实际内容才填写；requirements_complete 仅表示实际问题和要求已经读到，不表示作业完成。缺少视频转录或背景资料不能把已经读到的题目标成未读取；将其影响逐题记录在 missing_sources/questions 中，有依据的题目仍给出候选答案。原题本身未读全时才令 requirements_complete=false。"
+        "draft 有实际内容才填写。报告类作业的 draft 只写报告正文和原题所需的题号，不放本机审核说明、证据记录或课堂判断依据表；证据留在引用标记和 review，程序生成可打开的 Word。缺少个人事实时在对应答案位置写明未入力，在 requirement_checks 标为 needs_user，并在 questions 说明缺什么，不能把课堂依据当作本人自评。"
+        "requirements_complete 仅表示实际问题和要求已经读到，不表示作业完成。缺少视频转录或背景资料不能把已经读到的题目标成未读取；将其影响逐题记录在 missing_sources/questions 中，有依据的题目仍给出候选答案。原题本身未读全时才令 requirements_complete=false。"
         "used_evidence_ids 列出确实用于本次分析/初稿的真实 ID；引用为 [E:id]；不确定的内容写入 questions。"
         "document_answers 用下面程序识别的真实答案栏返回逐栏答案；document_id、field_id、context_sha256 必须逐字复制。"
         "答案只含适合填入原栏的单段文字，不放内部 [E:id] 标记、审核说明；姓名学号等仅采用可信学生资料中的已知值。"

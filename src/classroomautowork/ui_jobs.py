@@ -7,6 +7,7 @@ import uuid
 from dataclasses import asdict, replace
 from pathlib import Path
 
+from .answer_document import create_answer_document, valid_answer_document
 from .auth import credentials_for, documents_authorized
 from .browser_questions import recover_questions
 from .codex_rpc import model_catalog
@@ -46,6 +47,9 @@ FILES = {
     "document-answers.json",
     "form-answers.json",
     "form-fill.json",
+    "answer.docx",
+    "answer.html",
+    "answer-document.json",
 }
 POLICY_FIELDS = {
     "ai_use",
@@ -242,6 +246,24 @@ class FrontendJobs:
         if not source.get("ai_confirmed"):
             raise WorkflowError("未确认使用 AI 的资料包不能自动填入。")
         return self._start("fill", [{**item, "package": str(package)}], ai_confirmed=True)
+
+    def export_answer(self, job_id, key):
+        with self._lock:
+            if self._active:
+                raise WorkflowError("请等当前任务结束，再导出已有答案；不会重新下载或调用 AI。")
+            view = self.package_view(job_id, key)
+            if not view["text"]["draft.md"]:
+                raise WorkflowError("没有已核验的实际答案可导出，请先完成或重新核验初稿。")
+            result = create_answer_document(self.package_path(job_id, key))
+            job = self._jobs[job_id]
+            item = next(x for x in job["items"] if item_key(x) == key)
+            item["answer_document"] = result
+            if item["status"] == "ready" and result["status"] == "needs_user":
+                item["status"] = "needs_user"
+                job["status"] = "completed_with_issues"
+                job["message"] = "答案文件已生成，可打开审阅；仍有内容待补充，请点击补充并继续。"
+            self._save(job)
+            return self._snapshot(job)
 
     def start_selected(
         self,
@@ -741,6 +763,11 @@ class FrontendJobs:
                             and prepare_response_forms(Path(receipt["package"]))
                         ):
                             self._fill_response_item(job_id, result, Path(receipt["package"]))
+                        elif receipt.get("draft_sha256") and not forms:
+                            answer = create_answer_document(Path(receipt["package"]))
+                            self._item(
+                                job_id, result, answer_document=answer, status=answer["status"]
+                            )
                     except RunCancelled:
                         raise
                     except WorkflowError as exc:
@@ -753,7 +780,14 @@ class FrontendJobs:
                 status = (
                     "completed_with_issues"
                     if any(
-                        x["status"] in {"failed", "needs_document", "needs_form"}
+                        x["status"]
+                        in {
+                            "failed",
+                            "needs_document",
+                            "needs_form",
+                            "needs_user",
+                            "document_needs_user",
+                        }
                         for x in job["items"]
                     )
                     else "completed"
@@ -770,7 +804,7 @@ class FrontendJobs:
                 failed = sum(x["status"] == "failed" for x in job["items"])
                 self._log(
                     job_id,
-                    f"处理结束：{ready} 项原文档已填入，{form_opened} 项已打开自动预填原表单，{local_ready} 项本机答案，{materials} 项资料包，{needs} 项待补充，{failed} 项失败；请在原文档或原表单审阅并手动提交",
+                    f"处理结束：{ready} 项原文档已填入，{form_opened} 项已打开自动预填原表单，{local_ready} 项本机答案，{materials} 项资料包，{needs} 项待补充，{failed} 项失败；打开答案文件、原文档或原表单审阅，提交由你操作",
                 )
             with self._lock:
                 job["status"] = status
@@ -964,6 +998,7 @@ class FrontendJobs:
             "generation": generation,
             "document_fill": read_json(package / "document-fill.json"),
             "form_fill": read_json(package / "form-fill.json") if not changed else None,
+            "answer_document": valid_answer_document(package) if text["draft.md"] else None,
         }
 
     @staticmethod

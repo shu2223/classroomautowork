@@ -863,3 +863,5 @@ transition:none!important}
 .monitor-mode .assignment-section,.monitor-mode .ai-choice,.monitor-mode .codex-settings,.monitor-mode .selection-bar,.monitor-mode .stats{display:none}
 .monitor-mode .job-item .text-button,.monitor-mode .page-heading>button{display:none}
 @media(max-width:800px){.job-live-detail{padding:13px}.job-steps{gap:5px;flex-wrap:wrap}.job-steps li{min-width:40%;padding:4px 0}.job-times{gap:8px 12px}}
+
+.answer-table{border-collapse:collapse;width:100%;margin:18px 0;font-size:14px}.answer-table td{border:1px solid #d9e3df;padding:10px;vertical-align:top}.answer-table tr:first-child{font-weight:600;background:#f5f9f7}.answer-paragraph{white-space:pre-wrap;line-height:1.8}

@@ -23,7 +23,7 @@ from .ui_jobs import FILES, FrontendJobs, read_json
 ASSETS = Path(__file__).parent / "web"
 ASSET_TYPES = {"index.html": "text/html", "app.js": "text/javascript", "style.css": "text/css"}
 ITEM_ROUTE = re.compile(
-    r"/api/jobs/([a-f0-9]{32})/items/([0-9]+:[0-9]+)(?:/(supplement|download|image/[a-f0-9]{24}))?"
+    r"/api/jobs/([a-f0-9]{32})/items/([0-9]+:[0-9]+)(?:/(supplement|download|answer-docx|image/[a-f0-9]{24}))?"
 )
 
 
@@ -65,7 +65,8 @@ class LocalHandler(BaseHTTPRequestHandler):
             "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' blob:; connect-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
         )
         if attachment:
-            self.send_header("Content-Disposition", 'attachment; filename="classroom-review.zip"')
+            filename = attachment if isinstance(attachment, str) else "classroom-review.zip"
+            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
         self.end_headers()
         try:
             self.wfile.write(data)
@@ -229,6 +230,21 @@ class LocalHandler(BaseHTTPRequestHandler):
                         )
                     self._send(200, archive.getvalue(), "application/zip", attachment=True)
                     return
+                elif action == "answer-docx":
+                    view = jobs.package_view(job_id, key)
+                    if not view.get("answer_document"):
+                        raise WorkflowError(
+                            "答案 Word 文件尚未生成或已变化，请点击下载 Word 重新导出。"
+                        )
+                    package = jobs.package_path(job_id, key)
+                    document = jobs.package_file(package, "answer.docx")
+                    self._send(
+                        200,
+                        document.read_bytes(),
+                        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        attachment="classroom-answer.docx",
+                    )
+                    return
                 if action and action.startswith("image/"):
                     image = jobs.source_image(job_id, key, action.split("/")[1])
                     self._send(200, image.read_bytes(), "image/png")
@@ -294,6 +310,12 @@ class LocalHandler(BaseHTTPRequestHandler):
                         effort=payload.get("effort"),
                         ai_confirmed=payload.get("ai_confirmed", False),
                     )
+            elif match := re.fullmatch(
+                r"/api/jobs/([a-f0-9]{32})/items/([0-9]+:[0-9]+)/export-answer", path
+            ):
+                if payload:
+                    raise WorkflowError("导出请求不接受额外路径或远端写入指令。")
+                result = jobs.export_answer(match[1], match[2])
             elif match := re.fullmatch(
                 r"/api/jobs/([a-f0-9]{32})/items/([0-9]+:[0-9]+)/fill", path
             ):
