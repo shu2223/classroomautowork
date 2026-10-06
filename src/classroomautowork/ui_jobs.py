@@ -8,17 +8,22 @@ from dataclasses import asdict, replace
 from pathlib import Path
 
 from .auth import credentials_for, documents_authorized
+from .browser_questions import recover_questions
 from .codex_rpc import model_catalog
 from .config import Settings
 from .document_fill import fill_review, prepare_document_forms
 from .drafting import codex_command, generate_review
-from .errors import ConfigurationError, RunCancelled, WorkflowError
+from .errors import ConfigurationError, NeedsInput, RunCancelled, WorkflowError
+from .followups import read_followup
+from .form_capture import import_form_capture
 from .form_fill import fill_response_forms, prepare_response_forms
+from .form_read import form_references, form_url
 from .google_read import GoogleReader
 from .local import atomic_json, require_private_path, sha256_file, utc_now
 from .pending import discover_pending
 from .policy import CoursePolicy, confirmed_gate
 from .progress import ProgressUpdate
+from .supplements import load_supplement, normalized, save_supplement
 from .workflow import prepare
 
 ACTIVE = {"queued", "running", "stopping"}
@@ -297,6 +302,114 @@ class FrontendJobs:
             ai_confirmed=job.get("ai_confirmed", False),
         )
 
+    def supplement_item(self, job_id, key):
+        item = next((x for x in self.job(job_id)["items"] if item_key(x) == key), None)
+        if not item:
+            raise WorkflowError("找不到这项作业。")
+        return item
+
+    def save_item_supplement(
+        self,
+        job_id,
+        key,
+        values,
+        *,
+        continue_run=False,
+        model=None,
+        effort=None,
+        ai_confirmed=False,
+    ):
+        with self._lock:
+            if self._active:
+                raise WorkflowError(
+                    "当前任务仍在处理；请等它完成或暂停后保存补充，避免改变本次输入。"
+                )
+            item = self.supplement_item(job_id, key)
+            result = save_supplement(
+                self.settings.data_dir, item["course_id"], item["assignment_id"], values
+            )
+            if not continue_run:
+                return {"supplement": result, "status": "saved"}
+            source = self.job(job_id)
+            return self.start_selected(
+                [{field: item[field] for field in ("course_id", "assignment_id")}],
+                defer_media=source.get("defer_media", False),
+                model=model,
+                effort=effort,
+                ai_confirmed=ai_confirmed,
+            )
+
+    def import_followup(self, job_id, key):
+        if self.bootstrap()["active_job_id"]:
+            raise WorkflowError("请等当前处理结束后接收补充。")
+        package = self.package_path(job_id, key)
+        result = read_followup(package)
+        item = self.supplement_item(job_id, key)
+        supplement = load_supplement(
+            self.settings.data_dir, item["course_id"], item["assignment_id"]
+        )
+        marker = f"[Codex 补充回合 {result['turn_id']}]"
+        if marker not in supplement["text"]:
+            supplement = save_supplement(
+                self.settings.data_dir,
+                item["course_id"],
+                item["assignment_id"],
+                {
+                    "text": supplement["text"]
+                    + "\n\n"
+                    + marker
+                    + "\n"
+                    + "\n\n".join(
+                        (
+                            "用户补充："
+                            if record["role"] == "user"
+                            else "AI 候选内容（需要重新核验来源，不是个人事实）："
+                        )
+                        + record["text"]
+                        for record in result["records"]
+                    ),
+                    "personal_facts": supplement["personal_facts"],
+                },
+            )
+        return {
+            "supplement": supplement,
+            "followup": {k: v for k, v in result.items() if k != "records"},
+        }
+
+    def import_questions(self, job_id, key, values):
+        if set(values) != {"url", "question_script"}:
+            raise WorkflowError("题目导入仅接受原表单链接和题目脚本数据。")
+        if self.bootstrap()["active_job_id"]:
+            raise WorkflowError("请等当前处理结束后导入题目。")
+        package = self.package_path(job_id, key)
+        manifest = read_json(package / "manifest.json")
+        requirements = read_json(package / "requirements.json")
+        allowed = set(form_references(manifest["assignment"]))
+        allowed.update(form_references(requirements.get("student_submission") or {}))
+        allowed.update(x["url"] for x in requirements.get("response_forms", []))
+        for warning in manifest.get("warnings", []):
+            if warning.get("url") and any(
+                x.get("assignment_id") == manifest["assignment_id"]
+                for x in warning.get("origins", [])
+            ):
+                try:
+                    allowed.add(form_url(warning["url"]))
+                except WorkflowError:
+                    pass
+        form = import_form_capture(
+            self.settings.data_dir,
+            self.settings.school_email,
+            values["url"],
+            values["question_script"],
+            allowed,
+        )
+        return {
+            "title": form["title"],
+            "question_count": len(form["questions"]),
+            "page_count": form["page_count"],
+            "read_complete": form["read_complete"],
+        }
+
     def _request_approval(self, job_id, method, params):
         identifier = uuid.uuid4().hex
         with self._lock:
@@ -455,6 +568,33 @@ class FrontendJobs:
                     try:
                         forms = []
                         if job.get("ai_confirmed"):
+                            recovered = recover_questions(
+                                self.settings,
+                                Path(result["package"]),
+                                model=job["model"],
+                                effort=job.get("effort"),
+                                cancelled=self._cancel.is_set,
+                                progress=lambda msg: self._log(job_id, msg),
+                                approval=lambda method, params: self._request_approval(
+                                    job_id, method, params
+                                ),
+                                on_generation=lambda value, item=result: self._item(
+                                    job_id, item, browser_read=value
+                                ),
+                            )
+                            if recovered:
+                                refreshed = prepare(
+                                    self.settings,
+                                    targets=[(result["course_id"], result["assignment_id"])],
+                                    defer_media=job["defer_media"],
+                                    progress=lambda msg: self._log(job_id, msg),
+                                    on_assignment=assignment_event,
+                                )
+                                if not refreshed["packages"]:
+                                    raise NeedsInput(
+                                        "原题已读取，但重新准备资料尚未成功，请补充后继续。"
+                                    )
+                                result.update(refreshed["packages"][0])
                             self._log(
                                 job_id,
                                 ProgressUpdate(
@@ -524,7 +664,12 @@ class FrontendJobs:
                     except RunCancelled:
                         raise
                     except WorkflowError as exc:
-                        self._item(job_id, result, status="failed", error=str(exc))
+                        self._item(
+                            job_id,
+                            result,
+                            status="needs_user" if isinstance(exc, NeedsInput) else "failed",
+                            error=str(exc),
+                        )
                 status = (
                     "completed_with_issues"
                     if any(
@@ -674,7 +819,12 @@ class FrontendJobs:
         current_gate = CoursePolicy.load(self.settings.data_dir, manifest["course_id"]).draft_gate()
         if "ai_confirmation" in manifest:
             current_gate = confirmed_gate(current_gate, manifest["ai_confirmation"])
-        changed = current_gate != manifest["policy"]
+        supplement = load_supplement(
+            self.settings.data_dir, manifest["course_id"], manifest["assignment_id"]
+        )
+        changed = current_gate != manifest["policy"] or supplement != manifest.get(
+            "supplement", normalized({})
+        )
         generation = read_json(self.package_file(package, "codex-generation.json"))
         text = {}
         for name in ("draft.md", "checklist.md", "questions.md", "codex-summary.md"):
@@ -700,6 +850,7 @@ class FrontendJobs:
             "review": read_json(self.package_file(package, "review.json")),
             "receipt": receipt,
             "policy_changed": changed,
+            "supplement": supplement,
             "generation": generation,
             "document_fill": read_json(package / "document-fill.json"),
             "form_fill": read_json(package / "form-fill.json") if not changed else None,

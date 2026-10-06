@@ -23,7 +23,7 @@ from .ui_jobs import FILES, FrontendJobs, read_json
 ASSETS = Path(__file__).parent / "web"
 ASSET_TYPES = {"index.html": "text/html", "app.js": "text/javascript", "style.css": "text/css"}
 ITEM_ROUTE = re.compile(
-    r"/api/jobs/([a-f0-9]{32})/items/([0-9]+:[0-9]+)(?:/(download|image/[a-f0-9]{24}))?"
+    r"/api/jobs/([a-f0-9]{32})/items/([0-9]+:[0-9]+)(?:/(supplement|download|image/[a-f0-9]{24}))?"
 )
 
 
@@ -143,7 +143,14 @@ class LocalHandler(BaseHTTPRequestHandler):
                 result = jobs.policy(match[1])
             elif match := ITEM_ROUTE.fullmatch(path):
                 job_id, key, action = match.groups()
-                if action == "download":
+                if action == "supplement":
+                    from .supplements import load_supplement
+
+                    item = jobs.supplement_item(job_id, key)
+                    result = load_supplement(
+                        jobs.settings.data_dir, item["course_id"], item["assignment_id"]
+                    )
+                elif action == "download":
                     package = jobs.package_path(job_id, key)
                     view = jobs.package_view(job_id, key)
                     archive = io.BytesIO()
@@ -262,6 +269,29 @@ class LocalHandler(BaseHTTPRequestHandler):
                 if payload:
                     raise WorkflowError("文档授权请求不接受额外参数。")
                 result = jobs.authorize_documents()
+            elif match := re.fullmatch(
+                r"/api/jobs/([a-f0-9]{32})/items/([0-9]+:[0-9]+)/(supplement|continue|followup|questions)",
+                path,
+            ):
+                job_id, key, operation = match.groups()
+                if operation == "followup":
+                    if payload:
+                        raise WorkflowError("接收补充不接受其他会话 ID 或操作指令。")
+                    result = jobs.import_followup(job_id, key)
+                elif operation == "questions":
+                    result = jobs.import_questions(job_id, key, payload)
+                else:
+                    if set(payload) - {"text", "personal_facts", "model", "effort", "ai_confirmed"}:
+                        raise WorkflowError("补充请求包含不支持的参数。")
+                    result = jobs.save_item_supplement(
+                        job_id,
+                        key,
+                        {k: payload[k] for k in ("text", "personal_facts") if k in payload},
+                        continue_run=operation == "continue",
+                        model=payload.get("model"),
+                        effort=payload.get("effort"),
+                        ai_confirmed=payload.get("ai_confirmed", False),
+                    )
             elif match := re.fullmatch(
                 r"/api/jobs/([a-f0-9]{32})/items/([0-9]+:[0-9]+)/fill", path
             ):

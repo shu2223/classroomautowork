@@ -11,9 +11,11 @@ from .buzz import BuzzConfig, setup_buzz
 from .config import Settings, assignment_ids
 from .document_fill import fill_review
 from .errors import WorkflowError
+from .form_capture import import_form_capture
 from .form_fill import fill_response_forms, prepare_response_forms
+from .form_read import form_references
 from .google_read import GoogleReader
-from .local import state_root
+from .local import require_private_path, state_root
 from .pending import discover_pending
 from .review import finalize
 from .search import retrieve
@@ -92,6 +94,13 @@ def main(argv=None) -> int:
         "fill", help="Fill a verified Codex draft into its existing personal submission Doc"
     )
     fill.add_argument("--package", required=True, type=Path)
+    questions = commands.add_parser(
+        "import-form-questions",
+        help="Import native questions read in the authorized school browser",
+    )
+    questions.add_argument("--package", required=True, type=Path)
+    questions.add_argument("--url", required=True)
+    questions.add_argument("--question-data", required=True, type=Path)
     verify = commands.add_parser(
         "verify", help="Read the real assignment and download a permitted attachment"
     )
@@ -180,6 +189,38 @@ def main(argv=None) -> int:
                     "oauth": "authorized",
                     "identity": identity,
                     "connection": "Run verify to validate assignment and download.",
+                }
+            elif args.command == "import-form-questions":
+                package = require_private_path(args.package)
+                manifest = json.loads((package / "manifest.json").read_text(encoding="utf-8"))
+                expected = (
+                    settings.data_dir
+                    / "review-packages"
+                    / manifest["course_id"]
+                    / manifest["assignment_id"]
+                )
+                if package.parent != expected:
+                    raise WorkflowError("题目导入必须使用当前私人数据目录中的真实作业包。")
+                allowed = form_references(manifest["assignment"])
+                allowed.extend(form_references(manifest.get("student_submission") or {}))
+                for warning in manifest.get("warnings", []):
+                    if warning.get("url") and any(
+                        x.get("assignment_id") == manifest["assignment_id"]
+                        for x in warning.get("origins", [])
+                    ):
+                        allowed.append(warning["url"])
+                form = import_form_capture(
+                    settings.data_dir,
+                    settings.school_email,
+                    args.url,
+                    require_private_path(args.question_data).read_text(encoding="utf-8"),
+                    allowed,
+                )
+                result = {
+                    "status": "questions_imported",
+                    "page_count": form["page_count"],
+                    "question_count": len(form["questions"]),
+                    "read_complete": form["read_complete"],
                 }
             elif args.command == "fill":
                 result = (

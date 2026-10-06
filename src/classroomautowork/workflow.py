@@ -12,7 +12,9 @@ from .auth import credentials_for
 from .buzz import BuzzConfig, transcribe_media
 from .config import Settings
 from .errors import ConfigurationError, PermissionDenied, RunCancelled, WorkflowError
+from .external_sources import external_chunks, source_urls
 from .extract import extract_document, processor_identity
+from .form_capture import authenticated_form_cache
 from .form_read import PARSER_VERSION, form_chunks, form_references, read_form
 from .google_read import GoogleReader, attachment_metadata, drive_attachments
 from .local import atomic_json, sha256_file, utc_now
@@ -22,6 +24,7 @@ from .progress import ProgressUpdate, report
 from .search import retrieve
 from .store import Store, artifact, fingerprint
 from .student import StudentProfile
+from .supplements import load_supplement
 
 MEDIA = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".mp3", ".wav", ".m4a", ".ogg", ".flac"}
 
@@ -166,7 +169,10 @@ def sync_course(
     for source_id, url in list(linked_forms.items())[:100]:
         try:
             report(progress, "正在只读读取 Google Forms 全部页面的题目与选项", "form_read")
-            form = read_form(url)
+            try:
+                form = read_form(url)
+            except PermissionDenied as exc:
+                form = authenticated_form_cache(settings.data_dir, settings.school_email, url, exc)
             revision = fingerprint(form)
 
             def save_form(key, value=form):
@@ -351,6 +357,14 @@ def sync_course(
                     "error": str(exc),
                 }
             )
+    allowed_link_urls = source_urls(records) | source_urls(
+        [("cached", value) for value in store.chunks(course_id) if value["source_id"] in readable]
+    )
+    for source_id, revision, chunks in external_chunks(
+        settings.data_dir, course_id, allowed_link_urls
+    ):
+        store.replace_chunks(course_id, source_id, revision, chunks)
+        readable.add(source_id)
     store.prune(course_id, readable)
     return {
         "course": course,
@@ -396,6 +410,7 @@ def prepare_assignment(
     ]
     requirement_ids.update(value["source_id"] for value in response_forms)
     student_profile = asdict(StudentProfile.load(settings.data_dir))
+    supplement = load_supplement(settings.data_dir, course_id, assignment_id)
     required_files = set()
     for original, origins in course.get("attachment_origins", {}).items():
         if any(x.get("assignment_id") == assignment_id for x in origins):
@@ -466,6 +481,7 @@ def prepare_assignment(
             "downloads": course.get("downloads", {}),
             "response_forms": response_forms,
             "student_profile": student_profile,
+            "supplement": supplement,
         }
     )
     path = settings.data_dir / "review-packages" / course_id / assignment_id / identity[:24]
@@ -473,11 +489,11 @@ def prepare_assignment(
     def package(_key):
         path.mkdir(parents=True, exist_ok=True)
         questions = [
-            "请核对作业和课程中的 AI 使用规则。",
+            "在主界面勾选是否使用 AI；课程 AI 规定只保留为说明。",
             "个人经历、课堂参与和调查结果仅使用你提供的真实事实。",
         ]
         if not course["policy"]["can_draft"]:
-            questions.insert(0, "课程 AI 规则未知或禁止代写，当前不能生成作业答案初稿。")
+            questions.insert(0, "需要 AI 作答时勾选主界面的 AI 使用选项。")
         if course["warnings"]:
             questions.append("部分资料未处理或需目视核对，详见 manifest.json 的 warnings。")
         manifest = {
@@ -489,6 +505,7 @@ def prepare_assignment(
             "assignment": assignment,
             "student_submission": submission,
             "student_profile": student_profile,
+            "supplement": supplement,
             "response_forms": response_forms,
             "source_index": source_index,
             "downloads": list(course.get("downloads", {}).values()),

@@ -13,10 +13,11 @@ def confirmed_gate(course_gate: dict, confirmed: bool) -> dict:
     if type(confirmed) is not bool:
         raise ConfigurationError("AI 确认选项必须是勾选或未勾选。")
     gate = dict(course_gate)
-    gate["can_draft"] = confirmed and gate["ai_use"] != "forbidden"
+    gate["can_draft"] = confirmed
+    gate["course_ai_rules_advisory"] = True
     gate["unconfirmed_drafting"] = confirmed and gate["ai_use"] == "unknown"
     gate["user_drafting_instruction"] = (
-        "用户在本次任务中勾选：我已确认所选作业可以使用 AI。遵守已知教师限制；教师规定来源仍保持原记录。"
+        "用户在本次任务中明确选择使用 AI；课程中的 AI 禁止或限制只保留为说明，不阻止作答。此选择不代表教师许可。"
         if confirmed
         else ""
     )
@@ -91,13 +92,13 @@ class CoursePolicy:
     def draft_gate(self) -> dict:
         return {
             "ai_use": self.ai_use,
-            "can_draft": self.ai_use in {"allowed", "limited"}
-            or (self.ai_use == "unknown" and self.unconfirmed_drafting),
+            "can_draft": self.ai_use in {"allowed", "limited"} or self.unconfirmed_drafting,
+            "course_ai_rules_advisory": True,
             "unconfirmed_drafting": self.unconfirmed_drafting,
             "user_drafting_instruction": self.user_drafting_instruction,
             "policy_evidence": self.policy_evidence,
             "limitations": self.limitations,
             "disclosure": self.disclosure,
             "personal_facts": self.personal_facts,
-            "reason": "Follow actual teacher rules. Unknown rules permit a draft only with an explicit local user instruction; never relabel them as teacher permission.",
+            "reason": "The local user's AI choice controls generation. Teacher AI rules are advisory source records, not program permissions or teacher approval.",
         }

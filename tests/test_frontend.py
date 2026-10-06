@@ -190,12 +190,14 @@ def test_checked_ai_uses_selected_model_preserves_permissions_and_reuses_only_va
     assert drafting.reusable_review(variant, model="unit-model", effort="high") is None
 
 
-def test_course_forbidden_blocks_even_when_user_checks_ai(tmp_path, monkeypatch):
-    package, _, _, _ = prepared_fixture(tmp_path, "forbidden")
-    monkeypatch.setattr(
-        drafting, "codex_command", lambda: pytest.fail("Forbidden must not launch Codex")
-    )
-    assert drafting.generate_review(package, ai_confirmed=True)["draft_sha256"] is None
+def test_user_choice_generates_despite_advisory_course_ai_prohibition(tmp_path, monkeypatch):
+    package, _, _, review = prepared_fixture(tmp_path, "forbidden")
+    offline_rpc(tmp_path, monkeypatch, package, review)
+    result = drafting.generate_review(package, ai_confirmed=True, model="unit-model", effort="high")
+    assert result["draft_sha256"]
+    manifest = json.loads((Path(result["package"]) / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["policy"]["ai_use"] == "forbidden"
+    assert manifest["policy"]["course_ai_rules_advisory"] and manifest["policy"]["can_draft"]
 
 
 def test_metadata_only_revision_reuses_real_output_but_changed_content_does_not(

@@ -14,7 +14,8 @@ from urllib.parse import urlencode
 
 from filelock import FileLock, Timeout
 
-from .errors import WorkflowError
+from .errors import PermissionDenied, WorkflowError
+from .form_capture import authenticated_form_cache
 from .form_read import form_references, form_url, read_form
 from .local import atomic_json, require_private_path, sha256_file, utc_now
 from .policy import CoursePolicy, confirmed_gate
@@ -195,7 +196,12 @@ def fill_response_forms(settings, package: Path, *, progress=lambda _: None, ope
     plans = []
     for form in forms:
         progress(ProgressUpdate("正在核对原表单题目与自动填写的栏位", "form_fill"))
-        fresh = read_form(form["url"])
+        try:
+            fresh = read_form(form["url"])
+        except PermissionDenied as exc:
+            fresh = authenticated_form_cache(
+                settings.data_dir, settings.school_email, form["url"], exc
+            )
         if context_digest(fresh) != form["context_sha256"]:
             raise WorkflowError("原表单题目或选项已修改，请重新读题生成；未覆盖草稿。")
         selected = [x for x in answers if x["form_url"] == form["url"]]
@@ -215,6 +221,7 @@ def fill_response_forms(settings, package: Path, *, progress=lambda _: None, ope
                     if field["entry_id"] not in filled
                 ],
                 "browser_values_verified": False,
+                "question_verification": "fresh_anonymous_read_or_browser_capture_within_24h",
                 "draft_saved_verified": False,
             }
         )

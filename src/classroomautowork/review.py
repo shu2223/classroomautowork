@@ -9,7 +9,8 @@ from .errors import WorkflowError
 from .local import atomic_json, require_private_path, sha256_file, utc_now
 from .policy import CoursePolicy, confirmed_gate
 from .store import Store
-from .student import StudentProfile, identity_facts
+from .student import StudentProfile
+from .supplements import check_supplement, personal_facts
 
 
 def finalize(package: Path, review_path: Path, draft_path: Path | None = None) -> dict:
@@ -27,9 +28,8 @@ def finalize(package: Path, review_path: Path, draft_path: Path | None = None) -
     current_profile = asdict(StudentProfile.load(root))
     if "student_profile" in manifest and manifest["student_profile"] != current_profile:
         raise WorkflowError("学生资料已变化，请用新资料重新生成，旧初稿不能标为当前身份的结果。")
-    personal_facts = manifest["policy"]["personal_facts"] + identity_facts(
-        manifest.get("student_profile", {})
-    )
+    check_supplement(root, manifest)
+    facts = personal_facts(manifest)
     policy = CoursePolicy.load(root, manifest["course_id"])
     gate = policy.draft_gate()
     if "ai_confirmation" in manifest:
@@ -95,9 +95,7 @@ def finalize(package: Path, review_path: Path, draft_path: Path | None = None) -
             raise WorkflowError("Sourced draft claims must display their evidence citations.")
         if claim["kind"] == "user_fact":
             indices = claim.get("personal_fact_indices", [])
-            if not indices or any(
-                type(i) is not int or i < 0 or i >= len(personal_facts) for i in indices
-            ):
+            if not indices or any(type(i) is not int or i < 0 or i >= len(facts) for i in indices):
                 raise WorkflowError(
                     "Personal-experience claims must refer to facts supplied by the user."
                 )

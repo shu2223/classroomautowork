@@ -123,7 +123,7 @@ def test_current_form_is_required_cached_and_unavailable_form_is_removed(tmp_pat
 
     live = form_read.parse_form(published_page(), URL)
     monkeypatch.setattr(workflow, "read_form", lambda _: live)
-    settings = SimpleNamespace(data_dir=tmp_path)
+    settings = SimpleNamespace(data_dir=tmp_path, school_email="unit-test@example.invalid")
     reader = FormReader()
     with Store(tmp_path) as store:
         course = workflow.sync_course(reader, settings, store, "1")
