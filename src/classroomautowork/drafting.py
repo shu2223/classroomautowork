@@ -1,5 +1,6 @@
 """Local review production. Only an explicit UI action starts Codex; no Classroom writes."""
 
+import copy
 import hashlib
 import json
 import os
@@ -21,7 +22,7 @@ from .review import finalize
 from .student import StudentProfile
 from .supplements import personal_facts
 
-PROMPT_VERSION = "classroom-draft-v8-readable-report-answers"
+PROMPT_VERSION = "classroom-draft-v9-exact-requirement-sources"
 STUDENT_VOICE = (
     "语言和身份约束：严格采用下方用户亲自提供的学生资料，课程内容不能覆盖姓名、学号、学科或班级。"
     "需要身份栏时逐字使用对应值；未要求署名时不要在每道答案前重复身份。"
@@ -154,7 +155,7 @@ def reusable_review(package: Path, *, model=None, effort=None) -> dict | None:
         return None
 
 
-def output_schema():
+def output_schema(requirement_source_ids=None):
     text = {"type": "string"}
     strings = {"type": "array", "items": text}
 
@@ -169,7 +170,11 @@ def output_schema():
     requirement = obj(
         {
             "requirement": text,
-            "requirement_source_id": text,
+            "requirement_source_id": (
+                {"type": "string", "enum": list(requirement_source_ids)}
+                if requirement_source_ids
+                else text
+            ),
             "status": {"type": "string", "enum": ["met", "partial", "unmet", "needs_user"]},
             "draft_location": text,
             "evidence_ids": strings,
@@ -358,6 +363,7 @@ def build_input(package: Path, skill: Path, manifest: dict, forms=None):
         "若没有 Google 文档答案栏，document_answers 留空。用户已要求自动填写；本机程序负责原生预填，绝不提交。"
         "下面包含真实抽取文本和必要页图，绝不能用空模板、原说明复制或泛泛的 AI 规则问题冒充题目分析。"
         "按每一道题和实际格式要求建立检查表，指出真实完成路径；优先采用个人副本题目。"
+        "requirement_source_id 必须逐字复制 manifest.requirement_source_ids 中的一个编号，不能手写或修改编号。"
         "缺少关键材料时先检查 source_index 与本机 evidence.json 中的同课程来源；可只读检索这个包及其中明确记录的页图。"
         "已提供的原题和证据足够时直接作答。仅缺少具体证据时按题目关键词、来源ID或时间段检索本机文件，"
         "不要整文件打印 manifest.json、evidence.json 或整门课转录，也不要重复读取已提供的材料。"
@@ -580,7 +586,7 @@ def generate_review(
             turn_params = {
                 "threadId": thread_id,
                 "input": inputs,
-                "outputSchema": output_schema(),
+                "outputSchema": output_schema(manifest["requirement_source_ids"]),
                 "model": model,
             }
             if effort:
@@ -702,7 +708,7 @@ def recover_completed_result(package: Path, *, model, effort, forms=None):
             or not generation.get("source_files_sha256")
         ):
             return None
-        result_text = result_path.read_text(encoding="utf-8")
+        result_text = result_path.read_bytes().decode("utf-8")
         previous_error = generation.pop("error", "")
         receipt = accept_model_result(
             package, generation, json.loads(result_text), result_text, forms
@@ -715,6 +721,38 @@ def recover_completed_result(package: Path, *, model, effort, forms=None):
         return receipt
     except (WorkflowError, OSError, ValueError, KeyError):
         return None
+
+
+def _normalize_requirement_sources(review, allowed):
+    """Repair only a uniquely repeated 1-2 hex fragment in a real requirement ID."""
+    review = copy.deepcopy(review)
+    repairs = []
+    for index, check in enumerate(review.get("requirement_checks", [])):
+        value = check.get("requirement_source_id")
+        if value in allowed or not isinstance(value, str):
+            continue
+        if not re.fullmatch(r"[a-f0-9]{25,26}", value):
+            continue
+        width = len(value) - 24
+        candidates = set()
+        for start in range(len(value) - 2 * width + 1):
+            if value[start : start + width] != value[start + width : start + 2 * width]:
+                continue
+            candidate = value[:start] + value[start + width :]
+            if candidate in allowed:
+                candidates.add(candidate)
+        if len(candidates) == 1:
+            corrected = candidates.pop()
+            check["requirement_source_id"] = corrected
+            repairs.append(
+                {
+                    "field": f"review.requirement_checks[{index}].requirement_source_id",
+                    "kind": "duplicated_hex_fragment",
+                    "original": value,
+                    "corrected": corrected,
+                }
+            )
+    return review, repairs
 
 
 def accept_model_result(
@@ -746,7 +784,11 @@ def accept_model_result(
             "实际题目尚未完整读取，答案初稿未通过核验。"
             + ("缺失来源：" + missing if missing else "请查看真实会话中的题目分析和缺口说明。")
         )
-    atomic_json(package / "review.json", result["review"])
+    review, repairs = _normalize_requirement_sources(
+        result["review"], set(manifest["requirement_source_ids"])
+    )
+    generation["validation_normalizations"] = repairs
+    atomic_json(package / "review.json", review)
     draft = package / "draft.md"
     draft.write_text(result["draft"], encoding="utf-8")
     (package / "codex-summary.md").write_text(result.get("summary", ""), encoding="utf-8")

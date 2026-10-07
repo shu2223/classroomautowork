@@ -13,7 +13,7 @@ from .browser_questions import recover_questions
 from .codex_rpc import model_catalog
 from .config import Settings
 from .document_fill import fill_review, prepare_document_forms
-from .drafting import codex_command, generate_review
+from .drafting import codex_command, generate_review, recover_completed_result
 from .errors import ConfigurationError, NeedsInput, RunCancelled, WorkflowError
 from .followups import read_followup
 from .form_capture import import_form_capture
@@ -323,6 +323,8 @@ class FrontendJobs:
         job = self.job(job_id)
         if job["status"] in ACTIVE:
             raise WorkflowError("任务仍在运行。")
+        if self._recover_local_answers(job_id):
+            return self.job(job_id)
         missing = next(
             (
                 x
@@ -349,6 +351,60 @@ class FrontendJobs:
             effort=job.get("effort"),
             ai_confirmed=job.get("ai_confirmed", False),
         )
+
+    def _recover_local_answers(self, job_id):
+        """Recover completed local reports before any synchronization or model call."""
+        with self._lock:
+            if self._active:
+                return False
+            job = self._jobs[job_id]
+            recovered = False
+            for item in job["items"]:
+                if item.get("status") != "failed" or not item.get("package"):
+                    continue
+                package = self.package_path(job_id, item_key(item))
+                result = read_json(package / "codex-result.json", {})
+                if (
+                    not job.get("ai_confirmed")
+                    or result.get("document_answers")
+                    or prepare_response_forms(package)
+                ):
+                    continue
+                receipt = recover_completed_result(
+                    package, model=job.get("model"), effort=job.get("effort")
+                )
+                if not receipt or not receipt.get("draft_sha256"):
+                    continue
+                document = create_answer_document(package)
+                self._item(
+                    job_id,
+                    item,
+                    generation=receipt["generation"],
+                    status=document["status"],
+                    answer_document=document,
+                    error=None,
+                    reused_review=True,
+                )
+                recovered = True
+            if recovered:
+                job["status"] = (
+                    "completed"
+                    if all(
+                        x["status"] in {"ready", "document_ready", "form_opened"}
+                        for x in job["items"]
+                    )
+                    else "completed_with_issues"
+                )
+                self._log(
+                    job_id,
+                    "已核验并恢复上次完整 Codex 答案，生成可打开的审阅文件；未重新下载、未重新调用 AI。"
+                    + (
+                        "仍有内容待补充，请打开答案或补充并继续。"
+                        if document["status"] == "needs_user"
+                        else ""
+                    ),
+                )
+            return recovered
 
     def supplement_item(self, job_id, key):
         item = next((x for x in self.job(job_id)["items"] if item_key(x) == key), None)

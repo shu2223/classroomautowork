@@ -70,14 +70,14 @@ def finalize(package: Path, review_path: Path, draft_path: Path | None = None) -
         or not all(isinstance(q, str) for q in questions)
     ):
         raise WorkflowError("Review needs requirement checks and a list of unanswered questions.")
-    for check in checks:
+    for index, check in enumerate(checks, 1):
         if (
             not check.get("requirement")
             or check.get("requirement_source_id") not in manifest["requirement_source_ids"]
             or check.get("status") not in {"met", "partial", "unmet", "needs_user"}
         ):
             raise WorkflowError(
-                "Each requirement must identify its actual assignment source and status."
+                f"第 {index} 条要求的来源编号或检查状态无效；AI 返回结果已保留，尚未通过本机核验。"
             )
         if any(x not in sources for x in check.get("evidence_ids", [])):
             raise WorkflowError("Requirement check contains an unknown evidence ID.")
