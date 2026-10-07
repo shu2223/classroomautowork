@@ -22,7 +22,7 @@ from .review import finalize
 from .student import StudentProfile
 from .supplements import personal_facts
 
-PROMPT_VERSION = "classroom-draft-v9-exact-requirement-sources"
+PROMPT_VERSION = "classroom-draft-v10-natural-personal-templates"
 STUDENT_VOICE = (
     "语言和身份约束：严格采用下方用户亲自提供的学生资料，课程内容不能覆盖姓名、学号、学科或班级。"
     "需要身份栏时逐字使用对应值；未要求署名时不要在每道答案前重复身份。"
@@ -41,6 +41,10 @@ STUDENT_VOICE = (
     "不在答案末尾追加；影响事实准确性的必要限定仍写在相关句子中。"
     "举例可优先考虑与学生学科相关的场景，但必须有来源或明确是分析，不能虚构实习、购物、观看、调查、出席等经历。"
     "感想中的第一人称观点是待用户审阅的候选表达，不能宣称用户已经持有该观点。"
+    "用户明确要求通用模板、正常人的示例或自动生成饮食习惯时，给出完整自然的候选答案，"
+    "可包含一般大学生常见的情境、评价及理由；在 review 标明这是模板并待本人核对，kind 用 analysis。"
+    "模板正文硬性禁止用‘未入力’、‘仮に’、‘假设你’或‘请自行填写’作为占位或审核提示；"
+    "采用平常作业的直接陈述和自然句子，不把这些候选情境加入 personal_facts 或声称已经本人确认。"
     "若教师要求本人用自己的话判断或写观点，将这部分标为需要本人确认或改写，不能把 AI 候选文本标为本人已完成。"
 )
 
@@ -378,7 +382,7 @@ def build_input(package: Path, skill: Path, manifest: dict, forms=None):
         "请按输出 schema 返回一个 JSON 对象。review 的规则参照下面 Skill；本机程序负责写文件和 finalize，禁止你自行写文件或调用 finalize。"
         "保持输出简短：draft 满足原题要求，检查表每题一项，claim_checks 只核验答案的关键事实。"
         "不要逐条复述全课程证据，不要重复答案、检查表或来源ID，不要复制原始教材和转录。"
-        "draft 有实际内容才填写。报告类作业的 draft 只写报告正文和原题所需的题号，不放本机审核说明、证据记录或课堂判断依据表；证据留在引用标记和 review，程序生成可打开的 Word。缺少个人事实时在对应答案位置写明未入力，在 requirement_checks 标为 needs_user，并在 questions 说明缺什么，不能把课堂依据当作本人自评。"
+        "draft 有实际内容才填写。报告类作业的 draft 只写报告正文和原题所需的题号，不放本机审核说明、证据记录或课堂判断依据表；证据留在引用标记和 review，程序生成可打开的 Word。缺少个人事实时，在 requirement_checks 标为 needs_user，并在 questions 说明待本人确认的内容。用户要求通用模板时正文必须完整、自然，直接写候选评价和理由，不写未入力或仮に；候选情境属于 analysis，不是已核实的本人事实。未要求模板且没有真实个人资料时保留空栏，缺口只写在 review，不在答案正文放占位提示。"
         "requirements_complete 仅表示实际问题和要求已经读到，不表示作业完成。缺少视频转录或背景资料不能把已经读到的题目标成未读取；将其影响逐题记录在 missing_sources/questions 中，有依据的题目仍给出候选答案。原题本身未读全时才令 requirements_complete=false。"
         "used_evidence_ids 列出确实用于本次分析/初稿的真实 ID；引用为 [E:id]；不确定的内容写入 questions。"
         "document_answers 用下面程序识别的真实答案栏返回逐栏答案；document_id、field_id、context_sha256 必须逐字复制。"

@@ -262,6 +262,19 @@ class FrontendJobs:
                 item["status"] = "needs_user"
                 job["status"] = "completed_with_issues"
                 job["message"] = "答案文件已生成，可打开审阅；仍有内容待补充，请点击补充并继续。"
+            elif (
+                item["status"] == "needs_user"
+                and result["status"] == "ready"
+                and result["personal_templates"]
+            ):
+                item["status"] = "ready"
+                if all(
+                    x["status"] in {"ready", "document_ready", "form_opened"} for x in job["items"]
+                ):
+                    job["status"] = "completed"
+                job["message"] = (
+                    "已按你的要求整理完整通用模板，打开答案或 Word 审阅；个人情况在审阅时核对，提交由你手动完成。"
+                )
             self._save(job)
             return self._snapshot(job)
 

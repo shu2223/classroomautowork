@@ -15,10 +15,37 @@ from docx.shared import Cm, Pt, RGBColor
 from .errors import WorkflowError
 from .local import atomic_json, require_private_path, sha256_file, utc_now
 
-VERSION = "answer-document-v1.2"
+VERSION = "answer-document-v1.4-body-only-templates"
 
 
-def answer_blocks(draft):
+def personal_templates_requested(manifest):
+    """Only the trusted user's supplement can request personal template examples."""
+    text = manifest.get("supplement", {}).get("text", "")
+    for clause in re.split(r"[。.!！?？\n]", text):
+        if re.search(r"(?:不要|不需要|别|禁止|しない)", clause):
+            continue
+        if re.search(r"(?:生成|作成).*?(?:模板|テンプレート|饮食习惯)", clause):
+            return True
+    return False
+
+
+def template_presentation(draft, requested):
+    """Present existing conditional candidates as templates; never promote them to facts."""
+    if not requested:
+        return draft, 0
+    pattern = re.compile(
+        r"^([①-⑳\d]+)「([^」]+)」：未入力。仮に、(.+?)なら([◎〇○△×])と考える。[ \t]*$",
+        re.MULTILINE,
+    )
+
+    def render(match):
+        number, title, reason, rating = match.groups()
+        return f"{number}{title.replace('・', '、')}\n{rating}。{reason}。"
+
+    return pattern.subn(render, draft)
+
+
+def answer_blocks(draft, *, personal_templates=False):
     """Remove explicit internal audit notes, preserving answers and unfinished fields."""
     lines = []
     for line in draft.splitlines():
@@ -26,6 +53,9 @@ def answer_blocks(draft):
             break
         lines.append(re.sub(r"\[E:[a-f0-9]{24}\]", "", line).rstrip())
     text = "\n".join(lines)
+    text, _ = template_presentation(text, personal_templates)
+    if personal_templates and ("未入力" in text or re.search(r"仮に[、，]", text)):
+        raise WorkflowError("个人模板仍含占位或假设提示，需要按你的正文格式重新整理。")
     paragraphs = re.split(r"\n\s*\n", text)
     blocks = []
     for paragraph in paragraphs:
@@ -101,7 +131,11 @@ def create_answer_document(package):
     manifest = json.loads((package / "manifest.json").read_text(encoding="utf-8"))
     review = json.loads((package / "review.json").read_text(encoding="utf-8"))
     pending = [x["requirement"] for x in review["requirement_checks"] if x["status"] != "met"]
-    blocks = answer_blocks((package / "draft.md").read_text(encoding="utf-8"))
+    draft = (package / "draft.md").read_text(encoding="utf-8")
+    personal_templates = personal_templates_requested(manifest)
+    plain = re.sub(r"\[E:[a-f0-9]{24}\]", "", draft)
+    _, template_count = template_presentation(plain, personal_templates)
+    blocks = answer_blocks(draft, personal_templates=personal_templates)
     title = manifest["assignment"].get("title", "作业答案")
     document = Document()
     section = document.sections[0]
@@ -129,21 +163,11 @@ def create_answer_document(package):
     for name in ("Heading 1", "Heading 2", "Heading 3"):
         document.styles[name].paragraph_format.space_before = Pt(10)
         document.styles[name].paragraph_format.space_after = Pt(4)
-    # This is an answer review file, not a certification of assignment completion.
-    banner = (
-        "审阅稿：尚有内容待补充，请先在助手中补齐。"
-        if pending
-        else "答案审阅稿：请核对后手动提交。"
-    )
     first_is_title = blocks[0]["kind"] == "heading" and blocks[0]["level"] == 1
     displayed_title = blocks[0]["text"] if first_is_title else title
     document.add_paragraph(displayed_title, "Title")
-    note = document.add_paragraph(banner)
-    note.runs[0].font.color.rgb = RGBColor.from_string("916000")
-    rendered = [
-        f"<h1>{html.escape(displayed_title)}</h1>",
-        f"<p class='notice'>{html.escape(banner)}</p>",
-    ]
+    # Completion and personal-confirmation notices belong in the app, outside the answer.
+    rendered = [f"<h1>{html.escape(displayed_title)}</h1>"]
     for block in blocks[1:] if first_is_title else blocks:
         if block["kind"] == "table":
             rows = block["rows"]
@@ -218,8 +242,23 @@ def create_answer_document(package):
         "created_at": utc_now(),
         "inputs": inputs,
         "title": title,
-        "status": "needs_user" if pending else "ready",
+        "status": (
+            "ready"
+            if not pending
+            or (
+                personal_templates
+                and all(c["status"] in {"met", "needs_user"} for c in review["requirement_checks"])
+            )
+            else "needs_user"
+        ),
         "pending_requirements": pending,
+        "personal_templates": personal_templates,
+        "template_transform_count": template_count,
+        "presentation_note": (
+            "个人内容为你要求的通用模板，请按本人情况核对；模板没有加入真实个人事实。"
+            if personal_templates
+            else ""
+        ),
         "blocks": blocks,
         "files": {name: sha256_file(package / name) for name in ("answer.docx", "answer.html")},
         "submission": "manual_only",
