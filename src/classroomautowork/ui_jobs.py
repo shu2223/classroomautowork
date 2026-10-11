@@ -9,8 +9,10 @@ from pathlib import Path
 
 from .answer_document import create_answer_document, valid_answer_document
 from .auth import credentials_for, documents_authorized
+from .batch import course_batches
 from .browser_documents import ensure_document_sheet
 from .browser_questions import recover_questions
+from .buzz import validation_session
 from .codex_rpc import model_catalog
 from .completion import review_cautions
 from .config import Settings
@@ -134,6 +136,24 @@ class FrontendJobs:
                 for cid in {x["course_id"] for x in pending["assignments"]}:
                     policies[cid] = CoursePolicy.load(self.settings.data_dir, cid).draft_gate()
             jobs = sorted(self._jobs.values(), key=lambda x: x["created_at"], reverse=True)[:30]
+            # Refresh jobs must not evict an assignment's result from the one-click
+            # skip list. Keep one current record per assignment, outside log paging.
+            result_jobs, seen = [], set()
+            for job in sorted(self._jobs.values(), key=lambda x: x["created_at"], reverse=True):
+                if job["kind"] not in {"review", "fill"}:
+                    continue
+                items = []
+                for item in job["items"]:
+                    if item_key(item) not in seen:
+                        items.append(item)
+                        seen.add(item_key(item))
+                if items:
+                    result_jobs.append(
+                        {
+                            **{k: job[k] for k in ("id", "kind", "created_at", "status")},
+                            "items": items,
+                        }
+                    )
             return json.loads(
                 json.dumps(
                     {
@@ -143,6 +163,7 @@ class FrontendJobs:
                         "pending": pending,
                         "policies": policies,
                         "jobs": [self._snapshot(x) for x in jobs],
+                        "result_jobs": result_jobs,
                         "active_job_id": self._active,
                         "submission": "manual_only",
                     }
@@ -336,13 +357,36 @@ class FrontendJobs:
             return self.refresh()
         if job["kind"] == "document_auth":
             return self.authorize_documents()
-        if job["kind"] == "fill":
-            return self.fill_existing(job_id, item_key(job["items"][0]))
+        # Recovery may have completed some items. Never download or regenerate them
+        # merely because another assignment in the original batch failed.
+        job = self.job(job_id)
+        remaining = [
+            x
+            for x in job["items"]
+            if x["status"] not in {"ready", "document_ready", "form_opened", "document_needs_user"}
+            or (
+                x["status"] == "ready"
+                and not (x.get("package") and valid_answer_document(Path(x["package"])))
+            )
+        ]
+        if not remaining:
+            return job
+        if job["kind"] == "fill" and len(remaining) == 1:
+            return self.fill_existing(job_id, item_key(remaining[0]))
+        if job["kind"] == "fill" or (
+            job.get("ai_confirmed")
+            and all(
+                x["status"] in {"needs_document", "needs_form"}
+                and x.get("package")
+                and x.get("generation", {}).get("status") == "completed"
+                for x in remaining
+            )
+        ):
+            # The fill adapters revalidate permissions, source context and answer
+            # integrity. A fill failure does not require another generation pass.
+            return self._start("fill", remaining, ai_confirmed=True)
         return self.start_selected(
-            [
-                {"course_id": x["course_id"], "assignment_id": x["assignment_id"]}
-                for x in job["items"]
-            ],
+            [{"course_id": x["course_id"], "assignment_id": x["assignment_id"]} for x in remaining],
             defer_media=job["defer_media"],
             model=job.get("model"),
             effort=job.get("effort"),
@@ -625,6 +669,34 @@ class FrontendJobs:
             self._save(job)
             return self.job(job_id)
 
+    def _prepared_packages(self, job_id, job, assignment_event):
+        """Yield after closing each course's Store lock, so drafting can start now."""
+        cache = {"reused": 0, "processed": 0, "failed": 0}
+        groups = course_batches(job["items"])
+        for number, items in enumerate(groups, 1):
+            self._log(job_id, f"正在处理第 {number}/{len(groups)} 门课程，共 {len(items)} 项作业")
+            try:
+                batch = prepare(
+                    self.settings,
+                    targets=[(x["course_id"], x["assignment_id"]) for x in items],
+                    defer_media=job["defer_media"],
+                    progress=lambda msg: self._log(job_id, msg),
+                    on_assignment=assignment_event,
+                )
+            except RunCancelled:
+                raise
+            except WorkflowError as exc:
+                for item in items:
+                    self._item(job_id, item, status="failed", error=str(exc))
+                continue
+            for key in cache:
+                cache[key] += batch.get("cache", {}).get(key, 0)
+            with self._lock:
+                job["cache"] = dict(cache)
+                self._save(job)
+            yield from batch["packages"]
+
+    @validation_session()
     def _run(self, job_id):
         job = self._jobs[job_id]
         try:
@@ -698,17 +770,7 @@ class FrontendJobs:
                         **{k: result[k] for k in ("package", "error") if k in result},
                     )
 
-                batch = prepare(
-                    self.settings,
-                    targets=[(x["course_id"], x["assignment_id"]) for x in job["items"]],
-                    defer_media=job["defer_media"],
-                    progress=lambda msg: self._log(job_id, msg),
-                    on_assignment=assignment_event,
-                )
-                with self._lock:
-                    job["cache"] = batch["cache"]
-                    self._save(job)
-                for result in batch["packages"]:
+                for result in self._prepared_packages(job_id, job, assignment_event):
                     self._log(
                         job_id,
                         "真实题目与课堂资料已准备"

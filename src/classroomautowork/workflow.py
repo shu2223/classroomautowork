@@ -10,7 +10,7 @@ from pathlib import Path
 
 from .attachment_cache import content_signature, download_revision, legacy_download
 from .auth import credentials_for
-from .buzz import BuzzConfig, transcribe_media
+from .buzz import BuzzConfig, transcribe_media, validation_session
 from .config import Settings
 from .errors import ConfigurationError, PermissionDenied, RunCancelled, WorkflowError
 from .external_sources import external_chunks, source_urls
@@ -563,6 +563,7 @@ def prepare_assignment(
     return store.memo("review-preparation", identity, package)
 
 
+@validation_session()
 def prepare(
     settings: Settings,
     *,

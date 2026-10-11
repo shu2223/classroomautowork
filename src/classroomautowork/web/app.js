@@ -127,32 +127,52 @@ function safeLink(url, text, className) { try { const u = new URL(url); if (u.pr
 function pill(status) { return node("span", labels[status] || status, "pill " + ({ready: "success", needs_user: "warning", failed: "failure", interrupted: "warning", paused: "warning"}[status] || "")); }
 function codexLink(generation) { const id = generation?.thread_id; if (!id || !/^[a-f0-9-]{36}$/i.test(id)) return null; const link = node("a", "在 Codex 中打开真实会话 ↗", "generation-link"); link.href = "codex://threads/" + id; return link; }
 function overdue(item) { return !!item.due_utc && new Date(item.due_utc) < new Date(); }
-function latestItems() { const found = new Map(); for (const job of [...state.jobs].sort((a,b) => b.created_at.localeCompare(a.created_at))) if (["review", "fill"].includes(job.kind)) for (const item of job.items) if (!found.has(keyOf(item))) found.set(keyOf(item), {job, item}); return found; }
+function latestItems() { const found = new Map(); for (const job of [...state.jobs, ...(state.resultJobs || [])].sort((a,b) => b.created_at.localeCompare(a.created_at))) if (["review", "fill"].includes(job.kind)) for (const item of job.items) if (!found.has(keyOf(item))) found.set(keyOf(item), {job, item}); return found; }
+// One-click selection: only visible, confirmed pending work without delivered results.
+function hasAnswer(item) {
+  return !!(item?.answer_document?.files?.["answer.docx"] || item?.document_fill?.documents?.length || item?.form_fill?.forms?.length);
+}
+function delivered(item) {
+  return hasAnswer(item) && ["ready", "document_ready", "document_needs_user", "form_opened"].includes(item.status);
+}
+function selectTargets(visible, selected, latest) {
+  return visible.filter(item => !delivered(latest.get(keyOf(item))?.item) && (!selected.size || selected.has(keyOf(item))));
+}
 function filtered() {
   const normalize = value => value.normalize("NFKC").replace(/\s+/g, " ").trim().toLocaleLowerCase();
-  const q = normalize($("searchInput").value), course = $("courseFilter").value, date = $("dateFilter").value;
-  return (state.pending?.assignments || []).filter(item => (!state.hideOverdue || !overdue(item)) && (!course || item.course_id === course) && (!q || normalize((item.title || "") + " " + (item.course_name || "")).includes(q)) && (item.due_local ? (!date || localDay(item.due_local) <= date) : $("includeNoDue").checked));
+  const q = normalize($("searchInput").value), course = $("courseFilter").value, date = $("dateFilter").value, latest = latestItems();
+  return (state.pending?.assignments || []).filter(item => !delivered(latest.get(keyOf(item))?.item) && (!state.hideOverdue || !overdue(item)) && (!course || item.course_id === course) && (!q || normalize((item.title || "") + " " + (item.course_name || "")).includes(q)) && (item.due_local ? (!date || localDay(item.due_local) <= date) : $("includeNoDue").checked)).sort((a,b) => (a.due_utc || "9999").localeCompare(b.due_utc || "9999"));
+}
+function targets() { return selectTargets(filtered(), state.selected, latestItems()); }
+function saveOptions() {
+  localStorage.setItem("classroom-model", $("modelSelect").value);
+  localStorage.setItem("classroom-effort", $("effortSelect").value);
+  localStorage.setItem("classroom-process-media", String($("processMedia").checked));
 }
 function setButtons() {
-  const busy = !!state.active || state.busy || !!state.monitorOnly; $("authorizeDocuments").disabled = busy; $("authorizeDocuments").hidden = state.documentsAuthorized; $("documentPermissionNote").textContent = state.documentsAuthorized ? "自动填入已授权：答案写入个人副本，你打开原文档审阅并手动提交。" : "首次填入需 Google Docs 读写授权。Google 授权范围涵盖可编辑文档；本程序只填入本人待完成作业副本。";
+  const busy = !!state.active || state.busy || !!state.monitorOnly, count = targets().length, ai = $("aiConfirmed").checked;
+  $("authorizeDocuments").disabled = busy; $("authorizeDocuments").hidden = state.documentsAuthorized;
+  $("documentPermissionNote").textContent = state.documentsAuthorized ? "已授权。完成后可直接打开个人文档审阅。" : "尚未授权文档写入。可先生成答案，也可在此授权自动填写。";
   $("refreshButton").disabled = busy; $("refreshButton").classList.toggle("spinner", !!state.active && state.jobs.find(x => x.id === state.active)?.kind === "refresh");
-  $("generateButton").disabled = busy || !state.selected.size || ($("aiConfirmed").checked && (!state.models || state.modelsLoading));
-  $("aiConfirmed").disabled = busy;
-  $("generateButton").querySelector("span").textContent = $("aiConfirmed").checked ? "生成答案并准备审阅" : "准备所选资料";
-  $("aiChoiceNote").textContent = $("aiConfirmed").checked ? "使用所选模型生成答案，自动填写个人文档或原表单；你审阅后手动提交。" : "未勾选：只读取和整理资料，不调用 AI。无需填写规则原文。";
-  $("modelSelect").disabled = busy || !state.models || state.modelsLoading; $("effortSelect").disabled = busy || !state.models || state.modelsLoading; $("reloadModels").disabled = busy || state.modelsLoading;
-  $("selectedCount").textContent = state.selected.size;
-  $("clearSelection").disabled = !state.selected.size;
+  $("generateButton").disabled = busy || !count || (ai && (!state.models || state.modelsLoading));
+  $("generateButton").querySelector("span").textContent = state.active ? "正在处理…" : ai ? `一键完成${count ? ` ${count} 项` : ""}` : "仅整理资料";
+  $("aiConfirmed").disabled = busy; $("processMedia").disabled = busy;
+  $("aiChoiceNote").textContent = ai ? "生成答案并自动填写，最后由你审阅和提交。" : "只整理题目与资料，不生成答案。";
+  for (const id of ["modelSelect", "effortSelect"]) $(id).disabled = busy || !state.models || state.modelsLoading;
+  $("reloadModels").disabled = busy || state.modelsLoading;
+  $("selectedCount").textContent = count;
+  $("selectionLabel").textContent = state.active ? "项仍在当前列表" : state.selected.size ? "项已选择" : "项将自动完成";
+  $("selectionHint").textContent = state.active ? "完成的答案会陆续进入“待审阅”" : state.selected.size ? "只处理勾选项" : "当前筛选范围 · 已有答案自动跳过";
+  $("clearSelection").hidden = !state.selected.size;
   $("quitButton").disabled = busy;
+  const model = state.models?.models.find(x => x.model === $("modelSelect").value);
+  $("modelShortcut").textContent = !ai ? "仅整理资料 · 设置" : model ? `${model.displayName || model.model} · ${$("effortSelect").selectedOptions[0]?.textContent || "默认"}` : state.modelsLoading ? "读取模型…" : "选择模型";
 }
 function renderCourseFilters() {
-  const courses = new Map(); for (const item of state.pending?.assignments || []) { const prior = courses.get(item.course_id); courses.set(item.course_id, {name: item.course_name || "未命名课程", count: (prior?.count || 0) + 1}); }
+  const courses = new Map(); for (const item of state.pending?.assignments || []) courses.set(item.course_id, item.course_name || "未命名课程");
   const current = $("courseFilter").value; $("courseFilter").replaceChildren(node("option", "全部课程")); $("courseFilter").firstChild.value = "";
-  $("courseNav").replaceChildren();
-  for (const [id, course] of courses) { const option = node("option", course.name); option.value = id; $("courseFilter").append(option); const b = button("", "course-button", () => { $("courseFilter").value = id; setView("pending"); renderPending(); }); b.append(node("span", "", "course-dot"), node("span", course.name), node("b", course.count)); b.title = course.name; b.dataset.course = id; $("courseNav").append(b); }
+  for (const [id, name] of courses) { const option = node("option", name); option.value = id; $("courseFilter").append(option); }
   if (courses.has(current)) $("courseFilter").value = current;
-  if (!courses.size) $("courseNav").append(node("span", "刷新后显示你的课程", "muted small"));
-  $("courseCount").textContent = courses.size ? courses.size + " 门课程" : "等待刷新";
 }
 function renderDiscovery() {
   if (state.monitorOnly) return;
@@ -165,37 +185,67 @@ function renderDiscovery() {
   for (const item of omitted) { const p = node("p", `${item.course_name || ""} · ${item.title || "未命名作业"}（${item.submission_state || "状态不明"}，未自动加入待办） `); const link = safeLink(item.url, "去课堂确认"); if (link) p.append(link); $("discoveryContent").append(p); }
   for (const item of failed) $("discoveryContent").append(node("p", `课程 ${item.course_id}：${item.error}`));
 }
-function renderPending() {
-  const pending = state.pending, items = filtered(), latest = latestItems();
-  $("totalCount").textContent = pending ? pending.assignments.length : "—"; $("navCount").textContent = pending ? pending.assignments.length : "—";
-  $("overdueCount").textContent = pending ? pending.assignments.filter(x => x.due_utc && new Date(x.due_utc) < new Date()).length : "—";
-  $("readyCount").textContent = [...latest.values()].filter(x => ["ready", "document_ready", "document_needs_user", "form_opened"].includes(x.item.status)).length;
-  $("visibleCount").textContent = items.length;
-  $("refreshTime").textContent = pending ? `上次实时刷新 ${dateLabel(pending.refreshed_at, true)} · 列表保留到下次刷新` : "点击刷新，从 Classroom 读取实时待办";
-  $("clearFilters").hidden = !($("courseFilter").value || $("searchInput").value || $("dateFilter").value || !$("includeNoDue").checked || state.hideOverdue);
-  $("hideOverdue").setAttribute("aria-pressed", String(state.hideOverdue)); $("hideOverdue").textContent = state.hideOverdue ? "已隐藏逾期 · 显示全部" : "隐藏已逾期";
-  for (const b of $("courseNav").children) b.classList.toggle("active", b.dataset.course === $("courseFilter").value);
-  const checked = items.filter(x => state.selected.has(keyOf(x))).length;
-  $("selectAll").checked = !!items.length && checked === items.length; $("selectAll").indeterminate = checked > 0 && checked < items.length; $("selectAll").disabled = !items.length;
-  if (!pending) { setButtons(); return; }
-  const list = $("assignmentList"); list.replaceChildren();
-  if (!items.length) { const empty = node("div", undefined, "empty-state"); empty.append(node("h3", pending.assignments.length ? "当前筛选下没有作业" : "当前没有可自动处理的待办"), node("p", pending.assignments.length ? "调整课程、关键词或截止日期试试。" : "可以稍后刷新；提交状态不明的项目会在下方单独列出。")); list.append(empty); }
-  for (const item of items) {
-    const key = keyOf(item), row = node("article", undefined, "assignment-row"); row.classList.toggle("selected", state.selected.has(key));
-    const label = node("label"), check = node("input"); check.type = "checkbox"; check.checked = state.selected.has(key); check.setAttribute("aria-label", "选择作业 " + (item.title || item.assignment_id)); check.addEventListener("change", () => { check.checked ? state.selected.add(key) : state.selected.delete(key); renderPending(); });
-    const courseIcon = node("span", undefined, "course-icon"); courseIcon.append(icon("book"));
-    const body = node("div", undefined, "assignment-main"), meta = node("div", undefined, "assignment-meta"); body.append(node("span", item.title || "未命名作业", "assignment-title")); meta.append(node("span", item.course_name || "未命名课程")); const link = safeLink(item.url, "查看课堂 ↗"); if (link) meta.append(link); body.append(meta); label.append(check, courseIcon, body);
-    const side = node("div", undefined, "assignment-aside"), overdue = item.due_utc && new Date(item.due_utc) < new Date(); side.append(node("span", (overdue ? "已逾期 · " : "截止 · ") + dateLabel(item.due_local, true), "due-label" + (overdue ? " overdue" : "")));
-    const completed = latest.get(key), policy = state.policies[item.course_id];
-    if (completed) side.append(pill(completed.item.status));
-    else side.append(node("span", $("aiConfirmed").checked ? "可生成初稿" : "仅准备资料", "pill " + (policy?.can_draft ? "success" : "warning")));
-    const actions = node("div", undefined, "row-actions"); const policyButton = button("课程规则", "row-action", () => openPolicy(item.course_id, item.course_name)); policyButton.disabled = !!state.active; actions.append(policyButton);
-    if (completed?.item.package) actions.append(button(completed.item.status === "ready" ? "查看初稿" : "查看资料与分析", "row-action", () => openReview(completed.job.id, key)));
-    const nextInput = completed && inputAction(completed.item); if (nextInput) actions.prepend(button(nextInput.label, "button primary small-button", ()=>openSupplement(completed.job.id,key)));
-    for (const f of completed?.item.form_fill?.forms || []) { const link = safeLink(f.url, "在原表单审阅答案 ↗", "row-action"); if (link) actions.prepend(link); }
-    for (const d of completed?.item.document_fill?.documents || []) { const link = safeLink(d.url, "打开已填入的文档 ↗", "row-action"); if (link) actions.prepend(link); } side.append(actions); row.append(label, side); list.append(row);
+function resultAction(job, item) {
+  const doc = item.document_fill?.documents?.[0], form = item.form_fill?.forms?.[0];
+  const link = safeLink(doc?.url || form?.url, doc ? "打开文档 ↗" : "打开表单 ↗", "button primary small-button");
+  return link || button("打开答案", "button primary small-button", () => openReview(job.id, keyOf(item), "draft"));
+}
+function assignmentRow(item, record, result = false) {
+  const key = keyOf(item), row = node("article", undefined, "assignment-row");
+  row.classList.toggle("selected", state.selected.has(key));
+  const body = node("div", undefined, "assignment-main"), title = node("div", item.title || item.assignment_id, "assignment-title"), meta = node("div", item.course_name || "课程作业", "assignment-meta");
+  body.append(title, meta);
+  if (!result) {
+    const label = node("label"), check = node("input"); check.type = "checkbox"; check.checked = state.selected.has(key); check.disabled = !!state.active;
+    check.setAttribute("aria-label", "选择作业 " + (item.title || item.assignment_id));
+    check.addEventListener("change", () => { check.checked ? state.selected.add(key) : state.selected.delete(key); renderPending(); }); label.append(check, body); row.append(label);
+  } else row.append(body);
+  const side = node("div", undefined, "assignment-aside"), actions = node("div", undefined, "row-actions");
+  if (!result) side.append(node("span", item.due_local ? `${overdue(item) ? "已逾期 · " : ""}${dateLabel(item.due_local, true)}` : "无截止日期", "due-label" + (overdue(item) ? " overdue" : "")));
+  if (result) {
+    side.append(node("span", delivered(record.item) ? "答案可审阅 · 未自动提交" : "已有答案 · 填入尚未完成", "result-status"));
+    actions.append(resultAction(record.job, record.item));
+    const savedForm = safeLink(record.item.form_fill?.forms?.[0]?.original_url, "继续已改草稿 ↗", "text-button small");
+    if (savedForm) actions.append(savedForm);
+    if (!record.item.document_fill?.documents?.length && !record.item.form_fill?.forms?.length) actions.append(button("Word", "button secondary small-button", () => downloadAnswer(record.job.id, key)));
+  } else if (record) {
+    if (["failed", "paused", "interrupted", "needs_user", "needs_document", "needs_form"].includes(record.item.status)) side.append(node("span", "上次未完成 · 可重新开始", "small warning"));
+    else if (activeStates.has(record.job.status)) side.append(pill(record.item.status));
   }
-  renderDiscovery(); setButtons();
+  if (record?.item.package) actions.append(button("详情", "text-button small", () => openReview(record.job.id, key)));
+  else if (record?.item.error) actions.append(button("查看原因", "text-button small", () => showJob(record.job.id)));
+  else { const link = safeLink(item.url, "查看课堂 ↗", "text-button small"); if (link) actions.append(link); }
+  side.append(actions); row.append(side); return row;
+}
+function renderResults() {
+  const records = [...latestItems().values()].filter(x => hasAnswer(x.item));
+  $("readyCount").textContent = records.length;
+  if (state.view !== "results") return;
+  const list = $("resultsList"); list.replaceChildren();
+  if (!records.length) { const empty = node("div", undefined, "empty-state"); empty.append(node("h3", "答案完成后会出现在这里"), node("p", "从待完成列表一键开始，先完成的答案会先显示。")); list.append(empty); }
+  for (const record of records) {
+    const pending = state.pending?.assignments.find(x => keyOf(x) === keyOf(record.item));
+    list.append(assignmentRow({...pending, ...record.item}, record, true));
+  }
+}
+function renderPending() {
+  const pending = state.pending, items = filtered(), latest = latestItems(), visible = new Set(items.map(keyOf));
+  // A filter change must never process a checked assignment hidden from the user.
+  state.selected = new Set([...state.selected].filter(key => visible.has(key)));
+  $("navCount").textContent = (pending?.assignments || []).filter(x => !delivered(latest.get(keyOf(x))?.item)).length;
+  $("visibleCount").textContent = items.length;
+  $("refreshTime").textContent = pending ? `同步于 ${dateLabel(pending.refreshed_at, true)}` : "首次使用，点击刷新读取真实作业";
+  $("clearFilters").hidden = !($("courseFilter").value || $("searchInput").value || $("dateFilter").value || !$("includeNoDue").checked || state.hideOverdue);
+  $("hideOverdue").setAttribute("aria-pressed", String(state.hideOverdue)); $("hideOverdue").textContent = state.hideOverdue ? "已隐藏逾期" : "隐藏已逾期";
+  const checked = items.filter(x => state.selected.has(keyOf(x))).length;
+  $("selectAll").checked = !!items.length && checked === items.length; $("selectAll").indeterminate = checked > 0 && checked < items.length; $("selectAll").disabled = !items.length || !!state.active;
+  const list = $("assignmentList"); list.replaceChildren();
+  if (!items.length) {
+    const empty = node("div", undefined, "empty-state");
+    empty.append(node("h3", !pending ? "先同步你的作业" : "当前列表没有待处理作业"), node("p", !pending ? "点击右上方“刷新作业”，读取学校账户的真实待办。" : "已有答案在“待审阅”中，也可以调整筛选或刷新课堂状态。")); list.append(empty);
+  }
+  for (const item of items) list.append(assignmentRow(item, latest.get(keyOf(item))));
+  renderResults(); renderDiscovery(); setButtons();
 }
 function updateJob(job) { const at = state.jobs.findIndex(x => x.id === job.id); if (at < 0) state.jobs.unshift(job); else state.jobs[at] = job; }
 function jobProgress(job) {
@@ -249,12 +299,30 @@ function jobCard(job, full = false) {
 }
 function renderJobs() {
   const expanded = new Set([...document.querySelectorAll("details[data-job-log][open]")].map(x => x.dataset.jobLog));
-  const focus = state.jobs.find(x => x.id === (state.active || state.focus)); $("jobPanel").hidden = !focus || (focus.kind === "refresh" && ["completed", "completed_with_issues"].includes(focus.status)); $("jobPanel").replaceChildren(); if (!$("jobPanel").hidden) $("jobPanel").append(jobCard(focus));
-  $("historyList").replaceChildren(); if (!state.jobs.length) $("historyList").append(node("div", "还没有审核记录。刷新待办并勾选作业后，这里会保留处理进度与结果。", "empty-state muted small"));
-  for (const job of [...state.jobs].sort((a,b) => b.created_at.localeCompare(a.created_at))) $("historyList").append(jobCard(job, true)); setButtons();
-  for (const details of document.querySelectorAll("details[data-job-log]")) details.open = expanded.has(details.dataset.jobLog);
+  const focus = state.jobs.find(x => x.id === state.active);
+  $("jobPanel").hidden = !focus; $("jobPanel").replaceChildren();
+  if (focus) $("jobPanel").append(jobCard(focus));
+  if (state.view === "history") {
+    const opened = new Set([...document.querySelectorAll("details[data-history-job][open]")].map(x => x.dataset.historyJob));
+    $("historyList").replaceChildren();
+    if (!state.jobs.length) $("historyList").append(node("div", "还没有处理记录。", "empty-state muted"));
+    for (const job of [...state.jobs].sort((a,b) => b.created_at.localeCompare(a.created_at))) {
+      const details = node("details", undefined, "history-entry"); details.dataset.historyJob = job.id;
+      const summary = node("summary"), title = job.kind === "review" || job.kind === "fill" ? job.items.map(x => x.title || x.assignment_id).join("、") : job.kind === "refresh" ? "刷新作业" : "文档授权";
+      summary.append(node("span", title, "history-title"), node("span", labels[job.status] || job.status, "small"), node("time", dateLabel(job.created_at,true), "muted small")); details.append(summary);
+      const expand = () => { if (details.open && !details.querySelector("section")) details.append(jobCard(job, true)); };
+      details.addEventListener("toggle", expand); details.open = opened.has(job.id) || job.id === state.focus; expand(); $("historyList").append(details);
+    }
+  }
+  setButtons(); for (const details of document.querySelectorAll("details[data-job-log]")) details.open = expanded.has(details.dataset.jobLog);
 }
-function showJob(id) { state.focus=id; setView("history"); renderJobs(); document.querySelector(`section[data-job-card="${id}"]`)?.scrollIntoView({block:"center",behavior:"smooth"}); }
+async function showJob(id) {
+  try {
+    if (!state.jobs.some(x => x.id === id)) updateJob(await api("/api/jobs/" + id));
+    state.focus = id; setView("history");
+    document.querySelector(`details[data-history-job="${id}"]`)?.scrollIntoView({block:"center",behavior:"smooth"});
+  } catch (error) { toast(error.message); }
+}
 function updateProgressClock() {
   for (const box of document.querySelectorAll(".job-live-detail")) {
     const job = state.jobs.find(x => x.id === box.dataset.jobId); if (!job || !activeStates.has(job.status)) continue;
@@ -265,11 +333,11 @@ function updateProgressClock() {
 }
 setInterval(updateProgressClock, 1000);
 async function loadState() {
-  const data = await api("/api/bootstrap"); connection.lastSuccess = Date.now(); connection.error = null; state.monitorOnly = !!data.monitor_only; state.documentsAuthorized = !!data.documents_authorized; state.pending = data.pending; state.jobs = data.jobs; state.policies = data.policies; state.active = data.active_job_id; state.timezone = data.timezone; $("accountEmail").textContent = data.account;
-  if (state.active) $("aiConfirmed").checked = !!state.jobs.find(x => x.id === state.active)?.ai_confirmed;
+  const data = await api("/api/bootstrap"); connection.lastSuccess = Date.now(); connection.error = null; state.monitorOnly = !!data.monitor_only; state.documentsAuthorized = !!data.documents_authorized; state.pending = data.pending; state.jobs = data.jobs; state.resultJobs = data.result_jobs || []; state.policies = data.policies; state.active = data.active_job_id; state.timezone = data.timezone; $("accountEmail").textContent = data.account;
+  const running = state.jobs.find(x => x.id === state.active); if (running && ["review", "fill"].includes(running.kind)) $("aiConfirmed").checked = !!running.ai_confirmed;
   if (state.monitorOnly) { document.body.classList.add("monitor-mode"); $("notice").hidden = false; $("notice").replaceChildren(node("span", "这是只读进度窗口，不会影响原任务。审批和作业操作请返回原作业助手。 ")); const back = node("a", "返回作业助手 ↗"); back.href = data.source_url; back.target = "_blank"; back.rel = "noopener noreferrer"; $("notice").append(back); }
   if (state.pending) { const available = new Set(state.pending.assignments.map(keyOf)); state.selected = new Set([...state.selected].filter(x => available.has(x))); }
-  if (!state.focus) state.focus = state.jobs[0]?.id;
+
   renderCourseFilters(); renderPending(); renderJobs(); if (state.active) startPolling();
 }
 function startPolling() { if (polling) return; polling = setInterval(pollJob, 1400); }
@@ -277,7 +345,7 @@ async function pollJob() {
   if (!state.active) { clearInterval(polling); polling = null; return; }
   if (pollInFlight) return;
   pollInFlight = true;
-  try { const job = await api("/api/jobs/" + state.active); connection.lastSuccess = Date.now(); connection.error = null; updateJob(job); renderJobs(); if (!activeStates.has(job.status)) { state.active = null; state.focus = job.id; await loadState(); renderPending(); if (job.kind === "refresh") toast(job.status === "failed" ? job.message : `已刷新 ${state.pending?.assignments.length || 0} 项真实待办`); else toast(job.message); } } catch (error) { connection.error = error.message; renderJobs(); } finally { pollInFlight = false; }
+  try { const job = await api("/api/jobs/" + state.active); connection.lastSuccess = Date.now(); connection.error = null; updateJob(job); renderJobs(); renderPending(); if (!activeStates.has(job.status)) { state.active = null; state.focus = job.id; await loadState(); renderPending(); if (job.kind === "refresh") toast(job.status === "failed" ? job.message : `已刷新 ${state.pending?.assignments.length || 0} 项真实待办`); else toast(job.message); } } catch (error) { connection.error = error.message; renderJobs(); } finally { pollInFlight = false; }
 }
 async function action(path, body) {
   if (state.monitorOnly) { toast("这是只读进度窗口，请返回原作业助手操作。"); return; }
@@ -287,7 +355,13 @@ async function action(path, body) {
 async function jobAction(id, verb) { await action(`/api/jobs/${id}/${verb}`, {}); }
 function renderEfforts(preferred) { const model = state.models.models.find(x => x.model === $("modelSelect").value); $("effortSelect").replaceChildren(); const labels = {none: "无", minimal: "最少", low: "低", medium: "中", high: "高", xhigh: "很高", max: "最高", ultra: "极高"}; for (const value of model?.supportedReasoningEfforts || []) { const option = node("option", labels[value.reasoningEffort] || value.reasoningEffort); option.value = value.reasoningEffort; $("effortSelect").append(option); } if (!$("effortSelect").children.length) { const option = node("option", "沿用模型默认"); option.value = ""; $("effortSelect").append(option); } const selected = preferred || model?.defaultReasoningEffort; if ([...$("effortSelect").options].some(x => x.value === selected)) $("effortSelect").value = selected; }
 async function loadModels() { state.modelsLoading = true; setButtons(); $("modelStatus").textContent = "正在从本机 Codex 读取模型与当前配置…"; try { const catalog = await api("/api/codex/models"); state.models = catalog; $("modelSelect").replaceChildren(); for (const model of catalog.models) { const option = node("option", model.displayName || model.model); option.value = model.model; $("modelSelect").append(option); } const saved = localStorage.getItem("classroom-model"); const selected = catalog.models.some(x => x.model === saved) ? saved : catalog.default_model; if (catalog.models.some(x => x.model === selected)) $("modelSelect").value = selected; renderEfforts(saved === selected ? localStorage.getItem("classroom-effort") : selected === catalog.default_model ? catalog.default_effort : null); $("modelStatus").textContent = "来自本机 Codex 目录与配置；实际模型、会话和生成记录会保存在每份结果中。"; } catch (error) { state.models = null; $("modelStatus").textContent = error.message; toast(error.message); } finally { state.modelsLoading = false; setButtons(); } }
-function setView(view) { state.view = view; $("pendingView").hidden = view !== "pending"; $("historyView").hidden = view !== "history"; $("navPending").classList.toggle("active", view === "pending"); $("navHistory").classList.toggle("active", view === "history"); $("breadcrumb").textContent = "工作台 / " + (view === "pending" ? "待完成作业" : "审核记录"); }
+function setView(view) {
+  state.view = view;
+  for (const name of ["pending", "results", "history"]) $(name + "View").hidden = view !== name;
+  for (const [id, name] of [["navPending","pending"],["navResults","results"],["navHistory","history"]]) $(id).classList.toggle("active", view === name);
+  document.querySelector(".selection-bar").hidden = view !== "pending";
+  renderResults(); renderJobs();
+}
 function clearImages() { for (const url of state.images) URL.revokeObjectURL(url); state.images = []; }
 async function openReview(jobId, key, initialTab) {
   try {
@@ -310,7 +384,7 @@ async function openReview(jobId, key, initialTab) {
     $("fillDocumentButton").textContent = responseForm ? "自动填入原表单" : "填入已有初稿";
     $("downloadAnswerButton").hidden = !data.text["draft.md"] || state.monitorOnly;
     if (data.answer_document?.pending_requirements?.length) $("reviewStatus").textContent = `答案已生成 · ${g?.model || "原模型"} · ${data.answer_document.pending_requirements.length} 项审阅提示 · 未提交`;
-    renderTab(initialTab || (data.text["draft.md"] ? "draft" : "assignment")); $("reviewDialog").showModal();
+    $("reviewDialog").querySelector(".details-options").open = false; renderTab(initialTab || (data.text["draft.md"] ? "draft" : "assignment")); $("reviewDialog").showModal();
   } catch (error) { toast(error.message); }
 }
 function renderTab(tab) {
@@ -350,15 +424,16 @@ async function openPolicy(courseId, courseName) {
   try { const policy = await api("/api/policies/" + courseId); state.policyCourse = courseId; $("policyTitle").textContent = courseName || "课程 AI 规则"; $("policyUse").value = policy.ai_use; $("policyEvidence").value = policy.policy_evidence; $("policyLimits").value = policy.limitations; $("policyDisclosure").value = policy.disclosure; $("personalFacts").value = policy.personal_facts.join("\n"); $("attachmentBudget").value = policy.max_attachment_bytes / 1048576; $("pdfBudget").value = policy.max_pdf_pages; $("policyError").hidden = true; $("policyDialog").showModal(); } catch (error) { toast(error.message); }
 }
 $("refreshButton").addEventListener("click", () => action("/api/refresh", {}));
-$("generateButton").addEventListener("click", () => { localStorage.setItem("classroom-model", $("modelSelect").value); localStorage.setItem("classroom-effort", $("effortSelect").value); action("/api/review", {selected: [...state.selected].map(key => { const [course_id, assignment_id] = key.split(":"); return {course_id, assignment_id}; }), defer_media: !$("processMedia").checked, ai_confirmed: $("aiConfirmed").checked, ...($("aiConfirmed").checked ? {model: $("modelSelect").value, effort: $("effortSelect").value || null} : {})}); });
+$("generateButton").addEventListener("click", () => { saveOptions(); action("/api/review", {selected: targets().map(({course_id, assignment_id}) => ({course_id, assignment_id})), defer_media: !$("processMedia").checked, ai_confirmed: $("aiConfirmed").checked, ...($("aiConfirmed").checked ? {model: $("modelSelect").value, effort: $("effortSelect").value || null} : {})}); });
 $("aiConfirmed").checked = localStorage.getItem("classroom-ai-enabled") !== "false";
 $("aiConfirmed").addEventListener("change", () => { localStorage.setItem("classroom-ai-enabled", String($("aiConfirmed").checked)); setButtons(); renderPending(); });
-$("modelSelect").addEventListener("change", () => renderEfforts()); $("reloadModels").addEventListener("click", loadModels);
+$("modelSelect").addEventListener("change", () => { renderEfforts(); saveOptions(); setButtons(); }); $("effortSelect").addEventListener("change", () => { saveOptions(); setButtons(); }); $("reloadModels").addEventListener("click", loadModels);
 $("hideOverdue").addEventListener("click", () => { state.hideOverdue = !state.hideOverdue; localStorage.setItem("classroom-hide-overdue", String(state.hideOverdue)); if (state.hideOverdue) { let removed = 0; for (const item of state.pending?.assignments || []) if (overdue(item) && state.selected.delete(keyOf(item))) removed++; if (removed) toast(`已取消 ${removed} 项逾期作业的勾选，避免处理隐藏的作业。`); } renderPending(); });
 $("searchInput").addEventListener("input", renderPending); for (const id of ["courseFilter", "dateFilter", "includeNoDue"]) $(id).addEventListener("change", renderPending);
 $("selectAll").addEventListener("change", () => { for (const item of filtered()) $("selectAll").checked ? state.selected.add(keyOf(item)) : state.selected.delete(keyOf(item)); renderPending(); });
 $("clearSelection").addEventListener("click", () => { state.selected.clear(); renderPending(); });
 $("clearFilters").addEventListener("click", () => { $("courseFilter").value = ""; $("dateFilter").value = ""; $("searchInput").value = ""; $("includeNoDue").checked = true; state.hideOverdue = false; localStorage.setItem("classroom-hide-overdue", "false"); renderPending(); });
+$("navResults").addEventListener("click", () => setView("results"));
 $("navPending").addEventListener("click", () => setView("pending")); $("navHistory").addEventListener("click", () => setView("history"));
 for (const close of document.querySelectorAll(".close-dialog")) close.addEventListener("click", () => close.closest("dialog").close()); $("reviewDialog").addEventListener("close", clearImages);
 for (const tab of document.querySelectorAll(".review-tabs button")) tab.addEventListener("click", () => renderTab(tab.dataset.tab));
@@ -381,11 +456,19 @@ $("downloadAnswerButton").addEventListener("click", () => { const {jobId, key} =
 $("downloadButton").addEventListener("click", async () => { try { const {jobId, key, data} = state.preview; const blob = await api(`/api/jobs/${jobId}/items/${key}/download`); const url = URL.createObjectURL(blob), link = node("a"); link.href = url; link.download = (data.text["draft.md"] ? "Classroom-初稿证据包-" : "Classroom-资料待确认包-") + key.replace(":", "-") + ".zip"; document.body.append(link); link.click(); link.remove(); setTimeout(() => URL.revokeObjectURL(url), 1000); } catch (error) { toast(error.message); } });
 $("policyForm").addEventListener("submit", async event => { event.preventDefault(); const submit = event.submitter; submit.disabled = true; try { await api("/api/policies/" + state.policyCourse, "PUT", {ai_use: $("policyUse").value, policy_evidence: $("policyEvidence").value, limitations: $("policyLimits").value, disclosure: $("policyDisclosure").value, personal_facts: $("personalFacts").value.split("\n").map(x => x.trim()).filter(Boolean), max_attachment_bytes: Math.round(Number($("attachmentBudget").value) * 1048576), max_pdf_pages: Number($("pdfBudget").value)}); $("policyDialog").close(); await loadState(); toast("已保存课程设置；重新生成所选审核包时会应用这些设置。"); } catch (error) { $("policyError").textContent = error.message; $("policyError").hidden = false; } finally { submit.disabled = false; } });
 $("quitButton").addEventListener("click", async () => { try { await api("/api/shutdown", "POST", {}); $("notice").textContent = "助手已退出。下次双击快捷方式即可重新打开，任务记录与缓存会保留。"; $("notice").hidden = false; $("refreshButton").disabled = true; $("generateButton").disabled = true; $("quitButton").disabled = true; } catch (error) { toast(error.message); } });
-$("todayLabel").textContent = new Intl.DateTimeFormat("zh-CN", {year: "numeric", month: "long", day: "numeric", weekday: "short"}).format(new Date());
+for (const id of ["openSettings", "modelShortcut"]) $(id).addEventListener("click", () => $("settingsDialog").showModal());
+$("processMedia").checked = localStorage.getItem("classroom-process-media") !== "false";
+$("processMedia").addEventListener("change", saveOptions);
 if (!token) { $("notice").textContent = "请双击“Classroom 作业助手”快捷方式打开本机界面。此页面没有访问学校账户的本机凭证。"; $("notice").hidden = false; $("refreshButton").disabled = true; }
-else { loadState().catch(error => { $("notice").textContent = error.message; $("notice").hidden = false; toast(error.message); }).then(() => { if (!state.monitorOnly) loadModels(); else $("modelStatus").textContent = "只读进度窗口 · 本次实际模型见任务记录"; }); }
+else {
+  loadState().then(() => {
+    if (state.monitorOnly) { $("modelStatus").textContent = "只读进度窗口"; return; }
+    loadModels();
+    if (!state.active && (!state.pending || !state.pending.refreshed_at || Date.now() - Date.parse(state.pending.refreshed_at) > 15 * 60 * 1000)) action("/api/refresh", {});
+  }).catch(error => { $("notice").textContent = error.message; $("notice").hidden = false; toast(error.message); });
+}
 
-$("authorizeDocuments").addEventListener("click", () => action("/api/documents/authorize", {}));
+$("authorizeDocuments").addEventListener("click", () => { $("settingsDialog").close(); setView("pending"); action("/api/documents/authorize", {}); });
 $("fillDocumentButton").addEventListener("click", () => { const {jobId, key} = state.preview; $("reviewDialog").close(); action(`/api/jobs/${jobId}/items/${key}/fill`, {}); });
 
 async function openSupplement(jobId, key) {
@@ -500,3 +583,5 @@ $("importQuestions").addEventListener("click", event => supplementAction(event.c
   const result = await api(`/api/jobs/${jobId}/items/${key}/questions`, "POST", {url: $("captureUrl").value, question_script: $("captureScript").value});
   $("captureScript").value = ""; toast(`已导入真实题目结构：${result.page_count} 页、${result.question_count} 栏。点击保存并继续。`);
 }));
+
+$("courseSettingsButton").addEventListener("click", () => { const {data} = state.preview; openPolicy(data.manifest.course_id, data.manifest.course_name); });

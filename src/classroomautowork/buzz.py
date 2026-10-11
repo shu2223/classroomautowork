@@ -11,6 +11,8 @@ import re
 import shutil
 import struct
 import subprocess
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -23,6 +25,38 @@ from .store import artifact, fingerprint
 
 LARGE_MODELS = ("large-v3-turbo", "large-v3")
 DEFAULT_MODEL = "large-v3-turbo"
+_verified_files = ContextVar("buzz_verified_files", default=None)
+
+
+@contextmanager
+def validation_session():
+    """Reuse expensive binary hashes within one run, never across independent runs."""
+    token = _verified_files.set({}) if _verified_files.get() is None else None
+    try:
+        yield
+    finally:
+        if token is not None:
+            _verified_files.reset(token)
+
+
+def _verified_hash(path):
+    path = path.resolve()
+
+    def signature():
+        value = path.stat()
+        return (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
+
+    before = signature()
+    cache = _verified_files.get()
+    key = (str(path), before)
+    if cache is not None and key in cache:
+        return cache[key]
+    checksum = sha256_file(path)
+    if signature() != before:
+        raise ConfigurationError("Local transcription binary changed while being verified.")
+    if cache is not None:
+        cache[key] = checksum
+    return checksum
 
 
 def require_large_model(path: Path):
@@ -71,12 +105,12 @@ class BuzzConfig:
         return config.validated()
 
     def validated(self) -> "BuzzConfig":
-        if not self.engine.is_file() or sha256_file(self.engine) != self.engine_sha256:
+        if not self.engine.is_file() or _verified_hash(self.engine) != self.engine_sha256:
             raise ConfigurationError(
                 "Buzz's bundled engine is missing or changed; run buzz-setup again."
             )
         model = require_private_path(Path(self.model_path))
-        if not model.is_file() or sha256_file(model) != self.model_sha256:
+        if not model.is_file() or _verified_hash(model) != self.model_sha256:
             raise ConfigurationError(
                 "Local Whisper.cpp model is missing or fails its SHA-256 check."
             )

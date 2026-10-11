@@ -157,4 +157,5 @@ def test_reusing_one_answer_does_not_prevent_other_failed_items_retrying(tmp_pat
     monkeypatch.setattr(jobs, "start_selected", start)
     assert jobs.retry(identifier)["id"] == "next-offline-job"
     assert any(x["assignment_id"] == "3" for x in calls[0])
+    assert not any(x["assignment_id"] == "2" for x in calls[0])
     assert jobs._jobs[identifier]["items"][0]["status"] == "ready"

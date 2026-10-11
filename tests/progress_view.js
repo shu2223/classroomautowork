@@ -100,3 +100,18 @@ const {jobAction} = vm.runInNewContext(retryCode+'\n({jobAction});',{state:{jobs
   await jobAction('unit-job','pause'); assert.equal(requests[1][0],'/api/jobs/unit-job/pause');
   console.log('Retry resumes automatic processing without forcing the optional editor');
 })().catch(error=>{console.error(error);process.exitCode=1;});
+
+const selectionCode = source.slice(source.indexOf('function hasAnswer('),source.indexOf('function filtered('));
+const {hasAnswer,delivered,selectTargets} = vm.runInNewContext(selectionCode+'\n({hasAnswer,delivered,selectTargets});',{keyOf:x=>x.course_id+':'+x.assignment_id});
+const visible = [{course_id:'1',assignment_id:'1'},{course_id:'1',assignment_id:'2'},{course_id:'1',assignment_id:'3'}];
+const ready = {status:'ready',answer_document:{files:{'answer.docx':'verified-hash'}}};
+const latest = new Map([['1:2',{item:ready}]]);
+assert.equal(selectTargets(visible,new Set(),latest).length,2);
+assert.equal(selectTargets(visible,new Set(['1:3','hidden:4']),latest).length,1);
+assert.equal(selectTargets(visible,new Set(['hidden:4']),latest).length,0);
+assert.equal(selectTargets(visible,new Set(['1:2']),latest).length,0);
+assert.equal(delivered({status:'ready'}),false); // A status with no result is not delivery.
+assert.equal(delivered({...ready,status:'needs_form'}),false); // Failed fill remains actionable.
+assert.equal(hasAnswer({...ready,status:'needs_form'}),true); // Its local answer is still visible.
+assert.equal(delivered({status:'document_ready',document_fill:{documents:[{url:'verified-document'}]}}),true);
+console.log('One-click scope, existing-answer skip and missing-result regression checks passed');
