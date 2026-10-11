@@ -7,7 +7,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from .auth import credentials_for, secure_keyring
-from .buzz import BuzzConfig, setup_buzz
+from .buzz import DEFAULT_MODEL, LARGE_MODELS, BuzzConfig, setup_buzz
 from .config import Settings, assignment_ids
 from .document_fill import fill_review
 from .errors import WorkflowError
@@ -128,9 +128,7 @@ def main(argv=None) -> int:
         "buzz-setup", help="Configure installed Buzz and download a verified local model"
     )
     setup.add_argument("--buzz-root", required=True, type=Path)
-    setup.add_argument(
-        "--model-size", choices=["tiny", "base", "small", "medium", "large-v3"], default="small"
-    )
+    setup.add_argument("--model-size", choices=LARGE_MODELS, default=DEFAULT_MODEL)
     setup.add_argument("--language", default="ja")
     commands.add_parser("buzz-status", help="Check actual local engine/model integrity")
     commands.add_parser("tasks", help="Show persistent processing status")

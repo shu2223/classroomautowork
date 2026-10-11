@@ -9,12 +9,14 @@ from pathlib import Path
 
 from .answer_document import create_answer_document, valid_answer_document
 from .auth import credentials_for, documents_authorized
+from .browser_documents import ensure_document_sheet
 from .browser_questions import recover_questions
 from .codex_rpc import model_catalog
+from .completion import review_cautions
 from .config import Settings
 from .document_fill import fill_review, prepare_document_forms
-from .drafting import codex_command, generate_review, recover_completed_result
-from .errors import ConfigurationError, NeedsInput, RunCancelled, WorkflowError
+from .drafting import codex_command, generate_answer, recover_completed_result
+from .errors import ConfigurationError, RunCancelled, WorkflowError
 from .followups import read_followup
 from .form_capture import import_form_capture
 from .form_fill import fill_response_forms, prepare_response_forms
@@ -258,22 +260,14 @@ class FrontendJobs:
             job = self._jobs[job_id]
             item = next(x for x in job["items"] if item_key(x) == key)
             item["answer_document"] = result
-            if item["status"] == "ready" and result["status"] == "needs_user":
-                item["status"] = "needs_user"
-                job["status"] = "completed_with_issues"
-                job["message"] = "答案文件已生成，可打开审阅；仍有内容待补充，请点击补充并继续。"
-            elif (
-                item["status"] == "needs_user"
-                and result["status"] == "ready"
-                and result["personal_templates"]
-            ):
+            if item["status"] in {"needs_user", "ready"}:
                 item["status"] = "ready"
                 if all(
                     x["status"] in {"ready", "document_ready", "form_opened"} for x in job["items"]
                 ):
                     job["status"] = "completed"
                 job["message"] = (
-                    "已按你的要求整理完整通用模板，打开答案或 Word 审阅；个人情况在审阅时核对，提交由你手动完成。"
+                    "答案文件已生成，打开答案或 Word 审阅；待确认项在审阅时核对，提交由你手动完成。"
                 )
             self._save(job)
             return self._snapshot(job)
@@ -338,16 +332,6 @@ class FrontendJobs:
             raise WorkflowError("任务仍在运行。")
         if self._recover_local_answers(job_id):
             return self.job(job_id)
-        missing = next(
-            (
-                x
-                for x in job["items"]
-                if x.get("package") and x["status"] in {"needs_user", "document_needs_user"}
-            ),
-            None,
-        )
-        if missing:
-            return {**job, "next_action": "supplement", "supplement_key": item_key(missing)}
         if job["kind"] == "refresh":
             return self.refresh()
         if job["kind"] == "document_auth":
@@ -373,6 +357,11 @@ class FrontendJobs:
             job = self._jobs[job_id]
             recovered = False
             for item in job["items"]:
+                if item.get("status") == "ready" and item.get("package"):
+                    package = self.package_path(job_id, item_key(item))
+                    if valid_answer_document(package):
+                        recovered = True
+                        continue
                 if item.get("status") != "failed" or not item.get("package"):
                     continue
                 package = self.package_path(job_id, item_key(item))
@@ -410,14 +399,10 @@ class FrontendJobs:
                 )
                 self._log(
                     job_id,
-                    "已核验并恢复上次完整 Codex 答案，生成可打开的审阅文件；未重新下载、未重新调用 AI。"
-                    + (
-                        "仍有内容待补充，请打开答案或补充并继续。"
-                        if document["status"] == "needs_user"
-                        else ""
-                    ),
+                    "已核验并复用上次完整 Codex 答案及审阅文件；未重新下载、未重新调用 AI。",
                 )
-            return recovered
+            # A reusable item must not prevent the rest of a batch from retrying.
+            return recovered and job["status"] == "completed"
 
     def supplement_item(self, job_id, key):
         item = next((x for x in self.job(job_id)["items"] if item_key(x) == key), None)
@@ -673,9 +658,7 @@ class FrontendJobs:
                         self._item(
                             job_id,
                             item,
-                            status="document_needs_user"
-                            if any(d["remaining_empty_fields"] for d in result["documents"])
-                            else "document_ready",
+                            status="document_ready",
                             document_fill=result,
                             error=None,
                         )
@@ -739,20 +722,30 @@ class FrontendJobs:
                     try:
                         forms = []
                         if job.get("ai_confirmed"):
-                            recovered = recover_questions(
-                                self.settings,
-                                Path(result["package"]),
-                                model=job["model"],
-                                effort=job.get("effort"),
-                                cancelled=self._cancel.is_set,
-                                progress=lambda msg: self._log(job_id, msg),
-                                approval=lambda method, params: self._request_approval(
-                                    job_id, method, params
-                                ),
-                                on_generation=lambda value, item=result: self._item(
-                                    job_id, item, browser_read=value
-                                ),
-                            )
+                            recovered = False
+                            try:
+                                recovered = recover_questions(
+                                    self.settings,
+                                    Path(result["package"]),
+                                    model=job["model"],
+                                    effort=job.get("effort"),
+                                    cancelled=self._cancel.is_set,
+                                    progress=lambda msg: self._log(job_id, msg),
+                                    approval=lambda method, params: self._request_approval(
+                                        job_id, method, params
+                                    ),
+                                    on_generation=lambda value, item=result: self._item(
+                                        job_id, item, browser_read=value
+                                    ),
+                                )
+                            except RunCancelled:
+                                raise
+                            except WorkflowError as exc:
+                                self._log(
+                                    job_id,
+                                    "原题自动读取仍有缺口，继续处理已读材料并保留审阅提示："
+                                    + str(exc),
+                                )
                             if recovered:
                                 refreshed = prepare(
                                     self.settings,
@@ -762,8 +755,8 @@ class FrontendJobs:
                                     on_assignment=assignment_event,
                                 )
                                 if not refreshed["packages"]:
-                                    raise NeedsInput(
-                                        "原题已读取，但重新准备资料尚未成功，请补充后继续。"
+                                    raise WorkflowError(
+                                        "原题已读取，但资料重新核验失败；已保留读取结果，可重试。"
                                     )
                                 result.update(refreshed["packages"][0])
                             self._log(
@@ -773,8 +766,32 @@ class FrontendJobs:
                                     "document_inspect",
                                 ),
                             )
-                            forms = prepare_document_forms(self.settings, Path(result["package"]))
-                        receipt = generate_review(
+                            try:
+                                ensure_document_sheet(
+                                    self.settings,
+                                    Path(result["package"]),
+                                    model=job["model"],
+                                    effort=job.get("effort"),
+                                    cancelled=self._cancel.is_set,
+                                    progress=lambda msg: self._log(job_id, msg),
+                                    approval=lambda method, params: self._request_approval(
+                                        job_id, method, params
+                                    ),
+                                    on_generation=lambda value, item=result: self._item(
+                                        job_id, item, browser_write=value
+                                    ),
+                                )
+                                forms = prepare_document_forms(
+                                    self.settings, Path(result["package"])
+                                )
+                            except RunCancelled:
+                                raise
+                            except WorkflowError as exc:
+                                self._log(
+                                    job_id,
+                                    "原文档尚不能自动填写，继续生成可打开的本机答案：" + str(exc),
+                                )
+                        receipt = generate_answer(
                             Path(result["package"]),
                             cancelled=self._cancel.is_set,
                             progress=lambda msg: self._log(job_id, msg),
@@ -798,13 +815,22 @@ class FrontendJobs:
                             status=(
                                 "ready"
                                 if receipt["status"] == "ready_for_human_review"
-                                else "needs_user"
+                                else "failed"
                                 if job.get("ai_confirmed")
                                 else "materials_ready"
                             ),
                             reused_review=bool(receipt.get("reused")),
                             package=receipt["package"],
                         )
+                        if receipt.get("draft_sha256"):
+                            answer = create_answer_document(Path(receipt["package"]))
+                            self._item(
+                                job_id,
+                                result,
+                                answer_document=answer,
+                                status="ready",
+                                review_cautions=review_cautions(Path(receipt["package"]), receipt),
+                            )
                         if job.get("ai_confirmed") and receipt.get("draft_sha256") and forms:
                             self._item(job_id, result, status="filling_document")
                             try:
@@ -816,9 +842,7 @@ class FrontendJobs:
                                 self._item(
                                     job_id,
                                     result,
-                                    status="document_needs_user"
-                                    if any(d["remaining_empty_fields"] for d in filled["documents"])
-                                    else "document_ready",
+                                    status="document_ready",
                                     document_fill=filled,
                                     error=None,
                                 )
@@ -832,18 +856,13 @@ class FrontendJobs:
                             and prepare_response_forms(Path(receipt["package"]))
                         ):
                             self._fill_response_item(job_id, result, Path(receipt["package"]))
-                        elif receipt.get("draft_sha256") and not forms:
-                            answer = create_answer_document(Path(receipt["package"]))
-                            self._item(
-                                job_id, result, answer_document=answer, status=answer["status"]
-                            )
                     except RunCancelled:
                         raise
                     except WorkflowError as exc:
                         self._item(
                             job_id,
                             result,
-                            status="needs_user" if isinstance(exc, NeedsInput) else "failed",
+                            status="failed",
                             error=str(exc),
                         )
                 status = (
@@ -873,7 +892,7 @@ class FrontendJobs:
                 failed = sum(x["status"] == "failed" for x in job["items"])
                 self._log(
                     job_id,
-                    f"处理结束：{ready} 项原文档已填入，{form_opened} 项已打开自动预填原表单，{local_ready} 项本机答案，{materials} 项资料包，{needs} 项待补充，{failed} 项失败；打开答案文件、原文档或原表单审阅，提交由你操作",
+                    f"处理结束：{ready} 项原文档已填入，{form_opened} 项已打开自动预填原表单，{local_ready} 项本机答案，{materials} 项资料包，{needs} 项填写提示，{failed} 项失败；打开答案审阅，待确认项一并核对，提交由你操作",
                 )
             with self._lock:
                 job["status"] = status
@@ -929,9 +948,7 @@ class FrontendJobs:
             self._item(
                 job_id,
                 item,
-                status="needs_user"
-                if any(f["remaining_fields"] for f in result["forms"])
-                else "form_opened",
+                status="form_opened",
                 form_fill=result,
                 error=None,
                 generation=read_json(package / "codex-generation.json"),

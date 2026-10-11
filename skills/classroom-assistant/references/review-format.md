@@ -5,6 +5,8 @@
 - `requirement_checks`：非空数组。每项包含 `requirement`（要求原义）、`requirement_source_id`（manifest 的真实 requirement_source_ids 之一）、`status`（met / partial / unmet / needs_user）、`draft_location`、`evidence_ids`。
 - `claim_checks`：每个重要事实或分析一项。包含 `claim`、`kind`（sourced / analysis / user_fact）、`evidence_ids`。sourced 必须引用真实证据且在初稿出现相应 `[E:id]`；直接引文用 `quotes: [{evidence_id, text}]`，text 必须逐字出现在来源中。user_fact 还需 `personal_fact_indices`，对应 policy.personal_facts、supplement.personal_facts、可信身份合并后的从零起始索引。不要把主张改标为 analysis 来掩盖缺失的事实来源。
 - `questions`：字符串数组。列明个人事实缺口、矛盾要求、无法获取的来源、扫描或转录疑点及需用户审阅的决定。已通过本机复选框确认 AI 使用时，不再把确认规则原文作为生成前置问题；无教师规定原文可在 policy_notes 如实记录。受阻审核至少有一个问题。
+
+questions 和检查表中的 partial / unmet / needs_user 只表示审阅提示，不要求暂停已有答案交付或等待补充。普通感想、意见和生活情境直接给出自然的候选正文并用 analysis 表示；模板不变成个人事实。未知实际健康数值、出席、调查数据等不编造，只影响对应栏位。原题未读全时 requirements_complete=false，列明具体缺失来源和影响；已读题目仍可交付有依据的候选答案，不能把全部要求标为 met。答案正文不得出现“未入力”“仮に、”“请自行填写”等占位提示。
 - `ai_policy_checked`：实际核对课程及作业规定后才置为 true。
 - `policy_notes`：规则的真实来源及用户作答选择；课程 AI 禁止或限制仅作说明，不阻止已勾选的作答。
 - `suggested_disclosure`：按课程要求拟定真实的 AI 使用说明，不替用户声称独立完成。

@@ -40,7 +40,7 @@ def test_verified_report_is_readable_and_reuses_exact_files_without_ai(tmp_path)
     package = verified_package(tmp_path)
     original_hash = sha256_file(package / "draft.md")
     result = create_answer_document(package)
-    assert result["status"] == "needs_user"
+    assert result["status"] == "ready"
     assert result["pending_requirements"]
     content = "\n".join(p.text for p in Document(package / "answer.docx").paragraphs)
     assert "食品安全" in content and "本人評価：未入力" in content
@@ -189,7 +189,7 @@ def test_export_endpoint_preserves_model_and_exposes_an_actual_word_file(export_
     )
     assert status == 200
     item = json.loads(body)["items"][0]
-    assert item["status"] == "needs_user" and item["generation"]["model"] == "offline-fixture"
+    assert item["status"] == "ready" and item["generation"]["model"] == "offline-fixture"
     status, headers, body = request(local_server, endpoint + "/answer-docx")
     assert status == 200 and "wordprocessingml" in headers["Content-Type"]
     assert ".docx" in headers["Content-Disposition"]

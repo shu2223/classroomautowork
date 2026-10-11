@@ -12,14 +12,17 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Cm, Pt, RGBColor
 
+from .completion import candidate_mode
 from .errors import WorkflowError
 from .local import atomic_json, require_private_path, sha256_file, utc_now
 
-VERSION = "answer-document-v1.4-body-only-templates"
+VERSION = "answer-document-v1.5-review-candidates"
 
 
 def personal_templates_requested(manifest):
     """Only the trusted user's supplement can request personal template examples."""
+    if candidate_mode(manifest):
+        return True
     text = manifest.get("supplement", {}).get("text", "")
     for clause in re.split(r"[。.!！?？\n]", text):
         if re.search(r"(?:不要|不需要|别|禁止|しない)", clause):
@@ -242,16 +245,10 @@ def create_answer_document(package):
         "created_at": utc_now(),
         "inputs": inputs,
         "title": title,
-        "status": (
-            "ready"
-            if not pending
-            or (
-                personal_templates
-                and all(c["status"] in {"met", "needs_user"} for c in review["requirement_checks"])
-            )
-            else "needs_user"
-        ),
+        "status": "ready",
         "pending_requirements": pending,
+        "candidate_mode": candidate_mode(manifest),
+        "review_cautions": list(dict.fromkeys(pending + review.get("questions", []))),
         "personal_templates": personal_templates,
         "template_transform_count": template_count,
         "presentation_note": (

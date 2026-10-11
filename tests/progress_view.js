@@ -2,7 +2,7 @@
 const fs = require('node:fs'), vm = require('node:vm'), assert = require('node:assert/strict'), path = require('node:path');
 const source = fs.readFileSync(path.join(__dirname, '../src/classroomautowork/web/app.js'), 'utf8');
 const code = source.split('// Pure progress presentation;')[1].split('// End pure progress presentation.')[0];
-const {progressView,resumeTarget,completedSuccessor} = vm.runInNewContext('// ' + code + '\n({progressView,resumeTarget,completedSuccessor});', {activeStates:new Set(['queued','running','stopping']), labels:{failed:'失败',completed:'结束'},keyOf:x=>x.course_id+':'+x.assignment_id});
+const {progressView,completedSuccessor} = vm.runInNewContext('// ' + code + '\n({progressView,completedSuccessor});', {activeStates:new Set(['queued','running','stopping']), labels:{failed:'失败',completed:'结束'},keyOf:x=>x.course_id+':'+x.assignment_id});
 const now = Date.parse('2026-01-01T00:10:00Z'), network = {lastSuccess:now,error:null};
 const job = {status:'running',kind:'review',items:[{status:'preparing'}],created_at:'2026-01-01T00:00:00Z',updated_at:'2026-01-01T00:00:00Z',message:'Checking attachment offline-id',events:[]};
 let v = progressView(job, network, now);
@@ -26,7 +26,7 @@ assert.match(v.warning,/未收到新的模型活动通知/); assert.match(v.warn
 v = progressView({...aiJob,status:'completed'},network,now); assert.equal(v.ai,null);
 const uiCode = source.slice(source.indexOf('function jobProgress('),source.indexOf('function jobCard('));
 function element(tag,text,className) { return {tag,textContent:text,className,children:[],attributes:{},dataset:{},style:{},classList:{add(value){this.value=value;}},append(...children){this.children.push(...children);},setAttribute(key,value){this.attributes[key]=value;}}; }
-const {jobProgress} = vm.runInNewContext(uiCode+'\n({jobProgress});',{progressView,connection:network,node:element,Date:{now:()=>now},state:{monitorOnly:false},resumeTarget,codexLink:g=>g?.thread_id ? element('a','Session') : null,friendlyError:x=>x,durationLabel:x=>String(x)});
+const {jobProgress} = vm.runInNewContext(uiCode+'\n({jobProgress});',{progressView,connection:network,node:element,Date:{now:()=>now},state:{monitorOnly:false},codexLink:g=>g?.thread_id ? element('a','Session') : null,friendlyError:x=>x,durationLabel:x=>String(x)});
 let detail = jobProgress(aiJob), bar = detail.children.find(x=>x.className === 'job-progress');
 assert.equal(bar.tag,'div'); assert.equal(bar.children[0].className,'job-progress-sweep');
 assert.equal(bar.value,undefined); assert.match(bar.children[0].style.animationDelay,/^-\d+ms$/);
@@ -75,20 +75,28 @@ console.log('Production native-question editor checks passed');
 
 const missing = {course_id:'1',assignment_id:'2',status:'needs_user',package:'unit-private-package',form_fill:{forms:[{prefilled_fields:7,remaining_fields:Array.from({length:6},()=>({required:true,title:'Actual original field'}))}]}};
 const waiting = {...job,status:'completed_with_issues',kind:'fill',items:[missing]};
+const cardCode = source.slice(source.indexOf('function jobCard('),source.indexOf('function renderJobs('));
+const {jobCard} = vm.runInNewContext(cardCode+'\n({jobCard});',{
+  state:{jobs:[],monitorOnly:false},activeStates:new Set(['queued','running','stopping']),labels:{completed_with_issues:'处理已结束'},
+  node:element,button:element,pill:status=>element('span',status),safeLink:()=>null,codexLink:()=>null,
+  keyOf:x=>x.course_id+':'+x.assignment_id,inputAction:()=>({label:'调整答案或说明（可选）'}),
+  completedSuccessor,jobProgress:()=>element('div','progress'),friendlyError:x=>x
+});
+assert.doesNotThrow(()=>jobCard({...waiting,id:'unit-job',events:[]}));
 const completedLater = {...waiting,id:'unit-later',created_at:'2026-01-02T00:00:00Z',status:'completed',items:[{...missing,status:'form_opened'}]};
 assert.equal(completedSuccessor(waiting,[waiting,completedLater]).job.id,'unit-later');
 assert.equal(completedSuccessor(waiting,[waiting,{...completedLater,items:[{...missing,status:'needs_form'}]}]),null);
 v = progressView(waiting,network,now);
-assert.equal(v.active,false); assert.equal(v.stage,'input'); assert.equal(v.index,2);
-assert.match(v.title,/处理已结束/); assert.match(v.explanation,/7 栏/); assert.match(v.explanation,/6 项/);
-assert.equal(resumeTarget(waiting).label,'填写 6 项信息');
-assert.equal(resumeTarget({...waiting,status:'running'}),null);
-assert.equal(resumeTarget({...waiting,items:[{...missing,status:'needs_form'}]}),null);
+assert.equal(v.active,false); assert.equal(v.index,3); assert.equal(v.ready,1);
+assert.match(v.title,/答案已交付/); assert.match(v.explanation,/7 栏/); assert.match(v.explanation,/6 项/);
+assert.doesNotMatch(v.explanation,/等待补充|重试不会自动补齐/);
+v = progressView({...waiting,items:[{...missing,form_fill:undefined}]},network,now);
+assert.equal(v.ready,0); assert.doesNotMatch(v.title,/答案已交付/);
 const retryCode = source.slice(source.indexOf('async function jobAction('),source.indexOf('function renderEfforts('));
 const opened=[],requests=[];
-const {jobAction} = vm.runInNewContext(retryCode+'\n({jobAction});',{state:{jobs:[{...waiting,id:'unit-job'}]},resumeTarget,openSupplement:async(...args)=>opened.push(args),action:async(...args)=>requests.push(args)});
+const {jobAction} = vm.runInNewContext(retryCode+'\n({jobAction});',{state:{jobs:[{...waiting,id:'unit-job'}]},openSupplement:async(...args)=>opened.push(args),action:async(...args)=>requests.push(args)});
 (async()=>{
-  await jobAction('unit-job','retry'); assert.equal(opened.length,1); assert.equal(opened[0][1],'1:2'); assert.equal(requests.length,0);
-  await jobAction('unit-job','pause'); assert.equal(requests[0][0],'/api/jobs/unit-job/pause');
-  console.log('Missing-input retry opens editor without another processing request');
+  await jobAction('unit-job','retry'); assert.equal(opened.length,0); assert.equal(requests[0][0],'/api/jobs/unit-job/retry');
+  await jobAction('unit-job','pause'); assert.equal(requests[1][0],'/api/jobs/unit-job/pause');
+  console.log('Retry resumes automatic processing without forcing the optional editor');
 })().catch(error=>{console.error(error);process.exitCode=1;});

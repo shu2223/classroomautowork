@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import time
 from pathlib import Path
 
 from .codex_rpc import CodexClient
@@ -110,8 +111,14 @@ def recover_questions(
                 record["turn_id"] = turn_id
                 save()
                 messages = []
+                deadline = time.monotonic() + 5 * 60
                 while True:
-                    event = client.next_event()
+                    remaining = deadline + client.approval_wait_seconds - time.monotonic()
+                    if remaining <= 0:
+                        raise WorkflowError(
+                            "登录原题读取超过等待时限；保留已读资料，继续生成可用答案。"
+                        )
+                    event = client.next_event(timeout=remaining)
                     params = event.get("params", {})
                     if params.get("threadId") and params["threadId"] != thread_id:
                         continue

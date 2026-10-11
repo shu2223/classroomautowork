@@ -9,6 +9,7 @@ import math
 import os
 import re
 import shutil
+import struct
 import subprocess
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -19,6 +20,22 @@ from .errors import ConfigurationError, WorkflowError
 from .local import atomic_json, require_private_path, sha256_file, state_root
 from .progress import report
 from .store import artifact, fingerprint
+
+LARGE_MODELS = ("large-v3-turbo", "large-v3")
+DEFAULT_MODEL = "large-v3-turbo"
+
+
+def require_large_model(path: Path):
+    """Check Whisper's actual encoder dimensions, rather than trusting a filename."""
+    with path.open("rb") as stream:
+        header = stream.read(44)
+    if len(header) != 44:
+        raise ConfigurationError("转录模型文件不完整；请配置 large-v3-turbo 或 large-v3。")
+    magic, _, _, state, _, layers, *_ = struct.unpack("<11i", header)
+    if magic != 0x67676D6C or state < 1280 or layers < 32:
+        raise ConfigurationError(
+            "转录只允许 Whisper 大模型；旧 tiny/base/small/medium 不再用于作业。请运行 buzz-setup。"
+        )
 
 
 @dataclass(frozen=True)
@@ -63,6 +80,7 @@ class BuzzConfig:
             raise ConfigurationError(
                 "Local Whisper.cpp model is missing or fails its SHA-256 check."
             )
+        require_large_model(model)
         if not re.fullmatch(r"[a-z]{2,3}|auto", self.language):
             raise ConfigurationError("Invalid local transcription language.")
         if not 30 <= self.segment_seconds <= 600 or not 60 <= self.timeout_seconds <= 14400:
@@ -74,9 +92,9 @@ class BuzzConfig:
         return self
 
 
-def setup_buzz(root: Path, model_size: str = "small", language: str = "ja") -> dict:
-    if model_size not in {"tiny", "base", "small", "medium", "large-v3"}:
-        raise ConfigurationError("Choose a multilingual Whisper.cpp model size.")
+def setup_buzz(root: Path, model_size: str = DEFAULT_MODEL, language: str = "ja") -> dict:
+    if model_size not in LARGE_MODELS:
+        raise ConfigurationError("转录必须使用 large-v3-turbo 或 large-v3。")
     root = root.resolve()
     if not (root / "Buzz.exe").is_file() and not (root / "buzz").exists():
         raise ConfigurationError("Specify an existing Buzz installation directory.")
@@ -267,7 +285,7 @@ def transcribe_media(
             prefix = folder / "transcript"
             report(
                 progress,
-                f"Buzz 正在本机转录第 {index + 1}/{total} 段，单段完成后更新",
+                f"Buzz 大模型 {Path(config.model_path).stem.removeprefix('ggml-')} 正在本机转录第 {index + 1}/{total} 段，完成后缓存",
                 "transcribe",
                 current=index,
                 total=total,

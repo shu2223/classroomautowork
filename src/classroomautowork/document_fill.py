@@ -91,10 +91,33 @@ def inspect_form(document):
     hashes cover questions/headers, so regenerated answers cannot target changed questions.
     """
     fields, topology, instructions = [], [], []
-    for tab in document_tabs(document):
+    tabs = document_tabs(document)
+    for tab in tabs:
         topology.append({k: tab[k] for k in ("id", "title", "parent", "index")})
         table_number = 0
         body = tab["content"]
+        paragraphs = [p for p in body if "paragraph" in p]
+        if (
+            len(tabs) == 1
+            and len(paragraphs) == 1
+            and all("sectionBreak" in p or plain_container([p]) for p in body)
+        ):
+            # A newly-created Doc is one real blank paragraph, not an unknown template.
+            # Retain the field after insertion for idempotent readback. Nonempty content
+            # is still protected by plan_fill and cannot be overwritten.
+            context = {"document_title": document.get("title", ""), "tab_title": tab["title"]}
+            fields.append(
+                {
+                    "id": f"{tab['id']}/body-answer",
+                    "tab_id": tab["id"],
+                    "label": "回答（正文一段）",
+                    "context": json.dumps(context, ensure_ascii=False),
+                    "context_sha256": digest(context),
+                    "index": paragraphs[0]["startIndex"],
+                    "current": paragraph_text(paragraphs[0]).strip(),
+                }
+            )
+            continue
         for i, element in enumerate(body):
             if "table" in element:
                 rows = element["table"].get("tableRows", [])

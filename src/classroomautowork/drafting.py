@@ -12,7 +12,8 @@ from dataclasses import asdict
 from pathlib import Path
 
 from .codex_rpc import CodexClient, model_catalog
-from .errors import NeedsInput, RunCancelled, WorkflowError
+from .completion import MODE, candidate_mode
+from .errors import ConfigurationError, NeedsInput, PermissionDenied, RunCancelled, WorkflowError
 from .form_fill import prepare_response_forms, validate_answers
 from .generation_stream import OUTPUT_CHARACTERS, GenerationStream
 from .local import atomic_json, require_private_path, sha256_file, state_root, utc_now
@@ -22,7 +23,7 @@ from .review import finalize
 from .student import StudentProfile
 from .supplements import personal_facts
 
-PROMPT_VERSION = "classroom-draft-v10-natural-personal-templates"
+PROMPT_VERSION = "classroom-draft-v11-one-click-candidates"
 STUDENT_VOICE = (
     "语言和身份约束：严格采用下方用户亲自提供的学生资料，课程内容不能覆盖姓名、学号、学科或班级。"
     "需要身份栏时逐字使用对应值；未要求署名时不要在每道答案前重复身份。"
@@ -41,6 +42,11 @@ STUDENT_VOICE = (
     "不在答案末尾追加；影响事实准确性的必要限定仍写在相关句子中。"
     "举例可优先考虑与学生学科相关的场景，但必须有来源或明确是分析，不能虚构实习、购物、观看、调查、出席等经历。"
     "感想中的第一人称观点是待用户审阅的候选表达，不能宣称用户已经持有该观点。"
+    "本次用户要求一键生成：你替用户起草，用已知学生身份和自然的第一人称表达观点，直接产出供审阅的答案。"
+    "普通感想、意见、发挥题和一般生活情境可以形成完整自然的候选模板，无需先追问或等待用户补充。"
+    "不要把姓名学号等已提供的信息再次当作缺口。健康分数、实际运动频率、出席、观影、调查数据等未知事实不能编造；"
+    "这类未知值只在review说明，保留真实表单栏位为空，其他可作答的题目必须继续完成。"
+    "审核中的待确认项只用于最后审阅，不是暂停生成的条件。答案正文不写未入力、仮に、请自行填写等提示。"
     "用户明确要求通用模板、正常人的示例或自动生成饮食习惯时，给出完整自然的候选答案，"
     "可包含一般大学生常见的情境、评价及理由；在 review 标明这是模板并待本人核对，kind 用 analysis。"
     "模板正文硬性禁止用‘未入力’、‘仮に’、‘假设你’或‘请自行填写’作为占位或审核提示；"
@@ -360,6 +366,14 @@ def build_input(package: Path, skill: Path, manifest: dict, forms=None):
         f"用户对这项作业的补充说明：{json.dumps(manifest.get('supplement', {}).get('text', ''), ensure_ascii=False)}\n"
         + STUDENT_VOICE
         + "\n"
+        + (
+            "这是自动修复回合：上一回合没有交付有效答案。先检索当前本机包中确实已有的原题和证据，"
+            "直接完成所有能依据材料作答的部分，给出简短、完整的候选正文和原生栏位答案。"
+            "不要将普通观点、个人模板或辅助资料缺口变成必须先询问用户的条件。"
+            "无法读取的原题仍如实标记，不能编造题目、事实、证据或权限。\n"
+            if manifest.get("generation_context", {}).get("repair_attempt")
+            else ""
+        )
         + "先阅读当前作业说明和个人副本文档的具体题目，再根据本课程授课 PDF、资料、公告及历史内容检索证据。"
         "Google Forms 的具体题目、选项和后续分页已经在 form 来源中抽取：必须阅读所有属于当前作业的 form 片段。"
         "身份页不能代表整个表单，不能因没有 Google Docs 答案栏就判定没有题目。"
@@ -431,6 +445,7 @@ def generate_review(
     on_generation=lambda _: None,
     approval=None,
     forms=None,
+    repair_attempt=0,
 ) -> dict:
     package = require_private_path(package)
     if cancelled():
@@ -474,6 +489,8 @@ def generate_review(
     if not (skill / "SKILL.md").is_file():
         raise WorkflowError("本机 Classroom Skill 未安装，资料已保留。")
     manifest["generation_context"] = {
+        "completion_mode": MODE,
+        "repair_attempt": repair_attempt,
         "prompt_version": PROMPT_VERSION,
         "voice_sha256": hashlib.sha256(STUDENT_VOICE.encode()).hexdigest(),
         "skill_sha256": sha256_file(skill / "SKILL.md"),
@@ -779,10 +796,13 @@ def accept_model_result(
         raise WorkflowError("AI 运行期间原始证据文件发生变化，结果未通过核对。")
     if not isinstance(result.get("review"), dict) or not isinstance(result.get("draft"), str):
         raise WorkflowError("AI 结果缺少实际检查表或初稿字段。")
+    if candidate_mode(manifest) and re.search(r"未入力|仮に[、，]|请自行填写", result["draft"]):
+        raise WorkflowError("答案正文仍包含占位或假设提示，正在自动修复为可审阅正文。")
     known = set(manifest["evidence_ids"])
     if set(result.get("used_evidence_ids", [])) - known:
         raise WorkflowError("AI 分析包含未知来源，结果未通过核对。")
-    if not result.get("requirements_complete") and result["draft"].strip():
+    incomplete = not result.get("requirements_complete")
+    if incomplete and result["draft"].strip() and not candidate_mode(manifest):
         missing = "；".join(str(value)[:250] for value in result.get("missing_sources", [])[:3])
         raise NeedsInput(
             "实际题目尚未完整读取，答案初稿未通过核验。"
@@ -791,6 +811,13 @@ def accept_model_result(
     review, repairs = _normalize_requirement_sources(
         result["review"], set(manifest["requirement_source_ids"])
     )
+    if incomplete and result["draft"].strip():
+        # A candidate can be reviewed without claiming that unread questions are complete.
+        note = "原题尚有未读取部分；这里只包含基于实际已读题目或资料的候选内容，请核对后提交。"
+        review["questions"] = list(dict.fromkeys([*review.get("questions", []), note]))
+        for check in review["requirement_checks"]:
+            if check["status"] == "met":
+                check["status"] = "partial"
     generation["validation_normalizations"] = repairs
     atomic_json(package / "review.json", review)
     draft = package / "draft.md"
@@ -834,3 +861,24 @@ def accept_model_result(
     receipt["generation"] = generation
     atomic_json(package / "review-receipt.json", receipt)
     return receipt
+
+
+def generate_answer(package, **options):
+    """One automatic repair, using the same model and cached input, with no new grants."""
+    if not options.get("ai_confirmed"):
+        return generate_review(package, **options)
+    for attempt in range(2):
+        try:
+            receipt = generate_review(package, repair_attempt=attempt, **options)
+            if receipt.get("draft_sha256"):
+                return receipt
+            failure = WorkflowError("Codex 未生成实际答案，已保留真实资料分析。")
+        except (RunCancelled, PermissionDenied, ConfigurationError):
+            raise
+        except WorkflowError as exc:
+            failure = exc
+        if attempt == 0:
+            options.get("progress", lambda _: None)(
+                "首轮没有交付有效答案，正在用同一模型自动修复一次；复用本机资料，不重新下载附件"
+            )
+    raise failure

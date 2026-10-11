@@ -68,7 +68,7 @@ def test_retry_recovers_completed_report_without_download_or_new_ai(tmp_path, mo
     restored = jobs.retry(identifier)
     item = restored["items"][0]
     assert restored["id"] == identifier and jobs._active is None
-    assert item["status"] == "needs_user" and item["error"] is None
+    assert item["status"] == "ready" and item["error"] is None
     assert item["generation"]["model"] == generation["model"]
     assert item["generation"]["turn_id"] == generation["turn_id"]
     assert item["answer_document"]["pending_requirements"] == ["Unit requirement"]
@@ -82,9 +82,9 @@ def test_retry_recovers_completed_report_without_download_or_new_ai(tmp_path, mo
         repairs[0]["original"] == result["review"]["requirement_checks"][0]["requirement_source_id"]
     )
     assert repairs[0]["corrected"] == source
-    # A second retry opens the supplement editor and keeps the same file/model.
+    # Repeating retry reuses the verified answer without another download or model call.
     timestamp = (package / "answer.docx").stat().st_mtime_ns
-    assert jobs.retry(identifier)["next_action"] == "supplement"
+    assert jobs.retry(identifier)["id"] == identifier
     assert (package / "answer.docx").stat().st_mtime_ns == timestamp
 
 
@@ -123,3 +123,38 @@ def test_model_schema_limits_requirement_sources_to_real_ids():
         "properties"
     ]["requirement_source_id"]
     assert field == {"type": "string", "enum": ids}
+
+
+def test_reusing_one_answer_does_not_prevent_other_failed_items_retrying(tmp_path, monkeypatch):
+    package, generation, _, _ = failed_report(tmp_path)
+    receipt = drafting.recover_completed_result(package, model="offline-model", effort="high")
+    assert receipt and receipt["draft_sha256"]
+    from classroomautowork.answer_document import create_answer_document
+
+    create_answer_document(package)
+    jobs = FrontendJobs(unit_settings(tmp_path))
+    identifier = "b" * 32
+    jobs._jobs[identifier] = {
+        "id": identifier,
+        "kind": "review",
+        "status": "completed_with_issues",
+        "events": [],
+        "defer_media": False,
+        "model": generation["model"],
+        "effort": "high",
+        "ai_confirmed": True,
+        "items": [
+            {"course_id": "1", "assignment_id": "2", "status": "ready", "package": str(package)},
+            {"course_id": "1", "assignment_id": "3", "status": "failed"},
+        ],
+    }
+    calls = []
+
+    def start(items, **options):
+        calls.append(items)
+        return {"id": "next-offline-job"}
+
+    monkeypatch.setattr(jobs, "start_selected", start)
+    assert jobs.retry(identifier)["id"] == "next-offline-job"
+    assert any(x["assignment_id"] == "3" for x in calls[0])
+    assert jobs._jobs[identifier]["items"][0]["status"] == "ready"
