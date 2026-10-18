@@ -164,6 +164,23 @@ line-height:1.7}
 .job-live-detail .job-measurement{font-weight:600;color:#397453}
 .job-live-detail .job-file{font-size:12px;color:#46634f}
 .job-live-detail .job-current-message{font-size:11px;color:#819287}
+.job-estimate{padding:15px 16px;margin:15px 0 18px;border:1px solid #cbded0;border-radius:8px;background:#f7fbf8}
+.job-estimate-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;font-size:11px;color:#6b8171}
+.job-estimate-heading strong{font-size:19px;font-variant-numeric:tabular-nums;color:#315f43}
+.job-estimated-progress{display:block;width:100%;height:9px;margin:9px 0 13px;border:0;border-radius:9px;overflow:hidden;accent-color:#699c7e;background:#e4ede7}
+.job-estimated-progress::-webkit-progress-bar{background:#e4ede7;border-radius:9px}
+.job-estimated-progress::-webkit-progress-value{background:repeating-linear-gradient(110deg,#699c7e 0px,#699c7e 7px,#81ad94 7px,#81ad94 10px);border-radius:9px}
+.job-estimated-progress::-moz-progress-bar{background:#699c7e;border-radius:9px}
+.job-estimated-progress.unknown{background:repeating-linear-gradient(110deg,#e5eee8 0px,#e5eee8 7px,#d8e5dc 7px,#d8e5dc 10px)}
+.job-estimate p{margin:6px 0;line-height:1.75;overflow-wrap:anywhere}
+.job-estimate .job-eta-main{font-size:16px;font-weight:600;color:#315f43;font-variant-numeric:tabular-nums}
+.job-estimate .job-eta-detail,.job-estimate .job-eta-stage{font-size:12px;color:#53715e}
+.job-estimate .job-speed{font-size:11px;color:#52785f}
+.job-estimate .job-estimate-note{font-size:11px;color:#7b8d80}
+.job-estimate[data-estimate-state=stale],.job-estimate[data-estimate-state=paused]{background:#faf9f4;border-color:#e3ddce}
+.job-estimate[data-estimate-state=stale] .job-eta-main,.job-estimate[data-estimate-state=paused] .job-eta-main{color:#947544}
+.job-live-detail .job-stage-label{font-size:11px;color:#6b8171;margin:0 0 -7px}
+.job-live-detail[data-progress-state=stale] .job-progress-sweep,.job-live-detail[data-progress-state=paused] .job-progress-sweep{animation-play-state:paused}
 .job-steps{display:flex;list-style:none;padding:0;margin:0 0 18px;gap:12px}
 .job-steps li{display:flex;align-items:center;gap:6px;flex:1;font-size:11px;color:#9eaaa2}
 .job-steps li span{display:grid;place-items:center;border-radius:50%;width:22px;height:22px;background:#eff3f0;flex-shrink:0}

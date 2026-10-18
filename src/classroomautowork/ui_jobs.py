@@ -14,7 +14,7 @@ from .browser_documents import ensure_document_sheet
 from .browser_questions import recover_questions
 from .buzz import validation_session
 from .codex_rpc import model_catalog
-from .completion import review_cautions
+from .completion import document_answers_incomplete, document_fill_outcome, review_cautions
 from .config import Settings
 from .document_fill import fill_review, prepare_document_forms
 from .drafting import codex_command, generate_answer, recover_completed_result
@@ -24,6 +24,7 @@ from .form_capture import import_form_capture
 from .form_fill import fill_response_forms, prepare_response_forms
 from .form_read import form_references, form_url
 from .google_read import GoogleReader
+from .job_progress import JobProgress
 from .local import atomic_json, require_private_path, sha256_file, utc_now
 from .pending import discover_pending
 from .policy import CoursePolicy, confirmed_gate
@@ -90,6 +91,7 @@ class FrontendJobs:
         self._models_lock = threading.Lock()
         self._approval_answers = {}
         self._jobs = {}
+        self._progress = {}
         for path in sorted((self.root / "jobs").glob("*.json")):
             job = read_json(path)
             if not job or not re.fullmatch(r"[a-f0-9]{32}", job.get("id", "")):
@@ -108,6 +110,21 @@ class FrontendJobs:
                     }:
                         item["status"] = "interrupted"
                 atomic_json(path, job)
+            incomplete = False
+            for item in job.get("items", []):
+                if item.get("status") in {"ready", "document_ready", "document_needs_user"} and (
+                    document_answers_incomplete(item)
+                ):
+                    receipt = item.get("document_fill") or {}
+                    if item.get("requires_regeneration"):
+                        receipt = {**receipt, "status": "partial"}
+                    item.update(document_fill_outcome(receipt))
+                    incomplete = True
+            if incomplete:
+                if job["status"] == "completed":
+                    job["status"] = "completed_with_issues"
+                job["message"] = "原文档还有未完成的题目，请重试补全；已写入的答案会保留。"
+                atomic_json(path, job)
             self._jobs[job["id"]] = job
         queued = read_json(self.root / "answer-fill-requests.json", {})
         self._answer_requests = (
@@ -125,6 +142,8 @@ class FrontendJobs:
         self._next_answer_fill()
 
     def _save(self, job):
+        if job["id"] in self._progress:
+            job["estimate"] = self._progress[job["id"]].snapshot()
         job["updated_at"] = utc_now()
         atomic_json(self.root / "jobs" / (job["id"] + ".json"), job)
 
@@ -178,6 +197,8 @@ class FrontendJobs:
 
     def _snapshot(self, job):
         value = json.loads(json.dumps(job))
+        if job["id"] in self._progress:
+            value["estimate"] = self._progress[job["id"]].snapshot()
         value["runtime"] = {
             "observed_at": utc_now(),
             "worker_alive": bool(
@@ -195,8 +216,12 @@ class FrontendJobs:
             if isinstance(message, ProgressUpdate):
                 previous = job.get("progress", {})
                 details = dict(message.details)
+                if job_id in self._progress:
+                    self._progress[job_id].update(details)
+                details.pop("workload_files", None)
                 same_step = all(
-                    previous.get(key) == details.get(key) for key in ("stage", "file_id", "item_id")
+                    previous.get(key) == details.get(key)
+                    for key in ("stage", "file_id", "item_id", "phase")
                 )
                 job["progress"] = {
                     **details,
@@ -219,6 +244,8 @@ class FrontendJobs:
             if values.get("status") and values["status"] != entry.get("status"):
                 entry["stage_started_at"] = utc_now()
             entry.update(values)
+            if job_id in self._progress:
+                self._progress[job_id].item(entry, values)
             self._save(job)
 
     def models(self):
@@ -249,6 +276,7 @@ class FrontendJobs:
                 "submission": "manual_only",
             }
             self._jobs[job["id"]] = job
+            self._progress[job["id"]] = JobProgress(job, self.root / "progress-history.json")
             self._active = job["id"]
             self._cancel.clear()
             self._save(job)
@@ -268,6 +296,14 @@ class FrontendJobs:
         item = next(x for x in source["items"] if item_key(x) == key)
         if not source.get("ai_confirmed"):
             raise WorkflowError("未确认使用 AI 的资料包不能自动填入。")
+        if document_answers_incomplete(item):
+            return self.start_selected(
+                [{"course_id": item["course_id"], "assignment_id": item["assignment_id"]}],
+                defer_media=source.get("defer_media", False),
+                model=source.get("model"),
+                effort=source.get("effort"),
+                ai_confirmed=True,
+            )
         return self._start("fill", [{**item, "package": str(package)}], ai_confirmed=True)
 
     def export_answer(self, job_id, key):
@@ -329,6 +365,18 @@ class FrontendJobs:
                 seen.add(key)
         if not ai_confirmed:
             return self._start("review", items, defer_media, ai_confirmed=False)
+        # The main button and the history retry must both reuse a valid mapping.
+        # Empty mappings need a fresh inspection/generation, not an endless fill loop.
+        latest = {}
+        for previous in sorted(
+            self._jobs.values(), key=lambda x: x.get("created_at", ""), reverse=True
+        ):
+            if previous["kind"] in {"review", "fill"} and previous.get("ai_confirmed"):
+                for entry in previous["items"]:
+                    latest.setdefault(item_key(entry), entry)
+        reusable = [latest.get(item_key(item), {}) for item in items]
+        if all(self._can_retry_fill(item) for item in reusable):
+            return self._start("fill", reusable, ai_confirmed=True)
         catalog = read_json(self.root / "codex-models.json") or self.models()
         model = model or catalog["default_model"]
         entry = next((x for x in catalog["models"] if x["model"] == model), None)
@@ -347,6 +395,18 @@ class FrontendJobs:
             raise ConfigurationError("所选模型不支持这个推理强度。")
         return self._start("review", items, defer_media, model, effort, ai_confirmed)
 
+    @staticmethod
+    def _can_retry_fill(item):
+        generation = item.get("generation", {})
+        return (
+            item.get("status") in {"needs_document", "needs_form"}
+            and not document_answers_incomplete(item)
+            and item.get("package")
+            and generation.get("status") == "completed"
+            and generation.get("document_mapping_complete") is not False
+            and (item["status"] == "needs_form" or bool(generation.get("document_answers_sha256")))
+        )
+
     def retry(self, job_id):
         job = self.job(job_id)
         if job["status"] in ACTIVE:
@@ -364,6 +424,7 @@ class FrontendJobs:
             x
             for x in job["items"]
             if x["status"] not in {"ready", "document_ready", "form_opened", "document_needs_user"}
+            or document_answers_incomplete(x)
             or (
                 x["status"] == "ready"
                 and not (x.get("package") and valid_answer_document(Path(x["package"])))
@@ -371,16 +432,11 @@ class FrontendJobs:
         ]
         if not remaining:
             return job
-        if job["kind"] == "fill" and len(remaining) == 1:
+        incomplete_documents = any(document_answers_incomplete(x) for x in remaining)
+        if job["kind"] == "fill" and len(remaining) == 1 and not incomplete_documents:
             return self.fill_existing(job_id, item_key(remaining[0]))
-        if job["kind"] == "fill" or (
-            job.get("ai_confirmed")
-            and all(
-                x["status"] in {"needs_document", "needs_form"}
-                and x.get("package")
-                and x.get("generation", {}).get("status") == "completed"
-                for x in remaining
-            )
+        if (job["kind"] == "fill" and not incomplete_documents) or (
+            job.get("ai_confirmed") and all(self._can_retry_fill(x) for x in remaining)
         ):
             # The fill adapters revalidate permissions, source context and answer
             # integrity. A fill failure does not require another generation pass.
@@ -626,6 +682,8 @@ class FrontendJobs:
             }
             job["message"] = "Codex 正等待你的本次操作审批；课程内容不能自动批准。"
             job["approval"]["requested_at"] = utc_now()
+            if job_id in self._progress:
+                self._progress[job_id].pause(True)
             self._save(job)
         try:
             for _ in range(4500):
@@ -638,6 +696,8 @@ class FrontendJobs:
         finally:
             with self._lock:
                 job["approval"] = None
+                if job_id in self._progress:
+                    self._progress[job_id].pause(False)
                 self._save(job)
 
     def approve(self, job_id, identifier, decision):
@@ -666,6 +726,8 @@ class FrontendJobs:
             job.update(
                 status="stopping", message="正在暂停，当前资料处理结束后停止；已完成阶段会保留。"
             )
+            if job_id in self._progress:
+                self._progress[job_id].pause(True)
             self._save(job)
             return self.job(job_id)
 
@@ -674,7 +736,16 @@ class FrontendJobs:
         cache = {"reused": 0, "processed": 0, "failed": 0}
         groups = course_batches(job["items"])
         for number, items in enumerate(groups, 1):
-            self._log(job_id, f"正在处理第 {number}/{len(groups)} 门课程，共 {len(items)} 项作业")
+            self._log(
+                job_id,
+                ProgressUpdate(
+                    f"正在处理第 {number}/{len(groups)} 门课程，共 {len(items)} 项作业",
+                    "course_sync",
+                    course_id=items[0]["course_id"],
+                    course_index=number,
+                    course_total=len(groups),
+                ),
+            )
             try:
                 batch = prepare(
                     self.settings,
@@ -688,12 +759,22 @@ class FrontendJobs:
             except WorkflowError as exc:
                 for item in items:
                     self._item(job_id, item, status="failed", error=str(exc))
+                if job_id in self._progress:
+                    self._progress[job_id].prepared_courses.add(items[0]["course_id"])
                 continue
             for key in cache:
                 cache[key] += batch.get("cache", {}).get(key, 0)
             with self._lock:
                 job["cache"] = dict(cache)
                 self._save(job)
+            self._log(
+                job_id,
+                ProgressUpdate(
+                    "这门课程的资料已处理，接下来逐项作答",
+                    "course_prepared",
+                    course_id=items[0]["course_id"],
+                ),
+            )
             yield from batch["packages"]
 
     @validation_session()
@@ -719,6 +800,8 @@ class FrontendJobs:
                 for item in job["items"]:
                     if prepare_response_forms(Path(item["package"])):
                         self._fill_response_item(job_id, item, Path(item["package"]))
+                        if job_id in self._progress:
+                            self._progress[job_id].item_done(item)
                         continue
                     self._item(job_id, item, status="filling_document")
                     try:
@@ -730,14 +813,16 @@ class FrontendJobs:
                         self._item(
                             job_id,
                             item,
-                            status="document_ready",
                             document_fill=result,
-                            error=None,
+                            **document_fill_outcome(result),
                         )
                     except RunCancelled:
                         raise
                     except WorkflowError as exc:
                         self._item(job_id, item, status="needs_document", error=str(exc))
+                    finally:
+                        if job_id in self._progress:
+                            self._progress[job_id].item_done(item)
                 status = (
                     "completed"
                     if all(x["status"] in {"document_ready", "form_opened"} for x in job["items"])
@@ -853,6 +938,15 @@ class FrontendJobs:
                                     job_id,
                                     "原文档尚不能自动填写，继续生成可打开的本机答案：" + str(exc),
                                 )
+                        if job_id in self._progress:
+                            route = ["validate"] if job.get("ai_confirmed") else []
+                            if forms:
+                                route.append("fill")
+                            if job.get("ai_confirmed") and prepare_response_forms(
+                                Path(result["package"])
+                            ):
+                                route.append("form_fill")
+                            self._progress[job_id].route(result, route)
                         receipt = generate_answer(
                             Path(result["package"]),
                             cancelled=self._cancel.is_set,
@@ -904,9 +998,8 @@ class FrontendJobs:
                                 self._item(
                                     job_id,
                                     result,
-                                    status="document_ready",
                                     document_fill=filled,
-                                    error=None,
+                                    **document_fill_outcome(filled),
                                 )
                             except RunCancelled:
                                 raise
@@ -927,6 +1020,9 @@ class FrontendJobs:
                             status="failed",
                             error=str(exc),
                         )
+                    finally:
+                        if job_id in self._progress:
+                            self._progress[job_id].item_done(result)
                 status = (
                     "completed_with_issues"
                     if any(
@@ -983,6 +1079,8 @@ class FrontendJobs:
                             item["status"] = job["status"]
                 job["finished_at"] = utc_now()
                 job["approval"] = None
+                if job_id in self._progress:
+                    self._progress[job_id].finish(job["status"] == "completed")
                 try:
                     self._save(job)
                 finally:

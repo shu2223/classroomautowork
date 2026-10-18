@@ -4,13 +4,19 @@ No OpenAI API mode, URLs, prompts from course content, or shell invocation are a
 Five-minute segments are separate persistent tasks, so a long recording resumes by segment.
 """
 
+import codecs
 import json
 import math
 import os
+import queue
 import re
 import shutil
+import signal
 import struct
 import subprocess
+import threading
+import time
+import wave
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass
@@ -185,7 +191,99 @@ def setup_buzz(root: Path, model_size: str = DEFAULT_MODEL, language: str = "ja"
     }
 
 
-def run_local(arguments: list[str], timeout: int) -> str:
+def _stop_local(process):
+    """Reap our backend and its children when a timeout or progress callback fails."""
+    if process.poll() is None:
+        try:
+            if os.name == "nt":
+                subprocess.run(
+                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=10,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                )
+            else:
+                os.killpg(process.pid, signal.SIGKILL)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        if process.poll() is None:
+            process.kill()
+    process.wait()
+
+
+def _run_streaming(arguments, timeout, on_output):
+    """Read real backend output without blocking timeout checks or leaking transcripts."""
+    process = subprocess.Popen(
+        arguments,
+        shell=False,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        start_new_session=os.name != "nt",
+    )
+    packets = queue.SimpleQueue()
+
+    def read_output():
+        try:
+            while data := process.stdout.read1(4096):
+                packets.put(data)
+        finally:
+            packets.put(None)
+
+    reader = threading.Thread(target=read_output, daemon=True)
+    reader.start()
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    pending = ""
+    captured = bytearray()
+    deadline = time.monotonic() + timeout
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise WorkflowError(
+                    "Local media processing timed out; rerun to resume completed segments."
+                )
+            try:
+                data = packets.get(timeout=min(remaining, 0.2))
+            except queue.Empty:
+                continue
+            if data is None:
+                pending += decoder.decode(b"", final=True)
+                if pending:
+                    on_output(pending)
+                break
+            # Callers need parsed progress, not an unbounded copy of private course text.
+            captured.extend(data[: max(0, 4 * 1024 * 1024 - len(captured))])
+            pending += decoder.decode(data)
+            lines = re.split(r"[\r\n]", pending)
+            pending = lines.pop()
+            for line in lines:
+                if line:
+                    on_output(line)
+            if len(pending) > 65536:
+                pending = pending[-65536:]
+        remaining = deadline - time.monotonic()
+        try:
+            code = process.wait(timeout=max(0, remaining))
+        except subprocess.TimeoutExpired as exc:
+            raise WorkflowError(
+                "Local media processing timed out; rerun to resume completed segments."
+            ) from exc
+        if code:
+            raise WorkflowError("Local media backend failed; no successful transcript claimed.")
+        return captured.decode("utf-8", errors="replace")
+    finally:
+        _stop_local(process)
+        reader.join(timeout=2)
+        process.stdout.close()
+
+
+def run_local(arguments: list[str], timeout: int, *, on_output=None) -> str:
+    if on_output is not None:
+        return _run_streaming(arguments, timeout, on_output)
     try:
         result = subprocess.run(
             arguments,
@@ -202,6 +300,51 @@ def run_local(arguments: list[str], timeout: int) -> str:
     if result.returncode:
         raise WorkflowError("Local media backend failed; no successful transcript claimed.")
     return result.stdout.decode("utf-8", errors="replace")
+
+
+def _timestamp_seconds(stamp):
+    match = re.fullmatch(r"(\d+):(\d{2}):(\d{2})(?:[,.](\d{1,6}))?", stamp)
+    if not match or int(match[2]) >= 60 or int(match[3]) >= 60:
+        return None
+    fraction = float("0." + match[4]) if match[4] else 0.0
+    return int(match[1]) * 3600 + int(match[2]) * 60 + int(match[3]) + fraction
+
+
+def _ffmpeg_seconds(line):
+    if line.startswith("out_time_us="):
+        try:
+            value = float(line.split("=", 1)[1]) / 1_000_000
+        except ValueError:
+            return None
+        return value if math.isfinite(value) and value >= 0 else None
+    if line.startswith("out_time="):
+        return _timestamp_seconds(line.split("=", 1)[1])
+    return None
+
+
+def _whisper_seconds(line, duration):
+    # Both are emitted by the bundled whisper-cli, never inferred from wall time.
+    percent = re.search(r"\bwhisper[^:]*:\s*progress\s*=\s*(\d{1,3})%", line)
+    if percent and 0 <= int(percent[1]) <= 100:
+        return duration * int(percent[1]) / 100
+    stamp = re.match(
+        r"\s*\[\d{2}:\d{2}:\d{2}[,.]\d{3}\s*-->\s*(\d{2}:\d{2}:\d{2}[,.]\d{3})\]",
+        line,
+    )
+    if stamp:
+        return _timestamp_seconds(stamp[1])
+    return None
+
+
+def _wave_duration(path):
+    try:
+        with wave.open(str(path), "rb") as audio:
+            duration = audio.getnframes() / audio.getframerate()
+    except (OSError, EOFError, wave.Error, ZeroDivisionError) as exc:
+        raise WorkflowError("Local audio extraction did not create a readable WAV file.") from exc
+    if not math.isfinite(duration) or duration <= 0:
+        raise WorkflowError("Local audio extraction did not create nonempty audio.")
+    return duration
 
 
 def seconds(stamp: str) -> float:
@@ -267,30 +410,110 @@ def transcribe_media(
     }
     chunks, artifacts = [], []
     total = math.ceil(duration / config.segment_seconds)
+    rate_fields = {
+        "model": Path(config.model_path).stem.removeprefix("ggml-"),
+        "engine": config.engine_sha256,
+        "model_sha256": config.model_sha256,
+        "language": config.language,
+        "rate_key": fingerprint(
+            [config.engine_sha256, config.model_sha256, config.language, ["-ng"]]
+        ),
+    }
+    report(
+        progress,
+        f"录像共 {duration:.0f} 秒，正在检查 {total} 段本地转录缓存",
+        "transcribe",
+        phase="start",
+        current=0,
+        total=total,
+        unit="segments",
+        media_current_seconds=0,
+        media_total_seconds=duration,
+        segment_total=total,
+        segment_start_seconds=0,
+        segment_seconds=min(config.segment_seconds, duration),
+        **rate_fields,
+    )
     for start in range(0, int(duration) + 1, config.segment_seconds):
         if start >= duration:
             break
         index = start // config.segment_seconds
+        segment_duration = min(config.segment_seconds, duration - start)
+        media_fields = {
+            **rate_fields,
+            "current": index,
+            "total": total,
+            "unit": "segments",
+            "media_total_seconds": duration,
+            "segment_index": index,
+            "segment_start_seconds": start,
+            "segment_total": total,
+            "segment_seconds": segment_duration,
+        }
         report(
             progress,
             f"正在处理录像第 {index + 1}/{total} 段（{start:.0f}–{min(duration, start + config.segment_seconds):.0f} 秒）",
             "transcribe",
-            current=index,
-            total=total,
-            unit="segments",
+            phase="start",
+            media_current_seconds=start,
+            **media_fields,
         )
+        executed = False
 
-        def segment(key, offset=start, index=index):
+        def segment(
+            key,
+            offset=start,
+            index=index,
+            segment_duration=segment_duration,
+            media_fields=media_fields,
+        ):
+            nonlocal executed
+            executed = True
             folder = destination / key[:24]
             folder.mkdir(parents=True, exist_ok=True)
             wave = folder / "audio.wav"
-            report(
-                progress,
-                f"正在提取第 {index + 1}/{total} 段音轨",
-                "transcribe",
-                current=index,
-                total=total,
-                unit="segments",
+
+            def track_phase(phase, message, parser, phase_duration=segment_duration):
+                phase_started = time.monotonic()
+                processed = 0.0
+
+                def emit(value, *, complete=False):
+                    nonlocal processed
+                    value = max(processed, min(phase_duration, max(0.0, value)))
+                    elapsed = max(0.0, time.monotonic() - phase_started)
+                    processed = value
+                    report(
+                        progress,
+                        message,
+                        "transcribe",
+                        phase=phase,
+                        phase_current_seconds=value,
+                        phase_total_seconds=phase_duration,
+                        phase_elapsed_seconds=elapsed,
+                        phase_complete=complete,
+                        media_current_seconds=offset + (value if phase == "infer" else 0),
+                        processing_rate=value / elapsed if elapsed > 0 and value > 0 else None,
+                        cached=False,
+                        **media_fields,
+                    )
+
+                def observe(line):
+                    value = parser(line)
+                    if value is not None and math.isfinite(value) and value > processed:
+                        emit(value)
+
+                def finish(actual_duration=None):
+                    nonlocal phase_duration, processed
+                    if actual_duration is not None:
+                        phase_duration = actual_duration
+                        processed = min(processed, phase_duration)
+                    emit(phase_duration, complete=True)
+
+                emit(0)
+                return observe, finish
+
+            observe_prepare, finish_prepare = track_phase(
+                "prepare", f"正在提取第 {index + 1}/{total} 段音轨", _ffmpeg_seconds
             )
             run_local(
                 [
@@ -298,6 +521,9 @@ def transcribe_media(
                     "-nostdin",
                     "-v",
                     "error",
+                    "-nostats",
+                    "-progress",
+                    "pipe:1",
                     "-y",
                     "-ss",
                     str(offset),
@@ -315,15 +541,16 @@ def transcribe_media(
                     str(wave),
                 ],
                 config.timeout_seconds,
+                on_output=observe_prepare,
             )
+            audio_duration = min(segment_duration, _wave_duration(wave))
+            finish_prepare(audio_duration)
             prefix = folder / "transcript"
-            report(
-                progress,
+            observe_infer, finish_infer = track_phase(
+                "infer",
                 f"Buzz 大模型 {Path(config.model_path).stem.removeprefix('ggml-')} 正在本机转录第 {index + 1}/{total} 段，完成后缓存",
-                "transcribe",
-                current=index,
-                total=total,
-                unit="segments",
+                lambda line: _whisper_seconds(line, audio_duration),
+                audio_duration,
             )
             run_local(
                 [
@@ -339,13 +566,16 @@ def transcribe_media(
                     "-of",
                     str(prefix),
                     "-ng",
+                    "-pp",
                 ],
                 config.timeout_seconds,
+                on_output=observe_infer,
             )
             srt, vtt = prefix.with_suffix(".srt"), prefix.with_suffix(".vtt")
             if not srt.is_file() or not vtt.is_file():
                 raise WorkflowError("Buzz backend did not create timestamped subtitle files.")
             parsed = parse_srt(srt.read_text(encoding="utf-8-sig"), offset)
+            finish_infer()
             wave.unlink(missing_ok=True)
             return {"chunks": parsed, "artifacts": [artifact(srt), artifact(vtt)]}
 
@@ -356,9 +586,18 @@ def transcribe_media(
             progress,
             f"已完成并缓存 {index + 1}/{total} 段带时间戳转录",
             "transcribe",
+            phase="complete",
             current=index + 1,
             total=total,
             unit="segments",
+            media_current_seconds=min(duration, start + segment_duration),
+            media_total_seconds=duration,
+            segment_index=index,
+            segment_start_seconds=start,
+            segment_total=total,
+            segment_seconds=segment_duration,
+            cached=not executed,
+            **rate_fields,
         )
     output = destination / (fingerprint(identity)[:24] + ".json")
     atomic_json(output, {"chunks": chunks, "identity": identity})

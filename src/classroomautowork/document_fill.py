@@ -17,12 +17,69 @@ from filelock import FileLock, Timeout
 from google_auth_httplib2 import AuthorizedHttp
 from googleapiclient.discovery import build
 
+from .document_slots import (
+    identity_slots,
+    inline_slots,
+    paragraph_options,
+    protected_inline_runs,
+    slot_template,
+    utf16_length,
+)
 from .errors import PermissionDenied, WorkflowError
 from .google_read import retry_read
 from .local import atomic_json, require_private_path, sha256_file, utc_now
+from .student import StudentProfile
 
 HEADERS = re.compile(r"^(?:[〇○◯×/\s]+|判断の理由|理由|回答|答え|解答|answer|reason)$", re.I)
 PERSONAL = re.compile(r"学籍|氏.?名|姓名|名前|student.?id|\bname\b", re.I)
+SECTION = re.compile(r"^(?:[■□●]\s*)?(?:設問|課題|問)\s*[①-⑳0-9０-９一二三四五六七八九十]")
+WRITTEN_PROMPT = re.compile(r"(?:書|挙げ|答|考え|記入|説明|述べ|定義).*?(?:ください|なさい|字程度)")
+REASON_PROMPT = re.compile(r"^(?:その|判断の)?理由(?:は)?[?？:：。]?$")
+
+
+def required_answer_fields(form, *, answers=None):
+    """Return academic fields required by the currently selected alternatives.
+
+    Individual checkbox alternatives are optional; their reason only becomes required
+    when that alternative is selected. Identity uses the separate trusted profile flow.
+    """
+    selected = {
+        field["id"]
+        for field in form.get("fields", [])
+        if field.get("kind") == "choice" and field.get("current")
+    }
+    for answer in answers or []:
+        if isinstance(answer, dict) and str(answer.get("text", "")).strip() == "☑":
+            selected.add(answer.get("field_id"))
+    return [
+        field
+        for field in form.get("fields", [])
+        if not field.get("identity_key")
+        and field.get("kind") != "choice"
+        and (field.get("kind") != "reason" or field["id"].rsplit("/", 1)[0] + "/choice" in selected)
+    ]
+
+
+def missing_answer_fields(form, answers):
+    """Check complete, unique answer coverage before any document write is offered."""
+    if not isinstance(answers, list) or not all(isinstance(answer, dict) for answer in answers):
+        raise WorkflowError("答案栏映射无效，未修改文档。")
+    fields = {field["id"]: field for field in form.get("fields", [])}
+    supplied = set()
+    for answer in answers:
+        key = answer.get("field_id")
+        if key in supplied or key not in fields:
+            raise WorkflowError("答案栏映射无效或重复，未修改文档。")
+        if answer.get("context_sha256") != fields[key]["context_sha256"]:
+            raise WorkflowError("原题或表头已经变化，请重新读题；未修改文档。")
+        if not isinstance(answer.get("text"), str) or not answer["text"].strip():
+            raise WorkflowError("答案栏包含空答案，未修改文档。")
+        supplied.add(key)
+    return [
+        {key: field[key] for key in ("id", "label", "context")}
+        for field in required_answer_fields(form, answers=answers)
+        if not field.get("current") and field["id"] not in supplied
+    ]
 
 
 @contextmanager
@@ -84,13 +141,13 @@ def plain_container(content):
     return bool(content)
 
 
-def inspect_form(document):
-    """Identify bounded answer containers; exclude identity fields and unknown layouts.
+def inspect_form(document, *, include_identity=False):
+    """Identify bounded containers; identity slots are only exposed to the trusted filler.
 
     Stable field IDs use tab/table/row/column, not shifting character offsets. Context
     hashes cover questions/headers, so regenerated answers cannot target changed questions.
     """
-    fields, topology, instructions = [], [], []
+    fields, topology, instructions, unrecognized = [], [], [], []
     tabs = document_tabs(document)
     for tab in tabs:
         topology.append({k: tab[k] for k in ("id", "title", "parent", "index")})
@@ -118,7 +175,12 @@ def inspect_form(document):
                 }
             )
             continue
+        section, academic_section, question_context, option_context = "", "", "", ""
+        prompt_counts = {}
+        answer_paragraphs = set()
         for i, element in enumerate(body):
+            if i in answer_paragraphs:
+                continue
             if "table" in element:
                 rows = element["table"].get("tableRows", [])
                 if not rows:
@@ -163,54 +225,172 @@ def inspect_form(document):
             elif "paragraph" in element:
                 label = paragraph_text(element).strip()
                 instructions.append(label)
-                is_prompt = (
+                if re.match(r"^(?:課題|問)[①-⑳0-9０-９]", label):
+                    section = label
+                if SECTION.match(label):
+                    academic_section, question_context, option_context = label, "", ""
+                slots = inline_slots(paragraph_text(element)) if plain_container([element]) else []
+                if include_identity and plain_container([element]):
+                    slots += identity_slots(paragraph_text(element))
+                if slots:
+                    text = paragraph_text(element)
+                    context = [section, slot_template(text, slots)]
+                    for slot in slots:
+                        start, end = slot["span"]
+                        fields.append(
+                            {
+                                **slot,
+                                "id": f"{tab['id']}/paragraph:{i}/{slot['kind']}",
+                                "tab_id": tab["id"],
+                                "context": "\n".join(context),
+                                "context_sha256": digest(context),
+                                "index": element["startIndex"] + utf16_length(text[:start]),
+                                "end_index": element["startIndex"] + utf16_length(text[:end]),
+                                "paragraph_index": element["startIndex"],
+                            }
+                        )
+                    continue
+                written_prompt = bool(WRITTEN_PROMPT.search(label))
+                legacy_prompt = (
                     label.startswith("■")
                     or element["paragraph"]
                     .get("paragraphStyle", {})
                     .get("namedStyleType", "")
                     .startswith("HEADING")
                     or re.search(r"(?:回答|答え|解答|まとめ|考察|answer)\s*[:：]$", label, re.I)
+                    or written_prompt
                 )
-                if not label or not is_prompt or PERSONAL.search(label) or i + 1 >= len(body):
+                options = paragraph_options(label)
+                reason_prompt = bool(REASON_PROMPT.fullmatch(label))
+                question_prompt = bool(re.search(r"[?？]$", label))
+                new_prompt = bool(options or reason_prompt or question_prompt)
+                if not label or not (legacy_prompt or new_prompt) or PERSONAL.search(label):
+                    continue
+                if question_prompt and not reason_prompt and not SECTION.match(label):
+                    question_context, option_context = label, ""
+                if options:
+                    option_context = label
+                # A scenario followed by spacing and an explicit list of alternatives
+                # uses the answer below that list. Do not invent a second choice slot.
+                next_text = ""
+                for next_element in body[i + 1 :]:
+                    if "paragraph" not in next_element:
+                        break
+                    next_text = paragraph_text(next_element).strip()
+                    if next_text:
+                        break
+                if not options and paragraph_options(next_text):
+                    continue
+                context = "\n".join(
+                    dict.fromkeys(
+                        part
+                        for part in (academic_section, question_context, option_context, label)
+                        if part
+                    )
+                )
+                if i + 1 >= len(body):
+                    if new_prompt and not SECTION.match(label):
+                        unrecognized.append({"label": label, "context": context})
                     continue
                 following = body[i + 1]
                 if "paragraph" not in following or not plain_container([following]):
+                    if new_prompt and not SECTION.match(label):
+                        unrecognized.append({"label": label, "context": context})
                     continue
                 # Only a label followed by an actual answer paragraph. A heading followed
                 # by instructions (not a blank paragraph) is never treated as a fill slot.
                 current = paragraph_text(following).strip()
-                if current and not re.search(
-                    r"特徴|共通点|回答|答え|まとめ|考察|answer", label, re.I
+                if (
+                    inline_slots(paragraph_text(following))
+                    or re.sub(r"[〔〕【】［］\[\]\s]", "", current)
+                    in {"理由", "回答", "答え", "解答"}
+                    or (
+                        current
+                        and (
+                            SECTION.match(current)
+                            or paragraph_options(current)
+                            or WRITTEN_PROMPT.search(current)
+                            or (SECTION.match(label) and re.search(r"[?？]$", current))
+                        )
+                    )
+                ):
+                    if new_prompt and not SECTION.match(label):
+                        unrecognized.append({"label": label, "context": context})
+                    continue
+                if (
+                    current
+                    and not written_prompt
+                    and not new_prompt
+                    and not re.search(r"特徴|共通点|回答|答え|まとめ|考察|answer", label, re.I)
                 ):
                     continue
+                # Existing field IDs and hashes remain valid for cached keyword and
+                # written-answer mappings. Newly recognized prompts include section
+                # context so repeated "その理由は？" labels cannot collide.
+                old_field = bool(legacy_prompt and not options and not reason_prompt)
+                if old_field:
+                    field_id, field_context, field_hash = (
+                        f"{tab['id']}/after:{digest(label)[:16]}",
+                        label,
+                        digest(label),
+                    )
+                else:
+                    count_key = (academic_section, label)
+                    occurrence = prompt_counts.get(count_key, 0)
+                    prompt_counts[count_key] = occurrence + 1
+                    field_id = f"{tab['id']}/after:{digest([context, occurrence])[:16]}"
+                    field_context, field_hash = context, digest(context)
                 fields.append(
                     {
-                        "id": f"{tab['id']}/after:{digest(label)[:16]}",
+                        "id": field_id,
                         "tab_id": tab["id"],
-                        "label": label,
-                        "context": label,
-                        "context_sha256": digest(label),
+                        "label": ("選択（" + "／".join(options) + "）") if options else label,
+                        "context": field_context,
+                        "context_sha256": field_hash,
                         "index": following["startIndex"],
                         "current": current,
+                        **({"kind": "selection", "options": options} if options else {}),
                     }
                 )
+                answer_paragraphs.add(i + 1)
     return {
         "document_id": document["documentId"],
         "revision_id": document.get("revisionId"),
         "topology": topology,
         "fields": fields,
+        "unrecognized_questions": unrecognized,
         "question_sha256": digest([[f["id"], f["context_sha256"]] for f in fields]),
     }
 
 
-def plan_fill(document, answers):
-    form = inspect_form(document)
+def plan_fill(document, answers, *, student_profile=None):
+    include_identity = student_profile is not None
+    profile = (student_profile or StudentProfile()).validated()
+    form = inspect_form(document, include_identity=include_identity)
     if not form["revision_id"]:
         raise PermissionDenied("未读到可编辑的文档版本，不能填入。")
     lookup = {f["id"]: f for f in form["fields"]}
     seen, requests, expected, conflicts = set(), [], {}, []
     if not isinstance(answers, list) or not answers:
         raise WorkflowError("没有可映射到原文档答案栏的实际答案。初稿已保留。")
+    answers = list(answers)
+    identity_warnings = []
+    for field in form["fields"]:
+        if not field.get("identity_key"):
+            continue
+        if any(a.get("field_id") == field["id"] for a in answers):
+            raise WorkflowError("身份栏只能采用私人学生资料自动填写，不能由模型指定。")
+        value = getattr(profile, field["identity_key"])
+        if not value:
+            if not field["current"]:
+                identity_warnings.append(f"{field['label']}尚无已保存的学生资料，身份栏仍为空。")
+            continue
+        if field["current"] and field["current"] != value:
+            identity_warnings.append(f"{field['label']}已有内容与学生资料不同，已保留，请核对。")
+            continue
+        answers.append(
+            {"field_id": field["id"], "context_sha256": field["context_sha256"], "text": value}
+        )
     for answer in answers:
         key, text = answer.get("field_id"), answer.get("text")
         if key in seen or key not in lookup:
@@ -228,36 +408,59 @@ def plan_fill(document, answers):
         ):
             raise WorkflowError("答案包含无效文字或内部证据标记；未修改文档。")
         text = text.strip()
+        if field.get("choices") and text not in field["choices"]:
+            raise WorkflowError("文档勾选栏只接受原栏允许的选中标记；未修改文档。")
+        if field.get("kind") == "selection":
+            allowed = {re.sub(r"\s+", "", option) for option in field["options"]} | {
+                re.match(r"[①-⑳]|[（(]?[1-9][)）.．]", option)[0] for option in field["options"]
+            }
+            if re.sub(r"\s+", "", text) not in allowed:
+                raise WorkflowError("文档选择栏只接受原题列出的选项；未修改文档。")
         expected[key] = text
         if field["current"] == text:
             continue
         if field["current"]:
             conflicts.append(key)
             continue
-        requests.append(
+        edits = []
+        if field.get("end_index", field["index"]) > field["index"]:
+            edits.append(
+                {
+                    "deleteContentRange": {
+                        "range": {
+                            "startIndex": field["index"],
+                            "endIndex": field["end_index"],
+                            "tabId": field["tab_id"],
+                        }
+                    }
+                }
+            )
+        edits.append(
             {
                 "insertText": {
                     "location": {"index": field["index"], "tabId": field["tab_id"]},
-                    "text": text,
+                    "text": field.get("insert_prefix", "") + text,
                 }
             }
         )
+        requests.append((field["tab_id"], field["index"], edits))
     if conflicts:
         raise WorkflowError("保留你已填写的内容，未覆盖答案栏：" + ", ".join(conflicts[:8]))
-    requests.sort(
-        key=lambda r: (r["insertText"]["location"]["tabId"], -r["insertText"]["location"]["index"])
-    )
+    requests.sort(key=lambda r: (r[0], -r[1]))
     return {
         "document_id": form["document_id"],
         "form": form,
         "expected": expected,
-        "requests": requests,
+        "requests": [edit for _, _, edits in requests for edit in edits],
         "write_control": {"requiredRevisionId": form["revision_id"]},
+        "include_identity": include_identity,
+        "identity_warnings": identity_warnings,
     }
 
 
 def verify_fill(before, after, plan):
-    original, actual = inspect_form(before), inspect_form(after)
+    original = inspect_form(before, include_identity=plan.get("include_identity", False))
+    actual = inspect_form(after, include_identity=plan.get("include_identity", False))
     if (
         actual["document_id"] != plan["document_id"]
         or actual["topology"] != original["topology"]
@@ -272,8 +475,16 @@ def verify_fill(before, after, plan):
     # are expected; editable paragraphs are checked separately against exact answers.
     def signature(document, form):
         editable = {
-            (f["tab_id"], f["index"]) for f in form["fields"] if f["id"] in plan["expected"]
+            (f["tab_id"], f["index"])
+            for f in form["fields"]
+            if f["id"] in plan["expected"] and "span" not in f
         }
+        inline = {}
+        for field in form["fields"]:
+            if field["id"] in plan["expected"] and "span" in field:
+                inline.setdefault((field["tab_id"], field["paragraph_index"]), []).append(
+                    field["span"]
+                )
 
         def clean(value, tab_id):
             if isinstance(value, list):
@@ -282,6 +493,21 @@ def verify_fill(before, after, plan):
                 return value
             if "paragraph" in value and (tab_id, value.get("startIndex")) in editable:
                 return {"answer_paragraph_style": value["paragraph"].get("paragraphStyle", {})}
+            if "paragraph" in value and (tab_id, value.get("startIndex")) in inline:
+                paragraph = value["paragraph"]
+                return {
+                    **{
+                        k: clean(v, tab_id)
+                        for k, v in value.items()
+                        if k not in {"startIndex", "endIndex", "paragraph"}
+                    },
+                    "paragraph": {
+                        **{k: clean(v, tab_id) for k, v in paragraph.items() if k != "elements"},
+                        "elements": protected_inline_runs(
+                            paragraph["elements"], inline[(tab_id, value["startIndex"])]
+                        ),
+                    },
+                }
             return {
                 k: clean(v, tab_id) for k, v in value.items() if k not in {"startIndex", "endIndex"}
             }
@@ -290,13 +516,27 @@ def verify_fill(before, after, plan):
 
     if signature(before, original) != signature(after, actual):
         raise WorkflowError("写入后非答案内容或原格式发生变化，请在文档中核对。")
+    verified_by_kind = {}
+    for key in plan["expected"]:
+        kind = fields[key].get("kind", "paragraph")
+        verified_by_kind[kind] = verified_by_kind.get(kind, 0) + 1
+    remaining_required = [
+        {key: field[key] for key in ("id", "label", "context")}
+        for field in required_answer_fields(actual)
+        if not field["current"]
+    ]
+    unknown_questions = actual.get("unrecognized_questions", [])
     return {
-        "status": "filled_verified",
+        "status": "partial" if remaining_required or unknown_questions else "filled_verified",
         "document_id": actual["document_id"],
         "url": f"https://docs.google.com/document/d/{actual['document_id']}/edit",
         "verified_fields": len(plan["expected"]),
+        "verified_by_kind": verified_by_kind,
+        "identity_warnings": plan.get("identity_warnings", []),
         "remaining_empty_fields": [f["id"] for f in actual["fields"] if not f["current"]],
-        "inserted_fields": len(plan["requests"]),
+        "remaining_required_fields": remaining_required,
+        "unrecognized_questions": unknown_questions,
+        "inserted_fields": sum("insertText" in request for request in plan["requests"]),
         "revision_id": actual["revision_id"],
         "answers_sha256": digest(plan["expected"]),
         "question_sha256": actual["question_sha256"],
@@ -400,7 +640,15 @@ def own_document_ids(reader, course_id, assignment_id):
 
 
 def fill_personal_document(
-    reader, documents, *, course_id, assignment_id, document_id, answers, record_dir: Path
+    reader,
+    documents,
+    *,
+    course_id,
+    assignment_id,
+    document_id,
+    answers,
+    record_dir: Path,
+    student_profile=None,
 ):
     """Fresh personal-submission allowlist, private lock/plan/receipt and verified write."""
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,200}", document_id):
@@ -421,7 +669,7 @@ def fill_personal_document(
         ):
             raise PermissionDenied("文档必须由当前学校账户拥有并可编辑，不修改共享的教师原件。")
         before = documents.get(document_id)
-        plan = plan_fill(before, answers)
+        plan = plan_fill(before, answers, student_profile=student_profile)
         attempt_dir = record_dir / "attempts" / uuid.uuid4().hex
         attempt_dir.mkdir(parents=True)
         if not (record_dir / "original.json").exists():
@@ -528,20 +776,44 @@ def fill_review(settings, package, *, progress=lambda _: None):
             / manifest["course_id"]
             / manifest["assignment_id"]
             / doc_id,
+            student_profile=StudentProfile.load(settings.data_dir),
         )
         receipts.append(receipt)
-        progress("已填入并核验个人文档，可以直接打开审阅；尚未提交")
+        progress(
+            "已填入部分答案，仍有题目待补全"
+            if receipt["status"] == "partial"
+            else "已填入并核验个人文档，可以直接打开审阅；尚未提交"
+        )
     if not receipts:
         raise WorkflowError("这项作业没有可填入的个人 Google 文档，请查看作业要求。")
+    remaining_required = [
+        {**field, "document_id": receipt["document_id"]}
+        for receipt in receipts
+        for field in receipt.get("remaining_required_fields", [])
+    ]
+    unknown_questions = [
+        {**question, "document_id": receipt["document_id"]}
+        for receipt in receipts
+        for question in receipt.get("unrecognized_questions", [])
+    ]
     result = {
-        "status": "filled_verified",
+        "status": "partial"
+        if remaining_required
+        or unknown_questions
+        or any(receipt["status"] == "partial" for receipt in receipts)
+        else "filled_verified",
         "documents": receipts,
+        "remaining_required_fields": remaining_required,
+        "unrecognized_questions": unknown_questions,
         "submission": "manual_only",
         "generation": {
             k: generation.get(k)
             for k in ("model", "reasoning_effort", "thread_id", "turn_id", "finished_at")
         },
         "draft_sha256": validated["draft_sha256"],
+        "identity_warnings": [
+            warning for receipt in receipts for warning in receipt.get("identity_warnings", [])
+        ],
     }
     atomic_json(package / "document-fill.json", result)
     return result

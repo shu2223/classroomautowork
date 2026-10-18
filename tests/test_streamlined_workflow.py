@@ -141,6 +141,42 @@ def test_retry_fill_failure_does_not_download_or_generate_again(tmp_path, monkey
     assert calls[0][1]["ai_confirmed"] is True
 
 
+@pytest.mark.parametrize("mapped", [True, False])
+def test_main_button_retries_only_fill_when_document_mapping_exists(tmp_path, monkeypatch, mapped):
+    jobs = FrontendJobs(unit_settings(tmp_path))
+    target = {"course_id": "1", "assignment_id": "2"}
+    atomic_json(jobs.root / "pending.json", {"assignments": [target]})
+    atomic_json(
+        jobs.root / "codex-models.json",
+        {
+            "default_model": "offline-model",
+            "default_effort": None,
+            "models": [{"model": "offline-model"}],
+        },
+    )
+    generation = {"status": "completed"}
+    if mapped:
+        generation["document_answers_sha256"] = "verified-mapping-hash"
+    item = {
+        **target,
+        "status": "needs_document",
+        "package": str(tmp_path),
+        "generation": generation,
+    }
+    jobs._jobs["last"] = {
+        "kind": "review",
+        "ai_confirmed": True,
+        "items": [item],
+        "created_at": "2026-01-01",
+    }
+    calls = []
+    monkeypatch.setattr(jobs, "_start", lambda *args, **kw: calls.append((args, kw)))
+    jobs.start_selected([target], ai_confirmed=True)
+    assert calls[0][0][0] == ("fill" if mapped else "review")
+    if mapped:
+        assert calls[0][0][1][0]["package"] == str(tmp_path)
+
+
 def test_old_results_survive_more_than_thirty_refresh_jobs(tmp_path):
     jobs = FrontendJobs(unit_settings(tmp_path))
     jobs._jobs["old-result"] = {

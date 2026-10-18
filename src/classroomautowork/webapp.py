@@ -388,7 +388,7 @@ def existing_server(info_path: Path):
     return None
 
 
-def serve(settings: Settings | None = None, *, open_browser=True, port=0):
+def serve(settings: Settings | None = None, *, open_browser=True, port=0, token=None):
     settings = (settings or Settings.load()).validated()
     ui_root = settings.data_dir / "ui"
     ui_root.mkdir(parents=True, exist_ok=True)
@@ -405,7 +405,7 @@ def serve(settings: Settings | None = None, *, open_browser=True, port=0):
         raise WorkflowError("本机助手正在启动或运行，请稍后重新打开。") from None
     server = None
     try:
-        server = LocalServer(FrontendJobs(settings), port)
+        server = LocalServer(FrontendJobs(settings), port, token=token)
         atomic_json(info_path, {"port": server.server_port, "token": server.token})
         if open_browser:
             webbrowser.open(server.browser_url)

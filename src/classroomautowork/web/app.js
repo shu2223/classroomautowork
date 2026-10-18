@@ -14,6 +14,13 @@ const connection = {lastSuccess: 0, error: null};
 // Pure progress presentation; exercised by offline state tests.
 function durationLabel(ms) { const s = Math.max(0, Math.floor(ms / 1000)); return s < 60 ? `${s} 秒` : s < 3600 ? `${Math.floor(s / 60)} 分 ${s % 60} 秒` : `${Math.floor(s / 3600)} 小时 ${Math.floor(s % 3600 / 60)} 分`; }
 function ageOf(at, now) { const value = Date.parse(at); return Number.isFinite(value) ? Math.max(0, now - value) : null; }
+function documentContentGaps(fill) {
+  return ["remaining_required_fields", "unrecognized_questions"].flatMap(key => fill?.[key]?.length ? fill[key] : (fill?.documents || []).flatMap(doc => doc[key] || []));
+}
+function documentAnswersIncomplete(item) {
+  const fill = item?.document_fill;
+  return !!(item?.requires_regeneration || documentContentGaps(fill).length || fill?.status === "partial" || fill?.documents?.some(doc => doc.status === "partial"));
+}
 function inputAction(item) {
   if (!item.package) return null;
   const count = (item.form_fill?.forms || []).flatMap(f=>f.remaining_fields || []).filter(f=>f.required).length;
@@ -24,7 +31,7 @@ function completedSuccessor(job, jobs) {
   const key = keyOf(job.items[0]);
   const latest = [...jobs].filter(x=>["fill", "review"].includes(x.kind) && x.created_at > job.created_at && x.items.some(item=>keyOf(item) === key)).sort((a,b)=>b.created_at.localeCompare(a.created_at))[0];
   const item = latest?.items.find(x=>keyOf(x) === key);
-  return ["form_opened", "document_ready"].includes(item?.status) ? {job:latest,item} : null;
+  return ["form_opened", "document_ready"].includes(item?.status) && !documentAnswersIncomplete(item) ? {job:latest,item} : null;
 }
 function aiActivity(generation) {
   if (!generation?.thread_id || !/^[a-f0-9-]{36}$/i.test(generation.thread_id)) return null;
@@ -32,6 +39,113 @@ function aiActivity(generation) {
   const tools = completed.filter(x=>["commandExecution", "mcpToolCall", "webSearch", "imageView", "dynamicToolCall"].includes(x.type)).length;
   const updates = Number.isSafeInteger(generation.activity_count) && generation.activity_count > 0 ? generation.activity_count : 0;
   return {generation, text:[updates ? `已收到 ${updates.toLocaleString("zh-CN")} 次实际活动更新` : "真实会话已创建，等待模型活动更新", tools ? `已完成 ${tools} 次工具活动` : null].filter(Boolean).join(" · ")};
+}
+function estimateDuration(seconds) { return durationLabel(Math.max(1, Math.ceil(seconds)) * 1000); }
+function legacyTranscriptionEstimate(job, now) {
+  const p = job.progress || {};
+  if (p.stage !== "transcribe" || p.unit !== "segments" || !p.filename || !Number.isSafeInteger(p.current) || !Number.isSafeInteger(p.total) || p.current < 0 || p.current >= p.total) return null;
+  const started = Date.parse(p.started_at), prefix = `${p.filename} · `, segments = new Map();
+  if (!Number.isFinite(started)) return null;
+  for (const event of job.events || []) {
+    const at = Date.parse(event.at);
+    if (!Number.isFinite(at) || at < started || at > now || !event.message?.startsWith(prefix)) continue;
+    const message = event.message.slice(prefix.length);
+    const begin = message.match(/^正在处理录像第 (\d+)\/(\d+) 段（([\d.]+)[–-]([\d.]+) 秒）$/);
+    const infer = message.match(/^Buzz 大模型 .+ 正在本机转录第 (\d+)\/(\d+) 段，完成后缓存$/);
+    const done = message.match(/^已完成并缓存 (\d+)\/(\d+) 段带时间戳转录$/);
+    const match = begin || infer || done;
+    if (!match || Number(match[2]) !== p.total) continue;
+    const index = Number(match[1]);
+    if (index < 1 || index > p.total) continue;
+    if (begin) segments.set(index, {started:at, offset:Number(begin[3]), seconds:Number(begin[4]) - Number(begin[3])});
+    else {
+      const segment = segments.get(index);
+      if (segment && infer) segment.infer = at;
+      if (segment && done) segment.done = at;
+    }
+  }
+  // Cached segments have no inference event. Never divide an old stage start by
+  // a completion count, which can contain an arbitrary number of cache hits.
+  const samples = [...segments.entries()].filter(([index, s]) => index <= p.current && s.seconds > 0 && s.infer >= s.started && s.done - s.infer >= 1000).slice(-5).map(([, s]) => ({rate:(s.done - s.started) / 1000 / s.seconds, seconds:s.seconds}));
+  const current = segments.get(p.current + 1);
+  if (samples.length < 2 || !current || current.done || current.seconds <= 0) return null;
+  const weight = samples.reduce((sum, _, index) => sum + index + 1, 0);
+  const rate = samples.reduce((sum, sample, index) => sum + sample.rate * (index + 1), 0) / weight;
+  const lowerRate = Math.min(...samples.map(s => s.rate)) * 0.85, upperRate = Math.max(...samples.map(s => s.rate)) * 1.25;
+  const elapsed = (now - current.started) / 1000;
+  const raw = {observed_at:new Date(now).toISOString(), state:"estimating", overall:{scope_complete:false, unknown_tasks:1}, stage:{unit:"media_seconds", speed:1 / rate, source:"live", confidence:"low"}};
+  if (elapsed > current.seconds * upperRate) return {...raw, state:"calibrating", reason:"当前分段已超过已测耗时范围，等待本段完成后重新校准。"};
+  const futureSegments = p.total - p.current - 1;
+  const segmentSeconds = Math.max(...samples.map(s => s.seconds), current.seconds);
+  // The segment's start offset is stable. A live media counter can already
+  // include this segment's progress, so subtracting elapsed from it again
+  // would count the same work twice.
+  const measuredTotal = Number.isFinite(p.media_total_seconds) && p.media_total_seconds > current.offset;
+  const remainingMedia = measuredTotal ? p.media_total_seconds - current.offset : current.seconds + futureSegments * segmentSeconds;
+  const shortestMedia = measuredTotal || !futureSegments ? remainingMedia : Math.max(current.seconds, remainingMedia - segmentSeconds);
+  if (!futureSegments && elapsed >= remainingMedia * rate) return {...raw, state:"calibrating", reason:"最后一段已超过本次预测耗时，等待本段完成后重新校准。"};
+  raw.stage.remaining_seconds = Math.max(1, Math.round(remainingMedia * rate - elapsed));
+  raw.stage.lower_seconds = Math.max(1, Math.floor(shortestMedia * lowerRate - elapsed));
+  raw.stage.upper_seconds = Math.max(raw.stage.remaining_seconds, Math.ceil(remainingMedia * upperRate - elapsed));
+  Object.assign(raw.overall, {known_remaining_seconds:raw.stage.remaining_seconds, known_lower_seconds:raw.stage.lower_seconds, known_upper_seconds:raw.stage.upper_seconds, known_task_count:1});
+  raw.reason = `依据本文件最近 ${samples.length} 段的实际转录与音轨准备耗时估算。${measuredTotal || !futureSegments ? "" : "未报告的末段按完整分段上限计入，实际可能更短。"}其余附件、课程和作答耗时尚未计入。`;
+  return raw;
+}
+function estimateView(job, disconnected, now, stage) {
+  const legacyEstimate = !job.estimate ? legacyTranscriptionEstimate(job, now) : null;
+  const raw = job.estimate || legacyEstimate || {}, step = raw.stage || {}, overall = raw.overall || {};
+  const nonnegative = value => Number.isFinite(value) && value >= 0;
+  const positive = value => nonnegative(value) && value > 0;
+  const active = activeStates.has(job.status), observed = Date.parse(raw.observed_at);
+  let status = raw.state || "calibrating";
+  if (!active) status = job.status === "completed" ? "complete" : job.status === "paused" ? "paused" : "stopped";
+  else if (job.status === "stopping" || job.approval || ["approval", "authorization"].includes(stage)) status = "paused";
+  else if (disconnected || (Number.isFinite(observed) && (now - observed > 12000 || observed - now > 5000))) status = "stale";
+  else if (!Number.isFinite(observed)) status = "calibrating";
+  else if (!["estimating", "calibrating", "paused", "stale"].includes(status)) status = "calibrating";
+  const usable = active && status === "estimating";
+  const range = value => nonnegative(value.lower_seconds) && positive(value.upper_seconds) && value.lower_seconds <= value.remaining_seconds && value.upper_seconds >= value.remaining_seconds ? `通常 ${estimateDuration(value.lower_seconds)}–${estimateDuration(value.upper_seconds)}` : null;
+  const wholeStageRemaining = usable && positive(step.remaining_seconds) ? step.remaining_seconds : null;
+  const phaseRemaining = usable && positive(step.phase_remaining_seconds) ? step.phase_remaining_seconds : null;
+  const stageRemaining = wholeStageRemaining ?? phaseRemaining;
+  const overallRemaining = usable && positive(overall.remaining_seconds) ? overall.remaining_seconds : null;
+  const knownRemaining = usable && positive(overall.known_remaining_seconds) ? overall.known_remaining_seconds : null;
+  const unknown = Number.isSafeInteger(overall.unknown_tasks) && overall.unknown_tasks > 0 ? overall.unknown_tasks : 0;
+  const scopeComplete = overall.scope_complete === true && !unknown;
+  const percent = status === "complete" ? 100 : usable && scopeComplete && overallRemaining !== null && nonnegative(overall.percent) && overall.percent < 100 ? overall.percent : null;
+  let headline = {calibrating:"正在校准剩余时间", paused:job.status === "stopping" ? "正在暂停 · 剩余时间已冻结" : "等待继续 · 暂不估计完成时间", stale:"等待新状态 · 剩余时间已暂停更新", complete:"本次处理已结束", stopped:"本次处理已停止"}[status] || "正在估计剩余时间";
+  if (overallRemaining !== null) headline = `${scopeComplete ? "预计总共还需" : "已知工作预计还需"} ${estimateDuration(overallRemaining)}`;
+  else if (knownRemaining !== null) headline = `已知工作预计还需 ${estimateDuration(knownRemaining)}（其余未计入）`;
+  else if (usable) headline = stageRemaining === null ? "正在重新校准剩余时间" : "总剩余时间尚待估计";
+  let finish = null;
+  if (overallRemaining !== null && scopeComplete) {
+    const target = observed + overallRemaining * 1000;
+    if (Number.isFinite(target) && target <= 8640000000000000) finish = `预计完成 ${new Intl.DateTimeFormat("zh-CN", {timeZone:"Asia/Tokyo", month:"2-digit", day:"2-digit", hour:"2-digit", minute:"2-digit", hourCycle:"h23"}).format(new Date(target))}（日本时间）`;
+  }
+  let speed = null;
+  const phase = step.phase || job.progress?.phase;
+  if (usable && positive(step.speed)) {
+    const speedNumber = value => value >= 10 ? value.toFixed(1) : value.toFixed(2);
+    speed = step.unit === "media_seconds" ? `${phase === "prepare" ? "音频准备" : "Buzz"} ${speedNumber(step.speed)}× 实时` : step.unit === "bytes" ? `下载 ${speedNumber(step.speed / 1048576)} MB/s` : step.unit === "pages" ? `文档处理 ${speedNumber(step.speed)} 页/s` : null;
+  }
+  const source = {live:"本次实测速率", history:"同类历史耗时", mixed:"本次实测 + 同类历史"}[step.source];
+  const confidence = {low:"可信度较低", medium:"可信度中等", high:"可信度较高"}[step.confidence];
+  const stepLabel = stage === "transcribe" ? "本文件转录" : "本步骤";
+  const phaseLabel = stage === "transcribe" ? phase === "prepare" ? "本段音频准备" : "本段语音识别" : "当前子步骤";
+  const stageText = stageRemaining === null ? null : `${wholeStageRemaining === null ? phaseLabel : stepLabel}预计还需 ${estimateDuration(stageRemaining)}`;
+  const phaseText = wholeStageRemaining !== null && phaseRemaining !== null && stage === "transcribe" ? `${phaseLabel}预计还需 ${estimateDuration(phaseRemaining)}` : null;
+  const notes = [];
+  if (usable && !scopeComplete) notes.push(legacyEstimate ? "还有课程或附件尚未发现完整工作量，总剩余时间尚不能确定。" : unknown ? `还有 ${unknown} 项工作量待确认，暂不显示总百分比。` : "完整工作量尚未确认，总时间会随资料发现而调整。");
+  if (status === "calibrating") notes.push("正在收集本机速度或等待足够的同类记录，暂不提供不可靠的倒计时。");
+  if (!job.estimate && !legacyEstimate && active && status === "calibrating") notes.push("本次任务由旧版服务启动，尚未提供完整时间估计；有足够的分段实测记录后可先估计当前文件。其余课程或附件工作量尚未确认。");
+  if (status === "stale") notes.push("旧估计已冻结，收到新状态后重新计算。");
+  const reasons = {measured_rate:"根据本机处理速度与同类记录动态估算。", awaiting_measurements:"速度样本不足，等待处理进展后重新估计。", remaining_phases_uncalibrated:"已测到当前速度；其他处理阶段仍在校准，暂时不能估计完整剩余时间。", progress_not_updated:"处理计数暂未更新，收到新进展后重新估计。", waiting_for_resume:"继续运行后重新计算剩余时间。", complete:"处理已结束。", stopped:"处理已停止。"};
+  const reason = typeof raw.reason === "string" ? raw.reason.trim() : "";
+  if (active && reason) { const message = reasons[reason] || (/[\u3400-\u9fff]/u.test(reason) ? reason : null); if (message) notes.push(message); }
+  const finished = (job.items || []).filter(x => ["ready", "document_ready", "document_needs_user", "form_opened", "needs_form", "needs_document", "needs_user", "materials_ready", "failed"].includes(x.status)).length;
+  const countText = (job.items || []).length ? `已处理 ${finished}/${job.items.length} 项` : "正在确认工作量";
+  const knownRange = knownRemaining === null ? null : range({remaining_seconds:knownRemaining, lower_seconds:overall.known_lower_seconds, upper_seconds:overall.known_upper_seconds});
+  return {state:status, headline, percent, progressTitle:percent === null ? "作业项进度" : "总进度（估计）", percentText:percent === null ? countText : `${Math.floor(percent)}%`, scopeComplete, unknown, stageRemaining, phaseRemaining, overallRemaining, knownRemaining, stageText, phaseText, stageRange:wholeStageRemaining === null ? null : range(step), range:overallRemaining === null ? knownRange : range(overall), finish, speed, basis:usable ? [source,confidence].filter(Boolean).join(" · ") || null : null, note:notes.join(" ") || null};
 }
 function progressView(job, network, now = Date.now()) {
   const items = job.items || [], p = job.progress || {}, active = activeStates.has(job.status);
@@ -45,6 +159,7 @@ function progressView(job, network, now = Date.now()) {
   const descriptions = {
     prepare: ["准备题目与课堂资料", "读取作业要求、同课程资料、历史作业和公告；这一阶段还未调用 AI。"],
     course_sync: ["同步课程内容", "读取学校账户内的课程记录，查找本次作业的来源。"],
+    course_prepared: ["本课程资料已准备", "本课程的资料与附件已核对，继续整理所选作业。"],
     form_read: ["读取表单的全部题目", "只读获取 Google Forms 所有分页的题目和选项，身份页之后的题目也会加入本次作业要求。"],
     attachment: ["核验课程附件", "检查文件权限、版本与缓存，只处理新增或修改的材料。"],
     download: ["下载课程附件", "下载量来自真实收到的字节；大文件可能耗时，之后还要校验完整性。"],
@@ -52,6 +167,7 @@ function progressView(job, network, now = Date.now()) {
     extract: ["提取文档文字和页图", "逐页读取内容并保留必要图像，供 Codex 阅读题目与课堂资料。"],
     transcribe: ["Buzz 大模型正在本机转录录像", "使用本地 Whisper 大模型分段识别语音并保存时间戳。单段处理期间计数可能暂时不变，完成后继续更新。"],
     attachment_done: ["附件内容已准备", "材料已处理并缓存，继续检查其他附件。"],
+    attachment_failed: ["这份附件未能处理完成", "已保留具体原因，继续检查其他资料；请在处理记录中核对受影响的附件。"],
     document_inspect: ["核对作业填写方式", "检查有无个人 Google 文档答案栏；模型逐栏作答后，自动填入个人文档或原表单。"],
     document_create: ["创建本人作业文档", "在当前作业页面创建个人ドキュメントシート，核验实际附件和编辑权限后继续作答；不会提交。"],
     ai: ["Codex 正在阅读与作答", "使用所选模型分析真实题目和资料。AI 没有可测量的总百分比；显示实际活动与会话入口。"],
@@ -62,10 +178,12 @@ function progressView(job, network, now = Date.now()) {
     authorization: ["等待 Google 授权", "请在 Google 页面完成学校账户授权，然后返回助手。"],
   };
   let [title, explanation] = descriptions[stage] || descriptions.prepare;
+  if (stage === "transcribe" && p.phase === "prepare") { title = "正在准备 Buzz 转录音频"; explanation = "先从录像提取本段音频，再交给 Buzz 识别；音频准备与语音识别分别计量。"; }
   const legacy = active && !job.approval && !job.progress && /^Checking attachment /.test(job.message || "");
   if (legacy) { title = "正在处理课程附件"; explanation = "这次由旧版启动，未报告附件内部的子步骤。下载、提取或转录可能耗时，保持任务运行，无需重新开始。"; }
-  const ready = items.filter(x => ["document_ready", "document_needs_user", "form_opened"].includes(x.status) || x.document_fill?.documents?.length || x.form_fill?.forms?.some(f=>f.prefilled_fields > 0)).length;
-  const localReady = items.filter(x => x.status === "ready" || x.answer_document).length;
+  const ready = items.filter(x => !documentAnswersIncomplete(x) && (["document_ready", "document_needs_user", "form_opened"].includes(x.status) || x.document_fill?.documents?.length || x.form_fill?.forms?.some(f=>f.prefilled_fields > 0))).length;
+  const localReady = items.filter(x => !documentAnswersIncomplete(x) && (x.status === "ready" || x.answer_document)).length;
+  const incompleteDocuments = items.filter(documentAnswersIncomplete).length;
   const failed = items.filter(x => x.status === "failed").length;
   const needsInput = items.filter(x => ["needs_user", "document_needs_user", "needs_document", "needs_form"].includes(x.status)).length;
   const finished = items.filter(x => ["ready", "document_ready", "document_needs_user", "form_opened", "needs_form", "needs_document", "needs_user", "materials_ready", "failed"].includes(x.status)).length;
@@ -91,15 +209,28 @@ function progressView(job, network, now = Date.now()) {
     const unit = {pages:"页", segments:"段"}[p.unit] || "项", format = v => p.unit === "bytes" ? `${(v / 1048576).toFixed(1)} MB` : String(v);
     measurement = {value:p.current, max:p.total, text:p.unit === "bytes" ? `已下载 ${format(p.current)} / ${format(p.total)}` : `已完成 ${format(p.current)} / ${format(p.total)} ${unit}`};
   }
+  const measurableSeconds = (current,total) => Number.isFinite(current) && Number.isFinite(total) && total > 0 && current >= 0 && current <= total;
+  if (active && stage === "transcribe") {
+    if (p.phase === "prepare") {
+      measurement = measurableSeconds(p.phase_current_seconds,p.phase_total_seconds) ? {value:p.phase_current_seconds,max:p.phase_total_seconds,text:`本段音频已准备 ${durationLabel(p.phase_current_seconds * 1000)} / ${durationLabel(p.phase_total_seconds * 1000)}`} : null;
+    } else if (measurableSeconds(p.media_current_seconds,p.media_total_seconds)) {
+      measurement = {value:p.media_current_seconds,max:p.media_total_seconds,text:`本文件已转录 ${durationLabel(p.media_current_seconds * 1000)} / ${durationLabel(p.media_total_seconds * 1000)} 音频${Number.isSafeInteger(p.current) && Number.isSafeInteger(p.total) && p.total > 0 && p.current >= 0 && p.current <= p.total ? ` · ${p.current}/${p.total} 段` : ""}`};
+    }
+  }
+  if (active && stage === "ai") measurement = null;
+  if (measurement) { measurement.percent = Math.floor(measurement.value / measurement.max * 100); measurement.text += ` · ${measurement.percent}%（实测）`; }
   if (!active) {
     title = failed && stage === "validate" ? "结果核验未通过" : ready || localReady ? "答案已交付 · 请审阅" : labels[job.status] || job.status;
     explanation = failed ? `本次 ${failed} 项未完成；请查看具体原因。点击重试会自动核对原题和缓存资料后继续；已生成的答案入口仍保留。` : ready ? "请在已填入的原文档或预填原表单审阅，最后由你手动提交。" : localReady ? (items.some(x => x.answer_document) ? "本机答案文件已生成，请点击打开答案或下载 Word 审阅，最后手动提交。" : "逐题答案已核验；请继续自动填写后在原页面审阅，最后手动提交。") : needsInput ? "这条历史记录尚无可审阅的完整答案。点击重试会自动核对资料并继续作答；调整说明为可选操作。" : "请查看各项作业的结果与审阅提示。";
     const forms = items.flatMap(x=>x.form_fill?.forms || []), remaining = forms.flatMap(f=>f.remaining_fields || []).filter(f=>f.required).length;
     if (ready && remaining) explanation += ` 已准备 ${forms.reduce((n,f)=>n+(f.prefilled_fields || 0),0)} 栏候选答案；${remaining} 项实际个人信息请在原页面审阅时核对，其他答案已交付。`;
+    if (incompleteDocuments) { title = "原文档仍有题目未完成"; explanation = `${incompleteDocuments} 项作业仍有未填写的题目或答案栏。已写入的答案已保留，点击重试会重新核对题目并补全。`; }
   }
   const index = !active && (ready || localReady) ? 3 : ["fill", "form_fill", "document_create"].includes(stage) ? 2 : ["ai", "validate", "approval"].includes(stage) ? 1 : 0;
   const nowOrEnd = job.finished_at ? Date.parse(job.finished_at) : now;
-  return {active, title, explanation, stage, index, measurement, ai, ready, localReady, failed, finished, total:items.length, filename:p.filename || null, attachments:p.attachment_total ? `课程附件 ${p.attachment_index}/${p.attachment_total}` : null, elapsed:ageOf(job.started_at || job.created_at, nowOrEnd), stepElapsed:ageOf(stepAt, nowOrEnd), silence, warning, disconnected, workerAlive:job.runtime?.worker_alive === true, legacy};
+  const estimate = estimateView(job,disconnected,now,stage);
+  const measurementLabel = `当前步骤 · ${measurement ? ["stale","paused"].includes(estimate.state) ? "上次实测进度" : "实测进度" : estimate.state === "stale" ? "等待新状态" : estimate.state === "paused" ? "等待继续" : "实际活动"}`;
+  return {active, title, explanation, stage, index, measurement, measurementLabel, ai, estimate, ready, localReady, failed, finished, total:items.length, filename:p.filename || null, attachments:p.attachment_total ? `课程附件 ${p.attachment_index}/${p.attachment_total}` : null, elapsed:ageOf(job.started_at || job.created_at, nowOrEnd), stepElapsed:ageOf(stepAt, nowOrEnd), silence, warning, disconnected, workerAlive:job.runtime?.worker_alive === true, legacy};
 }
 // End pure progress presentation.
 
@@ -133,15 +264,15 @@ function hasAnswer(item) {
   return !!(item?.answer_document?.files?.["answer.docx"] || item?.document_fill?.documents?.length || item?.form_fill?.forms?.length);
 }
 function delivered(item) {
-  return hasAnswer(item) && ["ready", "document_ready", "document_needs_user", "form_opened"].includes(item.status);
+  return !documentAnswersIncomplete(item) && hasAnswer(item) && ["ready", "document_ready", "document_needs_user", "form_opened"].includes(item.status);
 }
 function selectTargets(visible, selected, latest) {
   return visible.filter(item => !delivered(latest.get(keyOf(item))?.item) && (!selected.size || selected.has(keyOf(item))));
 }
 function filtered() {
   const normalize = value => value.normalize("NFKC").replace(/\s+/g, " ").trim().toLocaleLowerCase();
-  const q = normalize($("searchInput").value), course = $("courseFilter").value, date = $("dateFilter").value, latest = latestItems();
-  return (state.pending?.assignments || []).filter(item => !delivered(latest.get(keyOf(item))?.item) && (!state.hideOverdue || !overdue(item)) && (!course || item.course_id === course) && (!q || normalize((item.title || "") + " " + (item.course_name || "")).includes(q)) && (item.due_local ? (!date || localDay(item.due_local) <= date) : $("includeNoDue").checked)).sort((a,b) => (a.due_utc || "9999").localeCompare(b.due_utc || "9999"));
+  const q = normalize($("searchInput").value), course = $("courseFilter").value, date = $("dateFilter").value;
+  return (state.pending?.assignments || []).filter(item => (!state.hideOverdue || !overdue(item)) && (!course || item.course_id === course) && (!q || normalize((item.title || "") + " " + (item.course_name || "")).includes(q)) && (item.due_local ? (!date || localDay(item.due_local) <= date) : $("includeNoDue").checked)).sort((a,b) => (a.due_utc || "9999").localeCompare(b.due_utc || "9999"));
 }
 function targets() { return selectTargets(filtered(), state.selected, latestItems()); }
 function saveOptions() {
@@ -190,13 +321,32 @@ function resultAction(job, item) {
   const link = safeLink(doc?.url || form?.url, doc ? "打开文档 ↗" : "打开表单 ↗", "button primary small-button");
   return link || button("打开答案", "button primary small-button", () => openReview(job.id, keyOf(item), "draft"));
 }
+function documentFillSummary(fill) {
+  const counts = {}, documents = fill?.documents || [];
+  for (const doc of documents) for (const [kind, count] of Object.entries(doc.verified_by_kind || {})) counts[kind] = (counts[kind] || 0) + count;
+  const labels = {choice:"处勾选", reason:"条理由", keyword:"个关键词", paragraph:"项文字答案", identity:"栏姓名/学号"};
+  const parts = Object.entries(labels).filter(([kind]) => counts[kind]).map(([kind, label]) => `${counts[kind]} ${label}`);
+  if (!parts.length) {
+    const total = documents.reduce((sum, doc) => sum + (doc.verified_fields || 0), 0);
+    if (total) parts.push(`${total} 栏答案`);
+  }
+  return parts.length ? "已回读核验：" + parts.join(" · ") : "";
+}
+function appendDocumentReceipt(parent, fill) {
+  const summary = documentFillSummary(fill);
+  if (summary) parent.append(node("p", summary, "small"));
+  const gaps = documentContentGaps(fill);
+  if (gaps.length) parent.append(node("p", `仍有 ${gaps.length} 个题目或答案栏未完成：` + gaps.map(gap => typeof gap === "string" ? gap : gap.label || gap.id || "未识别的题目").join("；"), "small warning"));
+  for (const warning of fill?.identity_warnings || []) parent.append(node("p", warning, "small warning"));
+}
 function assignmentRow(item, record, result = false) {
   const key = keyOf(item), row = node("article", undefined, "assignment-row");
   row.classList.toggle("selected", state.selected.has(key));
   const body = node("div", undefined, "assignment-main"), title = node("div", item.title || item.assignment_id, "assignment-title"), meta = node("div", item.course_name || "课程作业", "assignment-meta");
   body.append(title, meta);
+  appendDocumentReceipt(body, record?.item.document_fill);
   if (!result) {
-    const label = node("label"), check = node("input"); check.type = "checkbox"; check.checked = state.selected.has(key); check.disabled = !!state.active;
+    const label = node("label"), check = node("input"); check.type = "checkbox"; check.checked = state.selected.has(key); check.disabled = !!state.active || delivered(record?.item);
     check.setAttribute("aria-label", "选择作业 " + (item.title || item.assignment_id));
     check.addEventListener("change", () => { check.checked ? state.selected.add(key) : state.selected.delete(key); renderPending(); }); label.append(check, body); row.append(label);
   } else row.append(body);
@@ -209,7 +359,14 @@ function assignmentRow(item, record, result = false) {
     if (savedForm) actions.append(savedForm);
     if (!record.item.document_fill?.documents?.length && !record.item.form_fill?.forms?.length) actions.append(button("Word", "button secondary small-button", () => downloadAnswer(record.job.id, key)));
   } else if (record) {
-    if (["failed", "paused", "interrupted", "needs_user", "needs_document", "needs_form"].includes(record.item.status)) side.append(node("span", "上次未完成 · 可重新开始", "small warning"));
+    if (delivered(record.item)) {
+      side.append(node("span", "答案已生成 · Classroom 尚未提交", "result-status"));
+      actions.append(resultAction(record.job, record.item));
+    } else if (documentAnswersIncomplete(record.item) || ["failed", "paused", "interrupted", "needs_user", "needs_document", "needs_form"].includes(record.item.status)) {
+      side.append(node("span", documentAnswersIncomplete(record.item) ? "仍有题目未完成 · 可重试补全" : labels[record.item.status] || "上次未完成", "small warning"));
+      if (record.item.error) body.append(node("p", friendlyError(record.item.error), "small warning"));
+      if (hasAnswer(record.item)) actions.append(resultAction(record.job, record.item));
+    }
     else if (activeStates.has(record.job.status)) side.append(pill(record.item.status));
   }
   if (record?.item.package) actions.append(button("详情", "text-button small", () => openReview(record.job.id, key)));
@@ -229,28 +386,44 @@ function renderResults() {
   }
 }
 function renderPending() {
-  const pending = state.pending, items = filtered(), latest = latestItems(), visible = new Set(items.map(keyOf));
+  const pending = state.pending, items = filtered(), latest = latestItems(), eligible = items.filter(x => !delivered(latest.get(keyOf(x))?.item)), visible = new Set(eligible.map(keyOf));
   // A filter change must never process a checked assignment hidden from the user.
   state.selected = new Set([...state.selected].filter(key => visible.has(key)));
-  $("navCount").textContent = (pending?.assignments || []).filter(x => !delivered(latest.get(keyOf(x))?.item)).length;
+  $("navCount").textContent = pending?.assignments.length || 0;
   $("visibleCount").textContent = items.length;
   $("refreshTime").textContent = pending ? `同步于 ${dateLabel(pending.refreshed_at, true)}` : "首次使用，点击刷新读取真实作业";
+  $("listHint").textContent = `已同步 ${pending?.assignments.length || 0} 项未提交作业 · 当前显示 ${items.length} 项 · ${items.length - eligible.length} 项已有答案，一键完成会跳过`;
   $("clearFilters").hidden = !($("courseFilter").value || $("searchInput").value || $("dateFilter").value || !$("includeNoDue").checked || state.hideOverdue);
   $("hideOverdue").setAttribute("aria-pressed", String(state.hideOverdue)); $("hideOverdue").textContent = state.hideOverdue ? "已隐藏逾期" : "隐藏已逾期";
-  const checked = items.filter(x => state.selected.has(keyOf(x))).length;
-  $("selectAll").checked = !!items.length && checked === items.length; $("selectAll").indeterminate = checked > 0 && checked < items.length; $("selectAll").disabled = !items.length || !!state.active;
+  const checked = eligible.filter(x => state.selected.has(keyOf(x))).length;
+  $("selectAll").checked = !!eligible.length && checked === eligible.length; $("selectAll").indeterminate = checked > 0 && checked < eligible.length; $("selectAll").disabled = !eligible.length || !!state.active;
   const list = $("assignmentList"); list.replaceChildren();
   if (!items.length) {
     const empty = node("div", undefined, "empty-state");
-    empty.append(node("h3", !pending ? "先同步你的作业" : "当前列表没有待处理作业"), node("p", !pending ? "点击右上方“刷新作业”，读取学校账户的真实待办。" : "已有答案在“待审阅”中，也可以调整筛选或刷新课堂状态。")); list.append(empty);
+    empty.append(node("h3", !pending ? "先同步你的作业" : "当前筛选范围没有作业"), node("p", !pending ? "点击右上方“刷新作业”，读取学校账户的真实待办。" : "可以重置筛选查看所有已同步作业，或刷新课堂状态。")); list.append(empty);
   }
   for (const item of items) list.append(assignmentRow(item, latest.get(keyOf(item))));
   renderResults(); renderDiscovery(); setButtons();
 }
 function updateJob(job) { const at = state.jobs.findIndex(x => x.id === job.id); if (at < 0) state.jobs.unshift(job); else state.jobs[at] = job; }
+function estimatePanel(estimate) {
+  const panel = node("section", undefined, "job-estimate"); panel.dataset.estimateState = estimate.state;
+  const heading = node("div", undefined, "job-estimate-heading");
+  heading.append(node("span", estimate.progressTitle), node("strong", estimate.percentText)); panel.append(heading);
+  const bar = node(estimate.percent === null ? "div" : "progress", undefined, "job-estimated-progress");
+  if (estimate.percent === null) { bar.classList.add("unknown"); bar.setAttribute("aria-hidden", "true"); }
+  else { bar.max = 100; bar.value = estimate.percent; bar.setAttribute("aria-label", `总进度估计 ${estimate.percentText}，会随实际速度调整`); }
+  panel.append(bar, node("p", estimate.headline, "job-eta-main"));
+  if (estimate.range || estimate.finish) panel.append(node("p", [estimate.range,estimate.finish].filter(Boolean).join(" · "), "job-eta-detail"));
+  if (estimate.stageText) panel.append(node("p", [estimate.stageText,estimate.stageRange].filter(Boolean).join(" · "), "job-eta-stage"));
+  if (estimate.phaseText) panel.append(node("p", estimate.phaseText, "job-eta-stage"));
+  if (estimate.speed || estimate.basis) panel.append(node("p", [estimate.speed,estimate.basis].filter(Boolean).join(" · "), "job-speed"));
+  if (estimate.note) panel.append(node("p", estimate.note, "job-estimate-note"));
+  return panel;
+}
 function jobProgress(job) {
   const v = progressView(job, connection), box = node("div", undefined, "job-live-detail");
-  box.dataset.jobId = job.id;
+  box.dataset.jobId = job.id; box.dataset.progressState = v.estimate.state;
   if (["review", "fill"].includes(job.kind) && job.ai_confirmed) {
     const steps = node("ol", undefined, "job-steps");
     const localOnly = !v.active && v.localReady && !v.ready;
@@ -258,7 +431,9 @@ function jobProgress(job) {
     box.append(steps);
   }
   box.append(node("strong", v.title), node("p", v.explanation));
+  box.append(estimatePanel(v.estimate));
   if (v.active) {
+    box.append(node("p", v.measurementLabel, "job-stage-label"));
     const progress = node(v.measurement ? "progress" : "div", undefined, "job-progress");
     progress.setAttribute("aria-label", v.measurement?.text || "活动指示，不代表完成百分比");
     if (v.measurement) { progress.max = v.measurement.max; progress.value = v.measurement.value; }
@@ -327,6 +502,10 @@ function updateProgressClock() {
   for (const box of document.querySelectorAll(".job-live-detail")) {
     const job = state.jobs.find(x => x.id === box.dataset.jobId); if (!job || !activeStates.has(job.status)) continue;
     const v = progressView(job, connection), spans = box.querySelectorAll(".job-times span");
+    box.dataset.progressState = v.estimate.state;
+    const estimate = box.querySelector(".job-estimate");
+    if (estimate && estimate.dataset.estimateState !== v.estimate.state) estimate.replaceWith(estimatePanel(v.estimate));
+    const stageLabel = box.querySelector(".job-stage-label"); if (stageLabel) stageLabel.textContent = v.measurementLabel;
     if (spans.length === 4) { spans[0].textContent = `总耗时 ${durationLabel(v.elapsed || 0)}`; spans[1].textContent = `本步骤 ${durationLabel(v.stepElapsed || 0)}`; spans[2].textContent = v.silence === null ? "尚无处理记录" : `最近进展 ${durationLabel(v.silence)}前`; spans[3].textContent = v.disconnected ? "状态连接中断 · 自动重连中" : `服务连接正常${v.workerAlive ? " · 工作线程仍在运行" : ""}`; spans[3].classList.toggle("warning", v.disconnected); }
     const warning = box.querySelector(".job-warning"); warning.textContent = v.warning || ""; warning.hidden = !v.warning;
   }
@@ -350,8 +529,28 @@ async function pollJob() {
 async function action(path, body) {
   if (state.monitorOnly) { toast("这是只读进度窗口，请返回原作业助手操作。"); return; }
   if (state.busy) return; state.busy = true; setButtons();
-  try { const job = await api(path, "POST", body); updateJob(job); state.active = activeStates.has(job.status) ? job.id : null; state.focus = job.id; renderJobs(); renderPending(); startPolling(); return job; } catch (error) { toast(error.message); } finally { state.busy = false; setButtons(); }
+  try { const job = await api(path, "POST", body); connection.lastSuccess = Date.now(); connection.error = null; updateJob(job); state.active = activeStates.has(job.status) ? job.id : null; state.focus = job.id; renderJobs(); renderPending(); startPolling(); return job; } catch (error) { toast(error.message); } finally { state.busy = false; setButtons(); }
 }
+function pendingRefreshDue(pending, now = Date.now()) {
+  const age = ageOf(pending?.refreshed_at, now);
+  return age === null || age > 15 * 60 * 1000;
+}
+let syncChecking = false, lastSyncCheck = 0, lastRefreshAttempt = 0;
+async function syncWhenIdle() {
+  if (!token || state.monitorOnly || state.active || state.busy || syncChecking || document.hidden || document.querySelector("dialog[open]") || Date.now() - lastSyncCheck < 30000) return;
+  syncChecking = true; lastSyncCheck = Date.now();
+  try {
+    await loadState(); // Also pick up work/refreshes started in another window.
+    if (!state.active && !state.busy && pendingRefreshDue(state.pending) && Date.now() - lastRefreshAttempt > 60000) {
+      lastRefreshAttempt = Date.now();
+      await action("/api/refresh", {});
+    }
+  } catch (error) { connection.error = error.message; }
+  finally { syncChecking = false; }
+}
+setInterval(syncWhenIdle, 60000);
+window.addEventListener("focus", syncWhenIdle);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) syncWhenIdle(); });
 async function jobAction(id, verb) { await action(`/api/jobs/${id}/${verb}`, {}); }
 function renderEfforts(preferred) { const model = state.models.models.find(x => x.model === $("modelSelect").value); $("effortSelect").replaceChildren(); const labels = {none: "无", minimal: "最少", low: "低", medium: "中", high: "高", xhigh: "很高", max: "最高", ultra: "极高"}; for (const value of model?.supportedReasoningEfforts || []) { const option = node("option", labels[value.reasoningEffort] || value.reasoningEffort); option.value = value.reasoningEffort; $("effortSelect").append(option); } if (!$("effortSelect").children.length) { const option = node("option", "沿用模型默认"); option.value = ""; $("effortSelect").append(option); } const selected = preferred || model?.defaultReasoningEffort; if ([...$("effortSelect").options].some(x => x.value === selected)) $("effortSelect").value = selected; }
 async function loadModels() { state.modelsLoading = true; setButtons(); $("modelStatus").textContent = "正在从本机 Codex 读取模型与当前配置…"; try { const catalog = await api("/api/codex/models"); state.models = catalog; $("modelSelect").replaceChildren(); for (const model of catalog.models) { const option = node("option", model.displayName || model.model); option.value = model.model; $("modelSelect").append(option); } const saved = localStorage.getItem("classroom-model"); const selected = catalog.models.some(x => x.model === saved) ? saved : catalog.default_model; if (catalog.models.some(x => x.model === selected)) $("modelSelect").value = selected; renderEfforts(saved === selected ? localStorage.getItem("classroom-effort") : selected === catalog.default_model ? catalog.default_effort : null); $("modelStatus").textContent = "来自本机 Codex 目录与配置；实际模型、会话和生成记录会保存在每份结果中。"; } catch (error) { state.models = null; $("modelStatus").textContent = error.message; toast(error.message); } finally { state.modelsLoading = false; setButtons(); } }
@@ -378,12 +577,15 @@ async function openReview(jobId, key, initialTab) {
     const original = safeLink(filled?.url || prefilled?.url || attached?.alternateLink || responseForm?.url, filled ? "打开已填入的文档 ↗" : prefilled ? "打开预填答案表单 ↗" : attached ? "打开原作业文档 ↗" : "打开原作业表单 ↗", "button primary");
     $("originalDocumentAction").replaceChildren(); if (original) $("originalDocumentAction").append(original);
     $("fillDocumentButton").hidden = !data.text["draft.md"] || !!filled || (!responseForm && !data.generation?.document_answers_sha256) || (!!responseForm && !data.generation?.form_answers_sha256);
-    if (filled) $("reviewStatus").textContent = `已自动填入并回读核验 · ${g.model} · 尚未提交`;
+    if (filled) {
+      $("reviewStatus").textContent = `${data.document_fill.identity_warnings?.length ? "答案已填入 · 姓名/学号需核对" : "已自动填入并回读核验"} · ${g?.model || "原模型"} · 尚未提交`;
+      appendDocumentReceipt($("originalDocumentAction"), data.document_fill);
+    }
     else if (prefilled) $("reviewStatus").textContent += ` · 原表单已准备 ${prefilled.prefilled_fields} 栏预填答案，请在原表单审阅`;
     if (prefilled) { const note = node("p", "预填入口会重新带入候选答案；已在 Google 中修改过的内容请从下方原始链接继续审阅。浏览器草稿保存状态以 Google 页面为准。", "small"); $("originalDocumentAction").append(note); const saved = safeLink(prefilled.original_url, "继续 Google 中保存的草稿 ↗"); if (saved) $("originalDocumentAction").append(saved); for (const question of prefilled.needs_user || []) $("originalDocumentAction").append(node("p", question, "small warning")); }
     $("fillDocumentButton").textContent = responseForm ? "自动填入原表单" : "填入已有初稿";
     $("downloadAnswerButton").hidden = !data.text["draft.md"] || state.monitorOnly;
-    if (data.answer_document?.pending_requirements?.length) $("reviewStatus").textContent = `答案已生成 · ${g?.model || "原模型"} · ${data.answer_document.pending_requirements.length} 项审阅提示 · 未提交`;
+    if (!filled && data.answer_document?.pending_requirements?.length) $("reviewStatus").textContent = `答案已生成 · ${g?.model || "原模型"} · ${data.answer_document.pending_requirements.length} 项审阅提示 · 未提交`;
     $("reviewDialog").querySelector(".details-options").open = false; renderTab(initialTab || (data.text["draft.md"] ? "draft" : "assignment")); $("reviewDialog").showModal();
   } catch (error) { toast(error.message); }
 }
@@ -430,7 +632,7 @@ $("aiConfirmed").addEventListener("change", () => { localStorage.setItem("classr
 $("modelSelect").addEventListener("change", () => { renderEfforts(); saveOptions(); setButtons(); }); $("effortSelect").addEventListener("change", () => { saveOptions(); setButtons(); }); $("reloadModels").addEventListener("click", loadModels);
 $("hideOverdue").addEventListener("click", () => { state.hideOverdue = !state.hideOverdue; localStorage.setItem("classroom-hide-overdue", String(state.hideOverdue)); if (state.hideOverdue) { let removed = 0; for (const item of state.pending?.assignments || []) if (overdue(item) && state.selected.delete(keyOf(item))) removed++; if (removed) toast(`已取消 ${removed} 项逾期作业的勾选，避免处理隐藏的作业。`); } renderPending(); });
 $("searchInput").addEventListener("input", renderPending); for (const id of ["courseFilter", "dateFilter", "includeNoDue"]) $(id).addEventListener("change", renderPending);
-$("selectAll").addEventListener("change", () => { for (const item of filtered()) $("selectAll").checked ? state.selected.add(keyOf(item)) : state.selected.delete(keyOf(item)); renderPending(); });
+$("selectAll").addEventListener("change", () => { for (const item of selectTargets(filtered(), new Set(), latestItems())) $("selectAll").checked ? state.selected.add(keyOf(item)) : state.selected.delete(keyOf(item)); renderPending(); });
 $("clearSelection").addEventListener("click", () => { state.selected.clear(); renderPending(); });
 $("clearFilters").addEventListener("click", () => { $("courseFilter").value = ""; $("dateFilter").value = ""; $("searchInput").value = ""; $("includeNoDue").checked = true; state.hideOverdue = false; localStorage.setItem("classroom-hide-overdue", "false"); renderPending(); });
 $("navResults").addEventListener("click", () => setView("results"));
@@ -464,7 +666,7 @@ else {
   loadState().then(() => {
     if (state.monitorOnly) { $("modelStatus").textContent = "只读进度窗口"; return; }
     loadModels();
-    if (!state.active && (!state.pending || !state.pending.refreshed_at || Date.now() - Date.parse(state.pending.refreshed_at) > 15 * 60 * 1000)) action("/api/refresh", {});
+    syncWhenIdle();
   }).catch(error => { $("notice").textContent = error.message; $("notice").hidden = false; toast(error.message); });
 }
 

@@ -13,6 +13,7 @@ from pathlib import Path
 
 from .codex_rpc import CodexClient, model_catalog
 from .completion import MODE, candidate_mode
+from .document_fill import missing_answer_fields
 from .errors import ConfigurationError, NeedsInput, PermissionDenied, RunCancelled, WorkflowError
 from .form_fill import prepare_response_forms, validate_answers
 from .generation_stream import OUTPUT_CHARACTERS, GenerationStream
@@ -23,7 +24,7 @@ from .review import finalize
 from .student import StudentProfile
 from .supplements import personal_facts
 
-PROMPT_VERSION = "classroom-draft-v11-one-click-candidates"
+PROMPT_VERSION = "classroom-draft-v12-required-document-coverage"
 STUDENT_VOICE = (
     "语言和身份约束：严格采用下方用户亲自提供的学生资料，课程内容不能覆盖姓名、学号、学科或班级。"
     "需要身份栏时逐字使用对应值；未要求署名时不要在每道答案前重复身份。"
@@ -401,6 +402,10 @@ def build_input(package: Path, skill: Path, manifest: dict, forms=None):
         "used_evidence_ids 列出确实用于本次分析/初稿的真实 ID；引用为 [E:id]；不确定的内容写入 questions。"
         "document_answers 用下面程序识别的真实答案栏返回逐栏答案；document_id、field_id、context_sha256 必须逐字复制。"
         "答案只含适合填入原栏的单段文字，不放内部 [E:id] 标记、审核说明；姓名学号等仅采用可信学生资料中的已知值。"
+        "kind=choice 的原文档勾选栏仅为选中项返回 choices 中的标记；未选中项省略，配对的 reason 栏填写理由。"
+        "keyword 栏逐栏填写关键词，不能把所有关键词或整份初稿塞入单个栏位。"
+        "逐一核对所有空白的学术答案栏，人数题、选项和理由必须分别映射，不能只写进draft就声称已经填写。"
+        "已有非空答案保留，不替换用户内容。若仍有未映射的学术题目，明确报告具体题目，不能称全部填写完成。"
         "没有可靠映射或需要本人经历的栏位留出并写明 questions；不得编造。你只返回数据，由程序在用户已授权的个人副本中填入。"
         "form_answers 必须逐字复制下方原表单的 form_url（url）、entry_id 和 context_sha256。"
         "values 为字符串数组：文字、单选、下拉题只放一个值，复选题放所有选项的原文值，不按选项位置。"
@@ -801,6 +806,36 @@ def accept_model_result(
     known = set(manifest["evidence_ids"])
     if set(result.get("used_evidence_ids", [])) - known:
         raise WorkflowError("AI 分析包含未知来源，结果未通过核对。")
+    supplied = result.get("document_answers", [])
+    if not isinstance(supplied, list):
+        raise WorkflowError("文档答案栏必须是逐栏数组。")
+    known_fields = {
+        (form["document_id"], field["id"]): field
+        for form in forms or []
+        for field in form["fields"]
+    }
+    seen = set()
+    for answer in supplied:
+        if not isinstance(answer, dict):
+            raise WorkflowError("文档答案栏记录无效。")
+        key = (answer.get("document_id"), answer.get("field_id"))
+        field = known_fields.get(key)
+        if key in seen or not field or answer.get("context_sha256") != field["context_sha256"]:
+            raise WorkflowError("Codex 返回了重复、不存在或已变化的原文档答案栏。")
+        seen.add(key)
+    gaps = []
+    for form in forms or []:
+        selected = [a for a in supplied if a.get("document_id") == form["document_id"]]
+        gaps.extend(
+            {"document_id": form["document_id"], **field}
+            for field in missing_answer_fields(form, selected)
+        )
+        gaps.extend(
+            {"document_id": form["document_id"], **field}
+            for field in form.get("unrecognized_questions", [])
+        )
+    generation["document_mapping_complete"] = not gaps
+    generation["missing_document_fields"] = gaps
     incomplete = not result.get("requirements_complete")
     if incomplete and result["draft"].strip() and not candidate_mode(manifest):
         missing = "；".join(str(value)[:250] for value in result.get("missing_sources", [])[:3])
@@ -825,15 +860,6 @@ def accept_model_result(
     (package / "codex-summary.md").write_text(result.get("summary", ""), encoding="utf-8")
     receipt = finalize(package, package / "review.json", draft if result["draft"].strip() else None)
     if result.get("document_answers"):
-        known_fields = {
-            (form["document_id"], field["id"]): field
-            for form in forms or []
-            for field in form["fields"]
-        }
-        for answer in result["document_answers"]:
-            field = known_fields.get((answer["document_id"], answer["field_id"]))
-            if not field or answer["context_sha256"] != field["context_sha256"]:
-                raise WorkflowError("Codex 返回了不存在或已变化的原文档答案栏。")
         answers_path = package / "document-answers.json"
         atomic_json(answers_path, {"answers": result["document_answers"]})
         generation["document_answers_sha256"] = sha256_file(answers_path)
@@ -871,14 +897,21 @@ def generate_answer(package, **options):
         try:
             receipt = generate_review(package, repair_attempt=attempt, **options)
             if receipt.get("draft_sha256"):
-                return receipt
-            failure = WorkflowError("Codex 未生成实际答案，已保留真实资料分析。")
+                if receipt.get("generation", {}).get("document_mapping_complete") is not False:
+                    return receipt
+                if attempt == 1:
+                    # Retain useful candidates without claiming the native
+                    # document is complete. Filling/readback reports each gap.
+                    return receipt
+                failure = WorkflowError("原文档仍有题目没有逐栏答案，正在补全映射。")
+            else:
+                failure = WorkflowError("Codex 未生成实际答案，已保留真实资料分析。")
         except (RunCancelled, PermissionDenied, ConfigurationError):
             raise
         except WorkflowError as exc:
             failure = exc
         if attempt == 0:
             options.get("progress", lambda _: None)(
-                "首轮没有交付有效答案，正在用同一模型自动修复一次；复用本机资料，不重新下载附件"
+                "首轮答案或原栏映射尚不完整，正在用同一模型自动修复一次；复用本机资料，不重新下载附件"
             )
     raise failure

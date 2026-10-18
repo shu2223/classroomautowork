@@ -2,17 +2,22 @@
 
 from copy import deepcopy
 from datetime import UTC
+from types import SimpleNamespace
 
 import pytest
 
 from classroomautowork.document_fill import (
+    digest,
     fill_personal_document,
     inspect_form,
     legacy_answers,
+    missing_answer_fields,
     plan_fill,
+    required_answer_fields,
     verify_fill,
 )
 from classroomautowork.errors import PermissionDenied, WorkflowError
+from classroomautowork.student import StudentProfile
 
 
 def native_document():
@@ -108,6 +113,237 @@ def apply_insertions(document, plan):
         )
     updated["revisionId"] = "offline-after"
     return updated
+
+
+def inline_document(prefix=()):
+    doc = native_document()
+    sample = doc["tabs"][0]["documentTab"]["body"]["content"][0]
+    content, offset = [], 1
+    for text in [
+        *prefix,
+        "課題①　希望する体験を選ぶ",
+        "□音楽🎵体験　(　　　)",
+        "□工房見学　(　　　)",
+        "課題②　イメージ",
+        "キーワード1",
+        "キーワード2",
+        "課題③　考え",
+        "自分の考えを書いてください。100字程度。",
+        "",
+    ]:
+        element = deepcopy(sample)
+        length = len((text + "\n").encode("utf-16-le")) // 2
+        element.update(startIndex=offset, endIndex=offset + length)
+        run = element["paragraph"]["elements"][0]
+        run.update(startIndex=offset, endIndex=offset + length)
+        run["textRun"]["content"] = text + "\n"
+        content.append(element)
+        offset += length
+    doc["tabs"][0]["documentTab"]["body"]["content"] = content
+    return doc
+
+
+def communication_document():
+    """Match the actual spaced question/option/reason worksheet structure."""
+    document = inline_document()
+    sample = document["tabs"][0]["documentTab"]["body"]["content"][0]
+    lines = [
+        "氏名：",
+        "■設問①　コミュニケーションのイメージ",
+        "キーワード1",
+        "キーワード2",
+        "■設問②　コミュニケーションは何人で行うのか。",
+        "コミュニケーションとは最低何人で行うもの？その理由は？",
+        "",
+        "",
+        "■設問③　共通点",
+        "コミュニケーションの特徴を３つ挙げてください。",
+        "",
+        "■設問④　ケーススタディ",
+        "同じクラスのＡさんとＢさんが大喧嘩をしました。翌日二人は、お互いを無視して何も"
+        "言葉を交わさずに通り過ぎました。さて、この二人の間にコミュニケーションはあったでしょうか？",
+        "",
+        "①あった　　　②なかった",
+        "",
+        "その理由は？",
+        "",
+    ]
+    content, offset = [], 1
+    for text in lines:
+        element = deepcopy(sample)
+        length = len((text + "\n").encode("utf-16-le")) // 2
+        element.update(startIndex=offset, endIndex=offset + length)
+        run = element["paragraph"]["elements"][0]
+        run.update(startIndex=offset, endIndex=offset + length)
+        run["textRun"]["content"] = text + "\n"
+        content.append(element)
+        offset += length
+    document["tabs"][0]["documentTab"]["body"]["content"] = content
+    return document
+
+
+def apply_inline_edits(document, plan):
+    """Exercise Google UTF-16 offsets, including shifts after each request."""
+    from classroomautowork.document_slots import utf16_length
+
+    updated = deepcopy(document)
+    body = updated["tabs"][0]["documentTab"]["body"]["content"]
+    for request in plan["requests"]:
+        if "insertText" in request:
+            start = end = request["insertText"]["location"]["index"]
+            replacement = request["insertText"]["text"]
+        else:
+            span = request["deleteContentRange"]["range"]
+            start, end, replacement = span["startIndex"], span["endIndex"], ""
+        paragraph = next(p for p in body if p["startIndex"] <= start < p["endIndex"])
+        run = paragraph["paragraph"]["elements"][0]
+        text = run["textRun"]["content"].encode("utf-16-le")
+        a, b = start - paragraph["startIndex"], end - paragraph["startIndex"]
+        run["textRun"]["content"] = (
+            text[: 2 * a] + replacement.encode("utf-16-le") + text[2 * b :]
+        ).decode("utf-16-le")
+        offset = 1
+        for p in body:
+            r = p["paragraph"]["elements"][0]
+            length = utf16_length(r["textRun"]["content"])
+            p.update(startIndex=offset, endIndex=offset + length)
+            r.update(startIndex=offset, endIndex=offset + length)
+            offset += length
+    updated["revisionId"] = "after-inline-write"
+    return updated
+
+
+def test_saved_identity_fills_only_blank_labels_and_retry_is_idempotent():
+    before = inline_document(["学籍番号：", "氏　　名："])
+    fields = inspect_form(before)["fields"]
+    assert not any(f.get("identity_key") for f in fields)
+    expected = [
+        {
+            "field_id": f["id"],
+            "context_sha256": f["context_sha256"],
+            "text": "☑" if f.get("kind") == "choice" else "回答。",
+        }
+        for f in fields
+        if "工房" not in f["label"]
+    ]
+    # Reproduce the reported case: answers already exist, but identity is still blank.
+    answered = apply_inline_edits(before, plan_fill(before, expected))
+    profile = StudentProfile(student_id="TEST019", name="TEST STUDENT")
+    plan = plan_fill(answered, expected, student_profile=profile)
+    assert len(plan["requests"]) == 2
+    after = apply_inline_edits(answered, plan)
+    receipt = verify_fill(answered, after, plan)
+    assert receipt["inserted_fields"] == 2
+    assert receipt["verified_fields"] == 7
+    assert receipt["verified_by_kind"] == {
+        "choice": 1,
+        "reason": 1,
+        "keyword": 2,
+        "paragraph": 1,
+        "identity": 2,
+    }
+    assert receipt["identity_warnings"] == []
+    identities = [
+        f["current"]
+        for f in inspect_form(after, include_identity=True)["fields"]
+        if f.get("identity_key")
+    ]
+    assert identities == ["TEST019", "TEST STUDENT"]
+    assert plan_fill(after, expected, student_profile=profile)["requests"] == []
+    assert inspect_form(answered)["question_sha256"] == inspect_form(after)["question_sha256"]
+
+
+def test_missing_or_conflicting_identity_is_preserved_and_reported():
+    before = inline_document(["学籍番号：", "氏　　名： USER EDIT"])
+    expected = [answers(before)[-1]]
+    profile = StudentProfile(student_id="", name="SAVED NAME")
+    plan = plan_fill(before, expected, student_profile=profile)
+    after = apply_inline_edits(before, plan)
+    receipt = verify_fill(before, after, plan)
+    assert len(receipt["identity_warnings"]) == 2
+    assert "尚无已保存" in receipt["identity_warnings"][0]
+    assert "已保留" in receipt["identity_warnings"][1]
+    assert "identity" not in receipt["verified_by_kind"]
+    body = after["tabs"][0]["documentTab"]["body"]["content"]
+    assert (
+        body[0]["paragraph"] == before["tabs"][0]["documentTab"]["body"]["content"][0]["paragraph"]
+    )
+    body[1]["paragraph"]["elements"][0]["textRun"]["content"] = "氏　　名： CHANGED\n"
+    with pytest.raises(WorkflowError, match="非答案"):
+        verify_fill(before, after, plan)
+
+
+def test_model_cannot_supply_identity_even_when_it_knows_the_field_id():
+    before = inline_document(["学籍番号：", "氏名："])
+    field = inspect_form(before, include_identity=True)["fields"][0]
+    expected = [
+        {"field_id": field["id"], "context_sha256": field["context_sha256"], "text": "FAKE"}
+    ]
+    with pytest.raises(WorkflowError, match="身份栏只能"):
+        plan_fill(before, expected, student_profile=StudentProfile(student_id="TEST019"))
+    with pytest.raises(WorkflowError, match="映射"):
+        plan_fill(before, expected)
+
+
+def test_inline_choices_reasons_keywords_and_written_answer_roundtrip():
+    before = inline_document()
+    fields = inspect_form(before)["fields"]
+    assert len(fields) == 7
+    chosen = [f for f in fields if "工房" not in f["label"]]
+    expected = [
+        {
+            "field_id": f["id"],
+            "context_sha256": f["context_sha256"],
+            "text": "☑" if f.get("kind") == "choice" else "候補の回答🎵。",
+        }
+        for f in chosen
+    ]
+    plan = plan_fill(before, expected)
+    after = apply_inline_edits(before, plan)
+    receipt = verify_fill(before, after, plan)
+    assert receipt["verified_fields"] == receipt["inserted_fields"] == 5
+    assert plan_fill(after, expected)["requests"] == []
+    with pytest.raises(WorkflowError, match="保留你已填写"):
+        plan_fill(after, [{**expected[1], "text": "別の回答"}])
+    with pytest.raises(WorkflowError, match="选中标记"):
+        plan_fill(before, [{**expected[0], "text": " arbitrary "}])
+    changed = deepcopy(after)
+    run = changed["tabs"][0]["documentTab"]["body"]["content"][2]["paragraph"]["elements"][0]
+    run["textRun"]["content"] = run["textRun"]["content"].replace("□", "☑")
+    with pytest.raises(WorkflowError, match="非答案"):
+        verify_fill(before, changed, plan)
+    changed = deepcopy(before)
+    run = changed["tabs"][0]["documentTab"]["body"]["content"][0]["paragraph"]["elements"][0]
+    run["textRun"]["content"] = "課題①　別の設問\n"
+    with pytest.raises(WorkflowError, match="原题"):
+        plan_fill(changed, expected)
+
+
+def test_inline_readback_allows_split_runs_but_not_changed_label_style():
+    before = inline_document()
+    field = inspect_form(before)["fields"][1]
+    expected = [
+        {"field_id": field["id"], "context_sha256": field["context_sha256"], "text": "理由"}
+    ]
+    plan = plan_fill(before, expected)
+    after = apply_inline_edits(before, plan)
+    p = after["tabs"][0]["documentTab"]["body"]["content"][1]["paragraph"]
+    first = p["elements"][0]
+    second = deepcopy(first)
+    content = first["textRun"]["content"]
+    first["textRun"]["content"], second["textRun"]["content"] = content[:4], content[4:]
+    p["elements"] = [first, second]
+    verify_fill(before, after, plan)
+    first["textRun"]["textStyle"]["bold"] = True
+    with pytest.raises(WorkflowError, match="非答案"):
+        verify_fill(before, after, plan)
+
+
+def test_instruction_followed_by_a_reason_header_is_not_an_answer_paragraph():
+    doc = inline_document()
+    body = doc["tabs"][0]["documentTab"]["body"]["content"]
+    body[-1]["paragraph"]["elements"][0]["textRun"]["content"] = "   〔理由〕\n"
+    assert all("/after:" not in f["id"] for f in inspect_form(doc)["fields"])
 
 
 def test_targeted_reverse_insert_preserves_questions_styles_and_second_tab():
@@ -323,3 +559,199 @@ def test_previous_draft_migration_checks_actual_original_questions():
         legacy_answers(
             document, draft, original_text=original_text.replace("例示された状況", "変更された状況")
         )
+
+
+def test_interrogative_question_and_numbered_case_choice_and_reason_are_all_required():
+    before = communication_document()
+    form = inspect_form(before)
+    assert len(form["fields"]) == 6
+    assert len(required_answer_fields(form)) == 6
+    assert form["unrecognized_questions"] == []
+    q2, selection, reason = form["fields"][2], form["fields"][4], form["fields"][5]
+    assert "最低何人" in q2["label"]
+    assert selection["kind"] == "selection"
+    assert selection["options"] == ["①あった", "②なかった"]
+    assert "■設問④" in reason["context"] and "大喧嘩" in reason["context"]
+    assert all("あったでしょうか？" != field["label"] for field in form["fields"])
+    body = before["tabs"][0]["documentTab"]["body"]["content"]
+    assert selection["index"] == body[15]["startIndex"]
+    assert reason["index"] == body[17]["startIndex"]
+    supplied = [
+        {
+            "field_id": field["id"],
+            "context_sha256": field["context_sha256"],
+            "text": "①あった" if field.get("kind") == "selection" else "授業に基づいた回答。",
+        }
+        for field in form["fields"]
+    ]
+    assert missing_answer_fields(form, supplied) == []
+    missing = missing_answer_fields(form, supplied[:2] + supplied[3:4])
+    assert [field["id"] for field in missing] == [q2["id"], selection["id"], reason["id"]]
+    plan = plan_fill(before, supplied)
+    after = apply_inline_edits(before, plan)
+    receipt = verify_fill(before, after, plan)
+    assert receipt["status"] == "filled_verified"
+    assert receipt["remaining_required_fields"] == []
+    assert inspect_form(after)["question_sha256"] == form["question_sha256"]
+    assert plan_fill(after, supplied)["requests"] == []
+    assert body[14] == before["tabs"][0]["documentTab"]["body"]["content"][14]
+    # Prior cached mappings use these exact hashes; the newly recognized section
+    # headings must not change already supported keyword or written-answer fields.
+    assert form["fields"][0]["context_sha256"] == digest(["", "キーワード1<keyword>\n"])
+    q3 = form["fields"][3]
+    assert q3["id"] == f"t.0/after:{digest(q3['label'])[:16]}"
+    assert q3["context_sha256"] == digest(q3["label"])
+    with pytest.raises(WorkflowError, match="原题列出"):
+        plan_fill(before, [{**supplied[4], "text": "選択以外の内容。"}])
+
+
+def test_partial_write_receipt_does_not_claim_unanswered_questions_are_complete():
+    before = communication_document()
+    form = inspect_form(before)
+    old_answers = [
+        {
+            "field_id": field["id"],
+            "context_sha256": field["context_sha256"],
+            "text": "既存のキーワードと第３問の回答。",
+        }
+        for field in form["fields"]
+        if field.get("kind") == "keyword" or "３つ挙げ" in field["label"]
+    ]
+    plan = plan_fill(before, old_answers)
+    after = apply_inline_edits(before, plan)
+    receipt = verify_fill(before, after, plan)
+    assert receipt["status"] == "partial"
+    assert len(receipt["remaining_required_fields"]) == 3
+    assert any("最低何人" in field["label"] for field in receipt["remaining_required_fields"])
+    assert all(
+        set(field) == {"id", "label", "context"} for field in receipt["remaining_required_fields"]
+    )
+    # Filling the newly discovered fields preserves the already supplied old mapping.
+    assert plan_fill(after, old_answers)["requests"] == []
+
+
+def test_repeated_reason_labels_are_unique_and_survive_readback():
+    before = communication_document()
+    body = before["tabs"][0]["documentTab"]["body"]["content"]
+    extra = deepcopy(body[-4:])
+    extra[0]["paragraph"]["elements"][0]["textRun"]["content"] = "■設問⑤　次の例\n"
+    body.extend(extra)
+    offset = 1
+    for paragraph in body:
+        run = paragraph["paragraph"]["elements"][0]
+        length = len(run["textRun"]["content"].encode("utf-16-le")) // 2
+        paragraph.update(startIndex=offset, endIndex=offset + length)
+        run.update(startIndex=offset, endIndex=offset + length)
+        offset += length
+    form = inspect_form(before)
+    reasons = [field for field in form["fields"] if field["label"] == "その理由は？"]
+    assert len(reasons) == 2 and reasons[0]["id"] != reasons[1]["id"]
+    assert reasons[0]["context_sha256"] != reasons[1]["context_sha256"]
+    expected = [
+        {
+            "field_id": field["id"],
+            "context_sha256": field["context_sha256"],
+            "text": "何が伝わったか？",
+        }
+        for field in reasons
+    ]
+    plan = plan_fill(before, expected)
+    after = apply_inline_edits(before, plan)
+    verify_fill(before, after, plan)
+    assert inspect_form(after)["question_sha256"] == form["question_sha256"]
+    assert plan_fill(after, expected)["requests"] == []
+
+
+def test_unknown_question_without_safe_answer_container_is_reported():
+    before = communication_document()
+    body = before["tabs"][0]["documentTab"]["body"]["content"]
+    body.pop()  # The final reason has no answer paragraph at all.
+    form = inspect_form(before)
+    assert form["unrecognized_questions"][0]["label"] == "その理由は？"
+    expected = [
+        {
+            "field_id": field["id"],
+            "context_sha256": field["context_sha256"],
+            "text": "①あった" if field.get("kind") == "selection" else "授業資料からの回答。",
+        }
+        for field in form["fields"]
+    ]
+    plan = plan_fill(before, expected)
+    receipt = verify_fill(before, apply_inline_edits(before, plan), plan)
+    assert receipt["status"] == "partial"
+    assert receipt["remaining_required_fields"] == []
+    assert receipt["unrecognized_questions"][0]["label"] == "その理由は？"
+
+
+def test_required_fields_exclude_identity_and_unchecked_alternative_reasons():
+    before = inline_document(["学籍番号："])
+    form = inspect_form(before, include_identity=True)
+    required = required_answer_fields(form)
+    assert len(required) == 3
+    assert all(field.get("kind") not in {"identity", "choice", "reason"} for field in required)
+    choice = next(field for field in form["fields"] if field.get("kind") == "choice")
+    supplied = [{"field_id": choice["id"], "context_sha256": choice["context_sha256"], "text": "☑"}]
+    required = required_answer_fields(form, answers=supplied)
+    assert len(required) == 4 and sum(field.get("kind") == "reason" for field in required) == 1
+    with pytest.raises(WorkflowError, match="重复"):
+        missing_answer_fields(form, supplied * 2)
+    with pytest.raises(WorkflowError, match="空答案"):
+        missing_answer_fields(form, [{**supplied[0], "text": "   "}])
+
+
+def test_fill_review_aggregates_missing_questions_and_reports_partial(tmp_path, monkeypatch):
+    import json
+
+    from classroomautowork import auth, document_fill, drafting, google_read
+    from classroomautowork.local import sha256_file
+
+    package = tmp_path / "package"
+    package.mkdir()
+    (package / "manifest.json").write_text(
+        json.dumps(
+            {
+                "course_id": "1",
+                "assignment_id": "2",
+                "ai_confirmation": True,
+                "policy": {"can_draft": True},
+            }
+        ),
+        encoding="utf-8",
+    )
+    answer_path = package / "document-answers.json"
+    answer_path.write_text(
+        json.dumps({"answers": [{"document_id": "offline-doc"}]}), encoding="utf-8"
+    )
+    (package / "codex-generation.json").write_text(
+        json.dumps({"document_answers_sha256": sha256_file(answer_path)}), encoding="utf-8"
+    )
+    reader = PersonalReader()
+    reader.file_metadata = lambda _: {"mimeType": "application/vnd.google-apps.document"}
+    monkeypatch.setattr(auth, "credentials_for", lambda *a, **kw: (None, None))
+    monkeypatch.setattr(drafting, "reusable_review", lambda _: {"draft_sha256": "offline"})
+    monkeypatch.setattr(google_read, "GoogleReader", lambda _: reader)
+    monkeypatch.setattr(document_fill, "GoogleDocuments", lambda _: None)
+    missing = {"id": "q2", "label": "最低何人？", "context": "設問②"}
+    unknown = {"label": "その理由は？", "context": "設問④"}
+    monkeypatch.setattr(
+        document_fill,
+        "fill_personal_document",
+        lambda *a, **kw: {
+            "status": "partial",
+            "document_id": "offline-doc",
+            "remaining_required_fields": [missing],
+            "unrecognized_questions": [unknown],
+        },
+    )
+    progress = []
+    result = document_fill.fill_review(
+        SimpleNamespace(data_dir=tmp_path), package, progress=progress.append
+    )
+    assert result["status"] == "partial"
+    assert result["remaining_required_fields"] == [{**missing, "document_id": "offline-doc"}]
+    assert result["unrecognized_questions"] == [{**unknown, "document_id": "offline-doc"}]
+    assert progress[-1] == "已填入部分答案，仍有题目待补全"
+    assert (
+        json.loads((package / "document-fill.json").read_text(encoding="utf-8"))["status"]
+        == "partial"
+    )

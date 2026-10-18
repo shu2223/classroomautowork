@@ -167,6 +167,16 @@ def sync_course(
                     "role": "student_document" if kind == "submission" else kind,
                 }
             )
+    report(
+        progress,
+        f"已找到 {len(attachments)} 份课程附件，开始核对和处理",
+        "course_sync",
+        course_id=course_id,
+        workload_files=[
+            {"file_id": key, "filename": str(value.get("title") or "课程附件")[:200]}
+            for key, value in attachments.items()
+        ],
+    )
     for source_id, url in list(linked_forms.items())[:100]:
         try:
             report(progress, "正在只读读取 Google Forms 全部页面的题目与选项", "form_read")
@@ -227,6 +237,7 @@ def sync_course(
         name = str(reference.get("title") or "课程附件")[:200]
 
         context = {
+            "course_id": course_id,
             "file_id": file_id,
             "filename": name,
             "attachment_index": number,
@@ -240,6 +251,7 @@ def sync_course(
                 f"{context['filename']} · {update}",
                 **{
                     **details,
+                    "course_id": context["course_id"],
                     "file_id": context["file_id"],
                     "filename": context["filename"],
                     "attachment_index": context["attachment_index"],
@@ -357,6 +369,11 @@ def sync_course(
         except RunCancelled:
             raise
         except WorkflowError as exc:
+            file_progress(
+                ProgressUpdate(
+                    "这份附件未能完成，继续处理其他资料", "attachment_failed", failed=True
+                )
+            )
             warnings.append(
                 {
                     "source": "file:" + file_id,
