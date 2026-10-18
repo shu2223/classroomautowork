@@ -92,6 +92,7 @@ class FrontendJobs:
         self._approval_answers = {}
         self._jobs = {}
         self._progress = {}
+        self._on_start = None
         for path in sorted((self.root / "jobs").glob("*.json")):
             job = read_json(path)
             if not job or not re.fullmatch(r"[a-f0-9]{32}", job.get("id", "")):
@@ -282,7 +283,12 @@ class FrontendJobs:
             self._save(job)
             self._thread = threading.Thread(target=self._run, args=(job["id"],), daemon=True)
             self._thread.start()
-            return self.job(job["id"])
+            result = self.job(job["id"])
+        # The power controller's preflight can acquire the jobs lock; notify
+        # outside it so a countdown and a newly started worker cannot deadlock.
+        if self._on_start:
+            self._on_start(result)
+        return result
 
     def refresh(self):
         return self._start("refresh", [])

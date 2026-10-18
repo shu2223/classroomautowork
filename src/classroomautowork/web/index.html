@@ -21,6 +21,11 @@
 </header>
 <main>
 <div id="notice" class="notice" hidden></div>
+<section id="shutdownControl" class="shutdown-control" aria-label="自动关机" hidden>
+  <label class="shutdown-switch"><input id="shutdownEnabled" type="checkbox" role="switch" aria-describedby="shutdownNote" disabled><span class="switch-track" aria-hidden="true"></span><span>完成后自动关机</span></label>
+  <p id="shutdownNote" class="shutdown-note" role="status">本次任务全部成功后倒计时 60 秒，可随时取消。</p>
+  <button id="shutdownCancel" class="button secondary small-button" hidden>取消自动关机</button>
+</section>
 <section id="pendingView">
   <div class="page-heading"><div><h1>一键完成待办作业</h1><p>读取课堂资料、生成答案、自动填写。完成后打开结果检查，再由你提交。</p></div><button id="refreshButton" class="button secondary"><svg class="icon"><use href="#i-refresh"/></svg><span>刷新作业</span></button></div>
   <section id="jobPanel" class="job-panel" hidden aria-live="polite"></section>

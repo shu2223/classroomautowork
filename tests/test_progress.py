@@ -121,10 +121,9 @@ def test_monitor_can_only_read_status_and_cannot_pause_or_start(local_server):  
         thread.join(timeout=5)
 
 
-def test_browser_progress_states_are_truthful():
+@pytest.mark.parametrize("script", ["progress_view.js", "shutdown_view.js"])
+def test_browser_progress_states_are_truthful(script):
     node = shutil.which("node")
     if not node:
         pytest.skip("Node is needed for the production frontend's pure state logic")
-    subprocess.run(
-        [node, str(Path(__file__).with_name("progress_view.js"))], check=True, capture_output=True
-    )
+    subprocess.run([node, str(Path(__file__).with_name(script))], check=True, capture_output=True)

@@ -18,6 +18,8 @@ from filelock import FileLock, Timeout
 from .config import Settings
 from .errors import WorkflowError
 from .local import atomic_json, require_private_path, sha256_file
+from .power import ShutdownController
+from .power_service import PowerWatch, is_new_work, latest_completed_job
 from .ui_jobs import FILES, FrontendJobs, read_json
 
 ASSETS = Path(__file__).parent / "web"
@@ -30,11 +32,32 @@ ITEM_ROUTE = re.compile(
 class LocalServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, jobs: FrontendJobs, port=0, *, token=None):
+    def __init__(self, jobs: FrontendJobs, port=0, *, token=None, power=None):
         self.jobs = jobs
         self.token = token or secrets.token_urlsafe(32)
         super().__init__(("127.0.0.1", port), LocalHandler)
         self.origin = f"http://127.0.0.1:{self.server_port}"
+        self.power = power if power is not None else ShutdownController(preflight=self._power_ready)
+        self.power_watch = PowerWatch(self.power, self._power_job)
+        self.jobs._on_start = self.power_watch.on_start
+        self.power_watch.start()
+
+    def _power_job(self, identifier):
+        with self.jobs._lock:
+            identifier = self.jobs._active or identifier
+            return self.jobs.job(identifier) if identifier in self.jobs._jobs else None
+
+    def _power_ready(self, identifier):
+        with self.jobs._lock:
+            return bool(
+                not self.jobs._active
+                and latest_completed_job(self.jobs._jobs.get(identifier), self.jobs._jobs.values())
+            )
+
+    def server_close(self):
+        self.power_watch.close()
+        self.jobs._on_start = None
+        super().server_close()
 
     @property
     def browser_url(self):
@@ -133,9 +156,12 @@ class LocalHandler(BaseHTTPRequestHandler):
         try:
             jobs = self.server.jobs
             if path == "/api/health":
-                result = {"app": "classroomautowork", "status": "running"}
+                result = {"app": "classroomautowork", "status": "running", "auto_shutdown": True}
             elif path == "/api/bootstrap":
                 result = jobs.bootstrap()
+                result["shutdown"] = self.server.power.snapshot()
+            elif path == "/api/shutdown":
+                result = self.server.power.snapshot()
             elif path == "/api/codex/models":
                 result = jobs.models()
             elif match := re.fullmatch(r"/api/jobs/([a-f0-9]{32})", path):
@@ -267,6 +293,8 @@ class LocalHandler(BaseHTTPRequestHandler):
             payload = self._body()
             path = urlparse(self.path).path
             jobs = self.server.jobs
+            if is_new_work(path):
+                self.server.power_watch.before_new_work()
             if path == "/api/refresh":
                 if payload:
                     raise WorkflowError("刷新请求不接受额外参数。")
@@ -332,13 +360,22 @@ class LocalHandler(BaseHTTPRequestHandler):
                 result = jobs.pause(match[1]) if match[2] == "pause" else jobs.retry(match[1])
             elif path == "/api/shutdown":
                 if payload:
-                    raise WorkflowError("退出请求不接受额外参数。")
+                    if set(payload) != {"enabled"}:
+                        raise WorkflowError("自动关机只接受开关设置。")
+                    result = self.server.power_watch.set_enabled(payload["enabled"])
+                    self._send(200, result)
+                    return
                 active = jobs.bootstrap()["active_job_id"]
                 if active:
                     raise WorkflowError("请先暂停当前任务并等它停止，再退出助手。")
+                self.server.power.close()
                 self._send(200, {"status": "stopping"})
                 threading.Thread(target=self.server.shutdown, daemon=True).start()
                 return
+            elif path == "/api/shutdown/cancel":
+                if payload:
+                    raise WorkflowError("取消关机不接受其他参数。")
+                result = self.server.power.cancel()
             else:
                 self._send(404, {"error": "找不到本机接口。"})
                 return
@@ -377,6 +414,24 @@ def existing_server(info_path: Path):
         return None
     origin = f"http://127.0.0.1:{info['port']}"
     try:
+        companion = read_json(info_path.with_name("power-companion.json"), {})
+        if (
+            companion.get("source_port") == info["port"]
+            and type(companion.get("port")) is int
+            and 0 < companion["port"] < 65536
+            and isinstance(companion.get("token"), str)
+        ):
+            companion_origin = f"http://127.0.0.1:{companion['port']}"
+            probe = urllib.request.Request(
+                companion_origin + "/api/health",
+                headers={"Authorization": "Bearer " + companion["token"]},
+            )
+            try:
+                with urllib.request.urlopen(probe, timeout=2) as response:
+                    if json.load(response).get("power_companion"):
+                        return companion_origin + "/#" + companion["token"]
+            except (OSError, ValueError):
+                pass
         request = urllib.request.Request(
             origin + "/api/health", headers={"Authorization": "Bearer " + info["token"]}
         )

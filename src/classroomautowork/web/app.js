@@ -10,6 +10,8 @@ else token = sessionStorage.getItem("classroom-access") || "";
 let polling = null, toastTimer = null;
 let pollInFlight = false;
 const connection = {lastSuccess: 0, error: null};
+let shutdownPolling = null, shutdownPollInFlight = false, shutdownRequestVersion = 0;
+state.shutdown = null; state.shutdownPending = false; state.shutdownError = null; state.shutdownReceivedAt = 0;
 
 // Pure progress presentation; exercised by offline state tests.
 function durationLabel(ms) { const s = Math.max(0, Math.floor(ms / 1000)); return s < 60 ? `${s} 秒` : s < 3600 ? `${Math.floor(s / 60)} 分 ${s % 60} 秒` : `${Math.floor(s / 3600)} 小时 ${Math.floor(s % 3600 / 60)} 分`; }
@@ -234,6 +236,57 @@ function progressView(job, network, now = Date.now()) {
 }
 // End pure progress presentation.
 
+// Pure shutdown presentation: only the local backend can schedule or cancel power actions.
+function shutdownView(snapshot, now = Date.now(), receivedAt = now) {
+  const supported = snapshot?.supported === true, status = snapshot?.state || "off";
+  const enabled = supported && snapshot?.enabled === true;
+  const active = enabled || ["waiting", "armed", "countdown", "shutting_down"].includes(status);
+  const seconds = Number.isFinite(snapshot?.remaining_seconds) ? Math.max(0, Math.ceil(snapshot.remaining_seconds - Math.max(0, now - receivedAt) / 1000)) : null;
+  const deadline = Date.parse(snapshot?.deadline_at);
+  const remaining = Number.isFinite(deadline) ? Math.max(0, Math.ceil((deadline - now) / 1000)) : seconds;
+  let message = snapshot?.message || (supported ? "本次任务全部成功后倒计时 60 秒，可随时取消。" : "此设备暂不支持自动关机。");
+  if (status === "countdown") message = remaining === null ? "任务已全部成功，正在读取关机倒计时，可随时取消。" : remaining > 0 ? `任务已全部成功，${remaining} 秒后自动关机。请保存其他工作，可随时取消。` : "关机倒计时已结束，正在等待系统响应；仍可尝试取消。";
+  return {supported, status, enabled, active, message, remaining, canCancel:supported && active && status !== "shutting_down", urgent:status === "countdown" || status === "shutting_down"};
+}
+// End pure shutdown presentation.
+
+function receiveShutdown(snapshot) {
+  state.shutdown = snapshot; state.shutdownReceivedAt = Date.now(); state.shutdownError = null;
+  renderShutdown();
+}
+function renderShutdown() {
+  const view = shutdownView(state.shutdown, Date.now(), state.shutdownReceivedAt);
+  $("shutdownControl").hidden = !!state.monitorOnly || !state.shutdown;
+  $("shutdownControl").classList.toggle("shutdown-countdown", view.urgent);
+  $("shutdownEnabled").checked = view.enabled;
+  $("shutdownEnabled").disabled = !!state.monitorOnly || !view.supported || state.shutdownPending || view.status === "shutting_down";
+  $("shutdownNote").textContent = state.shutdownError ? `${state.shutdownError} ${view.active ? "关机计划可能仍在后台生效；可重试取消。" : ""}` : view.message;
+  $("shutdownCancel").hidden = !!state.monitorOnly || !view.canCancel;
+  $("shutdownCancel").disabled = state.shutdownPending;
+}
+async function pollShutdown() {
+  if (state.monitorOnly || !state.shutdown?.supported || shutdownPollInFlight || state.shutdownPending) return;
+  shutdownPollInFlight = true; const version = shutdownRequestVersion;
+  try { const snapshot = await api("/api/shutdown"); if (version === shutdownRequestVersion && !state.shutdownPending) receiveShutdown(snapshot); }
+  catch (error) { if (version === shutdownRequestVersion && !state.shutdownPending) { state.shutdownError = error.status === 404 ? "当前后台尚未提供自动关机，请重新打开新版助手。" : "暂时无法读取自动关机状态。"; renderShutdown(); } }
+  finally { shutdownPollInFlight = false; }
+}
+function startShutdownPolling() {
+  if (!shutdownPolling && !state.monitorOnly && state.shutdown?.supported) shutdownPolling = setInterval(pollShutdown, 2000);
+}
+async function changeShutdown(enabled, cancel = false) {
+  if (state.monitorOnly || state.shutdownPending || !state.shutdown?.supported) return;
+  state.shutdownPending = true; state.shutdownError = null; shutdownRequestVersion += 1; renderShutdown();
+  try {
+    receiveShutdown(await api(cancel ? "/api/shutdown/cancel" : "/api/shutdown", "POST", cancel ? {} : {enabled}));
+    toast(state.shutdown.message || (enabled ? "已开启本次任务完成后自动关机" : "已取消自动关机"));
+  } catch (error) {
+    try { receiveShutdown(await api("/api/shutdown")); } catch { /* Keep the last confirmed state so a failed cancel cannot look successful. */ }
+    state.shutdownError = error.status === 404 ? "当前后台尚未提供自动关机，请重新打开新版助手。" : error.message;
+    toast(state.shutdownError);
+  } finally { state.shutdownPending = false; renderShutdown(); startShutdownPolling(); }
+}
+
 function node(tag, text, className) { const el = document.createElement(tag); if (text !== undefined) el.textContent = text; if (className) el.className = className; return el; }
 function icon(name) { const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg"); svg.setAttribute("class", "icon"); svg.setAttribute("aria-hidden", "true"); const use = document.createElementNS(svg.namespaceURI, "use"); use.setAttribute("href", "#i-" + name); svg.append(use); return svg; }
 function button(text, className, handler) { const el = node("button", text, className); el.type = "button"; el.addEventListener("click", handler); return el; }
@@ -249,7 +302,7 @@ async function api(path, method = "GET", body) {
   try { response = await fetch(path, options); }
   catch (error) { throw new Error(error.name === "AbortError" ? "本机状态读取超时，等待连接恢复。" : error.message); }
   finally { clearTimeout(timer); }
-  if (!response.ok) { const error = await response.json().catch(() => ({})); throw new Error(friendlyError(error.error || "本机连接失败，请重新打开助手。")); }
+  if (!response.ok) { const data = await response.json().catch(() => ({})), error = new Error(friendlyError(data.error || "本机连接失败，请重新打开助手。")); error.status = response.status; throw error; }
   return response.headers.get("Content-Type").includes("application/json") ? response.json() : response.blob();
 }
 function dateLabel(value, time = false) { if (!value) return "无截止日期"; return new Intl.DateTimeFormat("zh-CN", {timeZone: state.timezone || "Asia/Tokyo", year: "numeric", month: "2-digit", day: "2-digit", ...(time ? {hour: "2-digit", minute: "2-digit"} : {})}).format(new Date(value)); }
@@ -511,8 +564,11 @@ function updateProgressClock() {
   }
 }
 setInterval(updateProgressClock, 1000);
+setInterval(renderShutdown, 1000);
 async function loadState() {
+  const shutdownVersion = shutdownRequestVersion;
   const data = await api("/api/bootstrap"); connection.lastSuccess = Date.now(); connection.error = null; state.monitorOnly = !!data.monitor_only; state.documentsAuthorized = !!data.documents_authorized; state.pending = data.pending; state.jobs = data.jobs; state.resultJobs = data.result_jobs || []; state.policies = data.policies; state.active = data.active_job_id; state.timezone = data.timezone; $("accountEmail").textContent = data.account;
+  if (shutdownVersion === shutdownRequestVersion && !state.shutdownPending) receiveShutdown(data.shutdown || {enabled:false, state:"off", supported:false, message:"当前后台尚未提供自动关机，请重新打开新版助手。"}); startShutdownPolling();
   const running = state.jobs.find(x => x.id === state.active); if (running && ["review", "fill"].includes(running.kind)) $("aiConfirmed").checked = !!running.ai_confirmed;
   if (state.monitorOnly) { document.body.classList.add("monitor-mode"); $("notice").hidden = false; $("notice").replaceChildren(node("span", "这是只读进度窗口，不会影响原任务。审批和作业操作请返回原作业助手。 ")); const back = node("a", "返回作业助手 ↗"); back.href = data.source_url; back.target = "_blank"; back.rel = "noopener noreferrer"; $("notice").append(back); }
   if (state.pending) { const available = new Set(state.pending.assignments.map(keyOf)); state.selected = new Set([...state.selected].filter(x => available.has(x))); }
@@ -629,6 +685,8 @@ $("refreshButton").addEventListener("click", () => action("/api/refresh", {}));
 $("generateButton").addEventListener("click", () => { saveOptions(); action("/api/review", {selected: targets().map(({course_id, assignment_id}) => ({course_id, assignment_id})), defer_media: !$("processMedia").checked, ai_confirmed: $("aiConfirmed").checked, ...($("aiConfirmed").checked ? {model: $("modelSelect").value, effort: $("effortSelect").value || null} : {})}); });
 $("aiConfirmed").checked = localStorage.getItem("classroom-ai-enabled") !== "false";
 $("aiConfirmed").addEventListener("change", () => { localStorage.setItem("classroom-ai-enabled", String($("aiConfirmed").checked)); setButtons(); renderPending(); });
+$("shutdownEnabled").addEventListener("change", event => changeShutdown(event.currentTarget.checked));
+$("shutdownCancel").addEventListener("click", () => changeShutdown(false, true));
 $("modelSelect").addEventListener("change", () => { renderEfforts(); saveOptions(); setButtons(); }); $("effortSelect").addEventListener("change", () => { saveOptions(); setButtons(); }); $("reloadModels").addEventListener("click", loadModels);
 $("hideOverdue").addEventListener("click", () => { state.hideOverdue = !state.hideOverdue; localStorage.setItem("classroom-hide-overdue", String(state.hideOverdue)); if (state.hideOverdue) { let removed = 0; for (const item of state.pending?.assignments || []) if (overdue(item) && state.selected.delete(keyOf(item))) removed++; if (removed) toast(`已取消 ${removed} 项逾期作业的勾选，避免处理隐藏的作业。`); } renderPending(); });
 $("searchInput").addEventListener("input", renderPending); for (const id of ["courseFilter", "dateFilter", "includeNoDue"]) $(id).addEventListener("change", renderPending);
