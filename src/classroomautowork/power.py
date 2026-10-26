@@ -7,7 +7,7 @@ import threading
 import time
 from datetime import UTC, datetime
 
-from .completion import document_answers_incomplete
+from .completion import answers_incomplete
 from .errors import WorkflowError
 
 ACTIVE = {"queued", "running", "stopping"}
@@ -172,7 +172,7 @@ class ShutdownController:
                 and all(
                     isinstance(item, dict)
                     and item.get("status") in READY_ITEMS
-                    and not document_answers_incomplete(item)
+                    and not answers_incomplete(item)
                     for item in items
                 )
             )

@@ -15,7 +15,7 @@ from .config import Settings
 from .errors import ConfigurationError, PermissionDenied, RunCancelled, WorkflowError
 from .external_sources import external_chunks, source_urls
 from .extract import extract_document, processor_identity
-from .form_capture import authenticated_form_cache
+from .form_capture import attach_form_images, authenticated_form_cache
 from .form_read import PARSER_VERSION, form_chunks, form_references, read_form
 from .google_read import GoogleReader, attachment_metadata, drive_attachments
 from .local import atomic_json, sha256_file, utc_now
@@ -184,6 +184,7 @@ def sync_course(
                 form = read_form(url)
             except PermissionDenied as exc:
                 form = authenticated_form_cache(settings.data_dir, settings.school_email, url, exc)
+            form = attach_form_images(settings.data_dir, settings.school_email, form)
             revision = fingerprint(form)
 
             def save_form(key, value=form):
@@ -192,7 +193,12 @@ def sync_course(
                 return {
                     "path": str(path),
                     "chunks": form_chunks(value),
-                    "artifacts": [artifact(path)],
+                    "artifacts": [artifact(path)]
+                    + [
+                        artifact(Path(picture["image_path"]))
+                        for picture in value.get("media", [])
+                        if picture.get("image_path")
+                    ],
                 }
 
             result = store.memo("form-questions", [revision, PARSER_VERSION], save_form)
@@ -212,7 +218,13 @@ def sync_course(
                 "form_read",
             )
             warnings.extend(
-                {"source": source_id, "url": url, "error": warning} for warning in form["warnings"]
+                {
+                    "source": source_id,
+                    "url": url,
+                    "origins": form_origins[source_id],
+                    "error": warning,
+                }
+                for warning in form["warnings"]
             )
         except RunCancelled:
             raise
@@ -271,10 +283,6 @@ def sync_course(
                 raise PermissionDenied(
                     "Download permission is unavailable; no cached attachment used."
                 )
-            if int(metadata.get("size", "0")) > policy.max_attachment_bytes:
-                raise WorkflowError(
-                    "Attachment exceeds this course's download budget; increase max_attachment_bytes to process it."
-                )
             suffix = Path(metadata["name"]).suffix.lower()
             if defer_media and (
                 suffix in MEDIA or metadata["mimeType"].startswith(("video/", "audio/"))
@@ -287,6 +295,12 @@ def sync_course(
             revision = download_revision(metadata)
 
             def download(key, meta=metadata):
+                # The budget limits new transfers. Completed, intact content
+                # matching the live revision can still pass Store's cache checks.
+                if int(meta.get("size", "0")) > policy.max_attachment_bytes:
+                    raise WorkflowError(
+                        "Attachment exceeds this course's download budget; increase max_attachment_bytes to process it."
+                    )
                 result = reader.download(
                     meta,
                     settings.data_dir / "attachments" / key[:24],
@@ -537,7 +551,7 @@ def prepare_assignment(
             "downloads": list(course.get("downloads", {}).values()),
             "recommended_evidence_ids": list(
                 dict.fromkeys(
-                    x["id"] for x in [*requirements, *mandatory, *related, *policy_sources]
+                    x["id"] for x in [*requirements, *mandatory, *extra, *related, *policy_sources]
                 )
             ),
             "course_name": course["course"].get("name"),

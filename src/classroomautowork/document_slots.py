@@ -86,6 +86,32 @@ def inline_slots(text):
     return []
 
 
+def explicit_answer_slots(text):
+    """Separate an explicit answer label from its contents within one paragraph.
+
+    A reason label or a request for selected numbers is part of the worksheet, not
+    an existing answer. Keep its colon, indentation and formatting protected.
+    """
+    match = re.fullmatch(
+        r"(?P<label>[ \t　]*(?P<name>"
+        r"(?:選択した|選んだ)番号(?:[ \t　]*[（(][^()（）\n:：]{1,30}[)）])?"
+        r"|[^\n:：?？]{0,60}理由|回答|答え|解答)"
+        r"[ \t　]*[:：])(?P<answer>[^\n]*)\n",
+        text,
+    )
+    if not match:
+        return []
+    return [
+        {
+            "kind": "number_selection" if "番号" in match["name"] else "labeled_answer",
+            "label": match["label"].strip(),
+            "span": match.span("answer"),
+            "current": match["answer"].strip(),
+            "insert_prefix": " ",
+        }
+    ]
+
+
 def slot_template(text, slots):
     for slot in sorted(slots, key=lambda x: x["span"][0], reverse=True):
         start, end = slot["span"]

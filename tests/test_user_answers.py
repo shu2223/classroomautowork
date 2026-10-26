@@ -77,7 +77,11 @@ def test_saving_inputs_during_active_work_preserves_generation_and_does_not_star
     jobs = FrontendJobs(unit_settings(tmp_path))
     jobs._active = "unit-active"
     jobs._jobs = {
-        "unit-active": {"status": "running", "items": [{"course_id": "1", "assignment_id": "2"}]}
+        "unit-active": {
+            "status": "running",
+            "ai_confirmed": True,
+            "items": [{"course_id": "1", "assignment_id": "2"}],
+        }
     }
     monkeypatch.setattr(jobs, "package_path", lambda *_: package)
     monkeypatch.setattr(
@@ -96,8 +100,12 @@ def test_saving_inputs_during_active_work_preserves_generation_and_does_not_star
     jobs._jobs["unit-active"]["status"] = "paused"
     assert jobs._next_answer_fill() is None and jobs._answer_requests
     jobs._jobs["unit-active"]["status"] = "completed"
-    monkeypatch.setattr(jobs, "fill_existing", lambda *args: {"kind": "fill", "target": args})
-    assert jobs._next_answer_fill() == {"kind": "fill", "target": ("unit-active", "1:2")}
+    monkeypatch.setattr(
+        jobs, "_start", lambda kind, items, **kw: {"kind": kind, "target": items, **kw}
+    )
+    applied = jobs._next_answer_fill()
+    assert applied["kind"] == "fill" and applied["ai_confirmed"]
+    assert applied["target"] == [{"course_id": "1", "assignment_id": "2", "package": str(package)}]
     assert json.loads(queue_path.read_text()) == {}
 
 
@@ -139,16 +147,22 @@ def test_explicit_deferred_fill_survives_restart_and_paused_work_stays_paused(
     source = {
         "id": job_id,
         "status": "completed",
-        "items": [{"course_id": "1", "assignment_id": "2"}],
+        "ai_confirmed": True,
+        "items": [{"course_id": "1", "assignment_id": "2", "form_requires_regeneration": True}],
     }
     jobs._save(source)
     atomic_json(jobs.root / "answer-fill-requests.json", {"1:2": job_id})
     filled = []
+    monkeypatch.setattr(FrontendJobs, "package_path", lambda *args: tmp_path)
     monkeypatch.setattr(
-        FrontendJobs, "fill_existing", lambda self, *args: filled.append(args) or {"kind": "fill"}
+        FrontendJobs,
+        "_start",
+        lambda self, *args, **kw: filled.append((args, kw)) or {"kind": "fill"},
     )
     restored = FrontendJobs(unit_settings(tmp_path))
-    assert filled == [(job_id, "1:2")] and not restored._answer_requests
+    assert len(filled) == 1 and filled[0][0][0] == "fill" and not restored._answer_requests
+    assert filled[0][0][1][0]["package"] == str(tmp_path)
+    assert filled[0][1] == {"ai_confirmed": True}
     source["status"] = "paused"
     jobs._save(source)
     atomic_json(jobs.root / "answer-fill-requests.json", {"1:2": job_id})

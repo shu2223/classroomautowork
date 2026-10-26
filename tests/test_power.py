@@ -162,6 +162,29 @@ def test_unsuccessful_bound_job_turns_switch_off(controller, status):
         [{"status": "document_ready", "document_fill": {"remaining_required_fields": ["q2"]}}],
         [{"status": "document_ready", "document_fill": {"unrecognized_questions": ["q4"]}}],
         [{"status": "document_ready", "document_fill": "invalid"}],
+        [
+            {
+                "status": "form_opened",
+                "form_fill": {"forms": [{"remaining_fields": [{"title": "Q1", "required": True}]}]},
+            }
+        ],
+        [
+            {
+                "status": "form_opened",
+                "form_fill": {
+                    "forms": [{"remaining_answer_fields": [{"title": "Q1", "required": True}]}]
+                },
+            }
+        ],
+        [
+            {
+                "status": "form_opened",
+                "form_fill": {
+                    "forms": [{"user_input_fields": [{"title": "学年", "required": True}]}]
+                },
+            }
+        ],
+        [{"status": "form_opened", "generation": {"form_mapping_complete": False}}],
         ["invalid"],
     ],
 )

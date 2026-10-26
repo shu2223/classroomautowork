@@ -14,14 +14,23 @@ from .browser_documents import ensure_document_sheet
 from .browser_questions import recover_questions
 from .buzz import validation_session
 from .codex_rpc import model_catalog
-from .completion import document_answers_incomplete, document_fill_outcome, review_cautions
+from .completion import (
+    answers_incomplete,
+    document_answers_incomplete,
+    document_fill_outcome,
+    form_answers_incomplete,
+    form_content_gaps,
+    form_fill_outcome,
+    form_generation_incomplete,
+    review_cautions,
+)
 from .config import Settings
 from .document_fill import fill_review, prepare_document_forms
 from .drafting import codex_command, generate_answer, recover_completed_result
 from .errors import ConfigurationError, RunCancelled, WorkflowError
 from .followups import read_followup
 from .form_capture import import_form_capture
-from .form_fill import fill_response_forms, prepare_response_forms
+from .form_fill import fill_response_forms, form_gap_reason, prepare_response_forms
 from .form_read import form_references, form_url
 from .google_read import GoogleReader
 from .job_progress import JobProgress
@@ -79,6 +88,42 @@ def read_json(path: Path, default=None):
         return default
 
 
+def normalize_form_fill(receipt):
+    """Migrate presentation coverage, keeping original answers and links intact."""
+    changed = False
+    targets = list(receipt.get("forms", []))
+    if "user_input_fields" in receipt or "remaining_answer_fields" in receipt:
+        targets.append(receipt)
+    for target in targets:
+        if "user_input_fields" not in target:
+            continue
+        previous = target["user_input_fields"]
+        personal = [
+            {**field, "gap_reason": "personal_fact"}
+            for field in previous
+            if form_gap_reason(field.get("title", ""), field.get("review_note", ""))
+            == "personal_fact"
+        ]
+        missing = form_content_gaps(target)
+        optional = [
+            field
+            for field in previous
+            if not field.get("required")
+            and form_gap_reason(field.get("title", ""), field.get("review_note", ""))
+            != "personal_fact"
+        ]
+        updates = {"user_input_fields": personal, "remaining_answer_fields": missing}
+        if optional:
+            updates["optional_empty_fields"] = target.get("optional_empty_fields", []) + optional
+        if any(target.get(key) != value for key, value in updates.items()):
+            target.update(updates)
+            changed = True
+    if form_content_gaps(receipt) and receipt.get("form_mapping_complete") is not False:
+        receipt["form_mapping_complete"] = False
+        changed = True
+    return changed
+
+
 class FrontendJobs:
     def __init__(self, settings: Settings):
         self.settings = settings.validated()
@@ -112,7 +157,10 @@ class FrontendJobs:
                         item["status"] = "interrupted"
                 atomic_json(path, job)
             incomplete = False
+            migrated = False
             for item in job.get("items", []):
+                if item.get("form_fill"):
+                    migrated = normalize_form_fill(item["form_fill"]) or migrated
                 if item.get("status") in {"ready", "document_ready", "document_needs_user"} and (
                     document_answers_incomplete(item)
                 ):
@@ -121,10 +169,23 @@ class FrontendJobs:
                         receipt = {**receipt, "status": "partial"}
                     item.update(document_fill_outcome(receipt))
                     incomplete = True
+                if item.get("status") in {"ready", "form_opened", "needs_form"} and (
+                    form_answers_incomplete(item)
+                ):
+                    generation = item.get("generation") or {}
+                    if item.get("form_requires_regeneration"):
+                        generation = {**generation, "form_mapping_complete": False}
+                    outcome = form_fill_outcome(item.get("form_fill") or {}, generation)
+                    item.update(outcome)
+                    incomplete = True
             if incomplete:
                 if job["status"] == "completed":
                     job["status"] = "completed_with_issues"
-                job["message"] = "原文档还有未完成的题目，请重试补全；已写入的答案会保留。"
+                job["message"] = (
+                    "原文档或表单还有未完成的必填栏，请查看原因并继续处理；已有答案会保留。"
+                )
+                atomic_json(path, job)
+            elif migrated:
                 atomic_json(path, job)
             self._jobs[job["id"]] = job
         queued = read_json(self.root / "answer-fill-requests.json", {})
@@ -302,7 +363,7 @@ class FrontendJobs:
         item = next(x for x in source["items"] if item_key(x) == key)
         if not source.get("ai_confirmed"):
             raise WorkflowError("未确认使用 AI 的资料包不能自动填入。")
-        if document_answers_incomplete(item):
+        if document_answers_incomplete(item) or form_generation_incomplete(item):
             return self.start_selected(
                 [{"course_id": item["course_id"], "assignment_id": item["assignment_id"]}],
                 defer_media=source.get("defer_media", False),
@@ -326,7 +387,9 @@ class FrontendJobs:
             if item["status"] in {"needs_user", "ready"}:
                 item["status"] = "ready"
                 if all(
-                    x["status"] in {"ready", "document_ready", "form_opened"} for x in job["items"]
+                    x["status"] in {"ready", "document_ready", "form_opened"}
+                    and not answers_incomplete(x)
+                    for x in job["items"]
                 ):
                     job["status"] = "completed"
                 job["message"] = (
@@ -403,10 +466,11 @@ class FrontendJobs:
 
     @staticmethod
     def _can_retry_fill(item):
-        generation = item.get("generation", {})
+        generation = item.get("generation") or {}
         return (
             item.get("status") in {"needs_document", "needs_form"}
             and not document_answers_incomplete(item)
+            and not form_generation_incomplete(item)
             and item.get("package")
             and generation.get("status") == "completed"
             and generation.get("document_mapping_complete") is not False
@@ -430,7 +494,7 @@ class FrontendJobs:
             x
             for x in job["items"]
             if x["status"] not in {"ready", "document_ready", "form_opened", "document_needs_user"}
-            or document_answers_incomplete(x)
+            or answers_incomplete(x)
             or (
                 x["status"] == "ready"
                 and not (x.get("package") and valid_answer_document(Path(x["package"])))
@@ -438,10 +502,12 @@ class FrontendJobs:
         ]
         if not remaining:
             return job
-        incomplete_documents = any(document_answers_incomplete(x) for x in remaining)
-        if job["kind"] == "fill" and len(remaining) == 1 and not incomplete_documents:
+        incomplete_mapping = any(
+            document_answers_incomplete(x) or form_generation_incomplete(x) for x in remaining
+        )
+        if job["kind"] == "fill" and len(remaining) == 1 and not incomplete_mapping:
             return self.fill_existing(job_id, item_key(remaining[0]))
-        if (job["kind"] == "fill" and not incomplete_documents) or (
+        if (job["kind"] == "fill" and not incomplete_mapping) or (
             job.get("ai_confirmed") and all(self._can_retry_fill(x) for x in remaining)
         ):
             # The fill adapters revalidate permissions, source context and answer
@@ -463,7 +529,11 @@ class FrontendJobs:
             job = self._jobs[job_id]
             recovered = False
             for item in job["items"]:
-                if item.get("status") == "ready" and item.get("package"):
+                if (
+                    item.get("status") == "ready"
+                    and item.get("package")
+                    and not answers_incomplete(item)
+                ):
                     package = self.package_path(job_id, item_key(item))
                     if valid_answer_document(package):
                         recovered = True
@@ -499,6 +569,7 @@ class FrontendJobs:
                     "completed"
                     if all(
                         x["status"] in {"ready", "document_ready", "form_opened"}
+                        and not answers_incomplete(x)
                         for x in job["items"]
                     )
                     else "completed_with_issues"
@@ -664,7 +735,17 @@ class FrontendJobs:
                 del self._answer_requests[key]
                 atomic_json(self.root / "answer-fill-requests.json", self._answer_requests)
                 try:
-                    return self.fill_existing(job_id, key)
+                    item = next((x for x in source.get("items", []) if item_key(x) == key), None)
+                    if item is None:
+                        raise WorkflowError("找不到需要填入的作业记录。")
+                    if not source.get("ai_confirmed"):
+                        raise WorkflowError("未确认使用 AI 的资料包不能自动填入。")
+                    package = self.package_path(job_id, key)
+                    # Explicitly saved answers may complete an older partial mapping.
+                    # Apply them before deciding whether any model work remains.
+                    return self._start(
+                        "fill", [{**item, "package": str(package)}], ai_confirmed=True
+                    )
                 except WorkflowError as exc:
                     item = next((x for x in source.get("items", []) if item_key(x) == key), None)
                     if item:
@@ -1111,13 +1192,13 @@ class FrontendJobs:
             result = fill_response_forms(
                 self.settings, package, progress=lambda msg: self._log(job_id, msg)
             )
+            generation = read_json(package / "codex-generation.json", {}) or {}
             self._item(
                 job_id,
                 item,
-                status="form_opened",
                 form_fill=result,
-                error=None,
-                generation=read_json(package / "codex-generation.json"),
+                generation=generation,
+                **form_fill_outcome(result, generation),
             )
         except RunCancelled:
             raise

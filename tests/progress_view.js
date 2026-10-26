@@ -2,7 +2,7 @@
 const fs = require('node:fs'), vm = require('node:vm'), assert = require('node:assert/strict'), path = require('node:path');
 const source = fs.readFileSync(path.join(__dirname, '../src/classroomautowork/web/app.js'), 'utf8');
 const code = source.split('// Pure progress presentation;')[1].split('// End pure progress presentation.')[0];
-const {progressView,completedSuccessor,documentContentGaps,documentAnswersIncomplete} = vm.runInNewContext('// ' + code + '\n({progressView,completedSuccessor,documentContentGaps,documentAnswersIncomplete});', {activeStates:new Set(['queued','running','stopping']), labels:{failed:'失败',completed:'结束'},keyOf:x=>x.course_id+':'+x.assignment_id});
+const {progressView,completedSuccessor,documentContentGaps,documentAnswersIncomplete,formContentGaps,formSourceGaps,formSourceDetail,retryActionLabel,formUserInputGaps,formAnswersIncomplete,answersIncomplete,inputAction} = vm.runInNewContext('// ' + code + '\n({progressView,completedSuccessor,documentContentGaps,documentAnswersIncomplete,formContentGaps,formSourceGaps,formSourceDetail,retryActionLabel,formUserInputGaps,formAnswersIncomplete,answersIncomplete,inputAction});', {activeStates:new Set(['queued','running','stopping']), labels:{failed:'失败',completed:'结束'},keyOf:x=>x.course_id+':'+x.assignment_id});
 const now = Date.parse('2026-01-01T00:10:00Z'), network = {lastSuccess:now,error:null};
 const job = {status:'running',kind:'review',items:[{status:'preparing'}],created_at:'2026-01-01T00:00:00Z',updated_at:'2026-01-01T00:00:00Z',message:'Checking attachment offline-id',events:[]};
 let v = progressView(job, network, now);
@@ -245,18 +245,18 @@ const waiting = {...job,status:'completed_with_issues',kind:'fill',items:[missin
 const cardCode = source.slice(source.indexOf('function jobCard('),source.indexOf('function renderJobs('));
 const {jobCard} = vm.runInNewContext(cardCode+'\n({jobCard});',{
   state:{jobs:[],monitorOnly:false},activeStates:new Set(['queued','running','stopping']),labels:{completed_with_issues:'处理已结束'},
-  node:element,button:element,pill:status=>element('span',status),safeLink:()=>null,codexLink:()=>null,
+  node:element,button:(text,className)=>element('button',text,className),pill:status=>element('span',status),safeLink:()=>null,codexLink:()=>null,
   keyOf:x=>x.course_id+':'+x.assignment_id,inputAction:()=>({label:'调整答案或说明（可选）'}),
-  completedSuccessor,jobProgress:()=>element('div','progress'),friendlyError:x=>x
+  completedSuccessor,retryActionLabel,jobProgress:()=>element('div','progress'),friendlyError:x=>x
 });
 assert.doesNotThrow(()=>jobCard({...waiting,id:'unit-job',events:[]}));
-const completedLater = {...waiting,id:'unit-later',created_at:'2026-01-02T00:00:00Z',status:'completed',items:[{...missing,status:'form_opened'}]};
+const completedLater = {...waiting,id:'unit-later',created_at:'2026-01-02T00:00:00Z',status:'completed',items:[{...missing,status:'form_opened',form_fill:{forms:[{prefilled_fields:13,remaining_answer_fields:[],user_input_fields:[]}]}}]};
 assert.equal(completedSuccessor(waiting,[waiting,completedLater]).job.id,'unit-later');
 assert.equal(completedSuccessor(waiting,[waiting,{...completedLater,items:[{...missing,status:'needs_form'}]}]),null);
 v = progressView(waiting,network,now);
-assert.equal(v.active,false); assert.equal(v.index,3); assert.equal(v.ready,1);
-assert.match(v.title,/答案已交付/); assert.match(v.explanation,/7 栏/); assert.match(v.explanation,/6 项/);
-assert.doesNotMatch(v.explanation,/等待补充|重试不会自动补齐/);
+assert.equal(v.active,false); assert.notEqual(v.index,3); assert.equal(v.ready,0);
+assert.match(v.title,/必填栏未完成/); assert.match(v.explanation,/补全答案/);
+assert.equal(completedSuccessor(waiting,[waiting,{...completedLater,items:[{...missing,status:'form_opened'}]}]),null);
 v = progressView({...waiting,items:[{...missing,form_fill:undefined}]},network,now);
 assert.equal(v.ready,0); assert.doesNotMatch(v.title,/答案已交付/);
 const retryCode = source.slice(source.indexOf('async function jobAction('),source.indexOf('function renderEfforts('));
@@ -269,7 +269,7 @@ const {jobAction} = vm.runInNewContext(retryCode+'\n({jobAction});',{state:{jobs
 })().catch(error=>{console.error(error);process.exitCode=1;});
 
 const selectionCode = source.slice(source.indexOf('function hasAnswer('),source.indexOf('function filtered('));
-const {hasAnswer,delivered,selectTargets} = vm.runInNewContext(selectionCode+'\n({hasAnswer,delivered,selectTargets});',{documentAnswersIncomplete,keyOf:x=>x.course_id+':'+x.assignment_id});
+const {hasAnswer,delivered,selectTargets} = vm.runInNewContext(selectionCode+'\n({hasAnswer,delivered,selectTargets});',{answersIncomplete,keyOf:x=>x.course_id+':'+x.assignment_id});
 const visible = [{course_id:'1',assignment_id:'1'},{course_id:'1',assignment_id:'2'},{course_id:'1',assignment_id:'3'}];
 const ready = {status:'ready',answer_document:{files:{'answer.docx':'verified-hash'}}};
 const latest = new Map([['1:2',{item:ready}]]);
@@ -292,6 +292,32 @@ v = progressView({...job,status:'completed',items:[incompleteDoc]},network,now);
 assert.equal(v.ready,0); assert.equal(v.localReady,0); assert.notEqual(v.index,3);
 assert.match(v.title,/仍有题目未完成/); assert.match(v.explanation,/补全/);
 assert.equal(documentContentGaps({remaining_required_fields:[{id:'q2'}],documents:[{remaining_required_fields:[{id:'q2'}]}]}).length,1);
+assert.equal(delivered({...missing,status:'form_opened'}),false);
+assert.equal(delivered({...missing,status:'form_opened',form_fill:{forms:[{remaining_fields:[{required:false}]}]}}),true);
+assert.equal(delivered({...missing,status:'form_opened',generation:{form_mapping_complete:false}}),false);
+assert.equal(delivered({...missing,status:'form_opened',form_fill:{form_mapping_complete:true,forms:[{remaining_answer_fields:[],user_input_fields:[]}]},generation:{form_mapping_complete:false}}),true);
+assert.equal(formAnswersIncomplete({form_fill:{forms:[{remaining_answer_fields:[],user_input_fields:[{required:true,title:'学年'}]}]}}),true);
+assert.equal(formContentGaps({forms:[{remaining_fields:[{required:true}],remaining_answer_fields:[]}]}).length,0);
+const nativeOnly = {...missing,status:'needs_form',form_fill:{form_mapping_complete:true,forms:[{remaining_answer_fields:[],unsupported_fields:[{required:true,title:'添付'}]}]}};
+assert.equal(formAnswersIncomplete(nativeOnly),true);
+assert.equal(inputAction(nativeOnly).count,0); // Native controls are completed in the original form.
+v = progressView({...waiting,items:[nativeOnly]},network,now);
+assert.match(v.explanation,/原表单使用原生控件/); assert.doesNotMatch(v.explanation,/重新核对题目/);
+const sourceFields = Array.from({length:17}, (_,index)=>({entry_id:String(index),title:`Question ${index}`,required:true,gap_reason:'missing_source',review_note:index % 2 ? '第4页第8题：缺少女子对住宿的评价，无法判断是否失望。' : '第3页第1题：缺少冰旅馆原文，无法判断受欢迎程度。'}));
+const sourceItem = {...missing,status:'needs_form',form_fill:{form_mapping_complete:false,forms:[{remaining_answer_fields:sourceFields,user_input_fields:[]}]}};
+const sourceJob = {...waiting,items:[sourceItem]};
+v = progressView(sourceJob,network,now);
+assert.match(v.title,/作答资料尚未读全/); assert.match(v.explanation,/17 个必答题缺少作答资料/);
+assert.match(v.explanation,/缺少冰旅馆原文/); assert.doesNotMatch(v.explanation,/17 栏必填信息|请补充/);
+assert.equal(inputAction(sourceItem).count,0); assert.equal(retryActionLabel(sourceJob),'再次读取资料并补全');
+assert.equal(retryActionLabel(waiting),'重试 / 继续');
+const sourceCard = jobCard({...sourceJob,id:'source-job',events:[]});
+assert.equal(sourceCard.children[0].children[1].textContent,'再次读取资料并补全');
+const formReceiptCode = source.slice(source.indexOf('function appendFormReceipt('),source.indexOf('function assignmentRow('));
+const {appendFormReceipt} = vm.runInNewContext(formReceiptCode+'\n({appendFormReceipt});',{node:element,formContentGaps,formSourceGaps,formSourceDetail,formUserInputGaps});
+const sourceRow = element('div'); appendFormReceipt(sourceRow,sourceItem.form_fill);
+assert.equal(sourceRow.children.length,1); assert.match(sourceRow.children[0].textContent,/17 个必答题缺少作答资料/);
+assert.match(sourceRow.children[0].textContent,/女子对住宿/); assert.doesNotMatch(sourceRow.children[0].textContent,/必填信息/);
 console.log('One-click scope, existing-answer skip and missing-result regression checks passed');
 
 // A generated answer must remain discoverable until Classroom reports submission.

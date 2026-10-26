@@ -15,7 +15,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 from .errors import PermissionDenied, WorkflowError
 
 MAX_PAGE_BYTES = 4 * 1024 * 1024
-PARSER_VERSION = "published-form-v1"
+PARSER_VERSION = "published-form-v2-images"
 FORM_PATH = re.compile(
     r"/forms/(?:u/\d+/)?d/(e/)?([A-Za-z0-9_-]{8,200})/(?:viewform|formResponse)/?"
 )
@@ -94,7 +94,7 @@ def parse_form(html: str, url: str) -> dict:
         title, description, items = body[8], body[0], body[1]
         if not isinstance(title, str) or not isinstance(items, list) or len(items) > 1000:
             raise ValueError
-        sections, questions, warnings, page = [], [], [], 1
+        sections, questions, media, warnings, page = [], [], [], [], 1
         for item in items:
             item_id, label, help_text, kind, entries = item[:5]
             if not isinstance(item_id, int) or not isinstance(kind, int):
@@ -105,6 +105,35 @@ def parse_form(html: str, url: str) -> dict:
                 sections.append(
                     {"page": page, "title": label or "", "description": help_text or ""}
                 )
+                continue
+            if kind == 11:
+                # Native image items carry an opaque media ID and dimensions,
+                # not a public download URL. The authorized browser supplies
+                # pixels separately; never guess a URL from this identifier.
+                descriptor = item[6] if len(item) > 6 else None
+                if (
+                    not isinstance(descriptor, list)
+                    or len(descriptor) < 3
+                    or not isinstance(descriptor[0], str)
+                    or not re.fullmatch(r"[A-Za-z0-9_-]{8,200}", descriptor[0])
+                    or not isinstance(descriptor[2], list)
+                    or len(descriptor[2]) < 2
+                    or any(type(value) is not int or value <= 0 for value in descriptor[2][:2])
+                ):
+                    warnings.append("表单包含无法识别的图像，需在原页面核对。")
+                    continue
+                picture = {
+                    "item_id": str(item_id),
+                    "page": page,
+                    "title": label or "",
+                    "description": help_text or "",
+                    "type": "image",
+                    "media_id": descriptor[0],
+                    "width": descriptor[2][0],
+                    "height": descriptor[2][1],
+                }
+                media.append(picture)
+                warnings.append(image_gap_warning(picture))
                 continue
             if kind not in TYPES:
                 warnings.append("表单包含需目视核对的图像、视频或未知题型；不可声称已完整读取。")
@@ -153,6 +182,7 @@ def parse_form(html: str, url: str) -> dict:
             "page_count": page,
             "questions": questions,
             "sections": sections,
+            "media": media,
             "warnings": list(dict.fromkeys(warnings)),
             "read_complete": not warnings,
             "parser": PARSER_VERSION,
@@ -161,6 +191,13 @@ def parse_form(html: str, url: str) -> dict:
         raise WorkflowError(
             "Google Forms 题目结构无法可靠识别，已停止；不能以链接或模板冒充题目。"
         ) from exc
+
+
+def image_gap_warning(picture: dict) -> str:
+    return (
+        f"Google Forms 第 {picture['page']} 页图片材料尚未读取："
+        f"{picture['title'] or picture['item_id']}（item {picture['item_id']}）。"
+    )
 
 
 def read_form(url: str) -> dict:
@@ -200,8 +237,14 @@ def form_chunks(form: dict) -> list[dict]:
             "locator": "Google Forms title and section requirements",
             "text": json.dumps(
                 {
-                    key: form[key]
-                    for key in ("title", "description", "sections", "read_complete", "warnings")
+                    **{
+                        key: form[key]
+                        for key in ("title", "description", "sections", "read_complete", "warnings")
+                    },
+                    "media": [
+                        {k: v for k, v in picture.items() if k not in {"image_path", "sha256"}}
+                        for picture in form.get("media", [])
+                    ],
                 },
                 ensure_ascii=False,
             ),
@@ -213,6 +256,17 @@ def form_chunks(form: dict) -> list[dict]:
                 **base,
                 "locator": f"Google Forms page {question['page']} item {question['item_id']}",
                 "text": json.dumps(question, ensure_ascii=False),
+            }
+        )
+    for picture in form.get("media", []):
+        chunks.append(
+            {
+                **base,
+                "locator": f"Google Forms page {picture['page']} image {picture['item_id']}",
+                "text": json.dumps(
+                    {k: v for k, v in picture.items() if k != "image_path"}, ensure_ascii=False
+                ),
+                **({"image_path": picture["image_path"]} if picture.get("image_path") else {}),
             }
         )
     return chunks

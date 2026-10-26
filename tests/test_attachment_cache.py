@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from classroomautowork.attachment_cache import download_revision, legacy_download
+from classroomautowork.policy import CoursePolicy
 from classroomautowork.store import Store, artifact, fingerprint
 from classroomautowork.workflow import sync_course
 
@@ -194,3 +195,52 @@ def test_native_or_unverifiable_content_retains_version_invalidation():
         assert download_revision({**metadata, **extra}) != download_revision(
             {**changed_version, **extra}
         )
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_download_budget_allows_complete_matching_cache_after_live_permission_check(
+    tmp_path, legacy
+):
+    reader = BinaryReader()
+    settings = SimpleNamespace(data_dir=tmp_path)
+    metadata = reader.file_metadata("unit-file-01")
+    revision = (
+        fingerprint(
+            {k: metadata.get(k) for k in ("id", "version", "mimeType", "size", "md5Checksum")}
+        )
+        if legacy
+        else download_revision(metadata)
+    )
+    CoursePolicy(max_attachment_bytes=1).save(tmp_path, "1")
+    with Store(tmp_path) as store:
+        store.memo(
+            "drive-download",
+            revision,
+            lambda key: reader.save(metadata, tmp_path / "attachments" / key[:24]),
+        )
+        result = sync_course(reader, settings, store, "1")
+        assert not result["warnings"] and reader.downloads == 0
+        assert any("unchanged lecture" in chunk["text"] for chunk in store.chunks("1"))
+        reader.denied = True
+        denied = sync_course(reader, settings, store, "1")
+        assert "no cached attachment" in denied["warnings"][0]["error"]
+        assert not any(x["source_id"].startswith("file:") for x in store.chunks("1"))
+
+
+@pytest.mark.parametrize("cache_state", ["missing", "corrupt", "stale"])
+def test_download_budget_still_blocks_oversized_new_or_unverified_content(tmp_path, cache_state):
+    reader = BinaryReader()
+    settings = SimpleNamespace(data_dir=tmp_path)
+    with Store(tmp_path) as store:
+        if cache_state != "missing":
+            sync_course(reader, settings, store, "1")
+            if cache_state == "corrupt":
+                next((tmp_path / "attachments").glob("*/*.txt")).write_bytes(b"damaged")
+            else:
+                reader.content = "食品安全 changed lecture".encode()
+        previous_downloads = reader.downloads
+        CoursePolicy(max_attachment_bytes=1).save(tmp_path, "1")
+        result = sync_course(reader, settings, store, "1")
+        assert reader.downloads == previous_downloads
+        assert "download budget" in result["warnings"][0]["error"]
+        assert not any(x["source_id"].startswith("file:") for x in store.chunks("1"))

@@ -23,17 +23,43 @@ function documentAnswersIncomplete(item) {
   const fill = item?.document_fill;
   return !!(item?.requires_regeneration || documentContentGaps(fill).length || fill?.status === "partial" || fill?.documents?.some(doc => doc.status === "partial"));
 }
+function formContentGaps(fill) {
+  if (Object.hasOwn(fill || {}, "remaining_answer_fields")) return fill.remaining_answer_fields || [];
+  return fill?.forms?.length ? fill.forms.flatMap(form => Object.hasOwn(form, "remaining_answer_fields") ? form.remaining_answer_fields || [] : (form.remaining_fields || []).filter(field => field.required)) : (fill?.remaining_fields || []).filter(field => field.required);
+}
+function formUserInputGaps(fill, keys = ["user_input_fields", "unsupported_fields"]) {
+  return keys.flatMap(key => Object.hasOwn(fill || {}, key) ? fill[key] || [] : (fill?.forms || []).flatMap(form => form[key] || [])).filter(field => field.required);
+}
+function formSourceGaps(fill) {
+  return formContentGaps(fill).filter(field => field.gap_reason === "missing_source");
+}
+function formSourceDetail(fields) {
+  return [...new Set(fields.map(field => (field.review_note || "").replace(/^第\d+页第\d+题[：:]\s*/, "").trim()).filter(Boolean))].slice(0, 2).join("；").slice(0, 180);
+}
+function retryActionLabel(job) {
+  return job.items?.some(item => formSourceGaps(item.form_fill).length) ? "再次读取资料并补全" : "重试 / 继续";
+}
+function formGenerationIncomplete(item) {
+  const mapping = Object.hasOwn(item?.form_fill || {}, "form_mapping_complete") ? item.form_fill.form_mapping_complete : item?.generation?.form_mapping_complete;
+  return !!((item?.form_requires_regeneration && item?.form_fill?.form_mapping_complete !== true) || mapping === false || formContentGaps(item?.form_fill).length);
+}
+function formAnswersIncomplete(item) {
+  return formGenerationIncomplete(item) || !!formUserInputGaps(item?.form_fill).length;
+}
+function answersIncomplete(item) {
+  return documentAnswersIncomplete(item) || formAnswersIncomplete(item);
+}
 function inputAction(item) {
   if (!item.package) return null;
-  const count = (item.form_fill?.forms || []).flatMap(f=>f.remaining_fields || []).filter(f=>f.required).length;
-  return {key:keyOf(item), count, label:"调整答案或说明（可选）"};
+  const count = formUserInputGaps(item.form_fill, ["user_input_fields"]).length;
+  return {key:keyOf(item), count, label:count ? `补充 ${count} 栏必填信息` : "调整答案或说明（可选）"};
 }
 function completedSuccessor(job, jobs) {
   if (activeStates.has(job.status) || job.items?.length !== 1 || !["needs_user", "document_needs_user", "needs_form", "needs_document"].includes(job.items[0].status)) return null;
   const key = keyOf(job.items[0]);
   const latest = [...jobs].filter(x=>["fill", "review"].includes(x.kind) && x.created_at > job.created_at && x.items.some(item=>keyOf(item) === key)).sort((a,b)=>b.created_at.localeCompare(a.created_at))[0];
   const item = latest?.items.find(x=>keyOf(x) === key);
-  return ["form_opened", "document_ready"].includes(item?.status) && !documentAnswersIncomplete(item) ? {job:latest,item} : null;
+  return ["form_opened", "document_ready"].includes(item?.status) && !answersIncomplete(item) ? {job:latest,item} : null;
 }
 function aiActivity(generation) {
   if (!generation?.thread_id || !/^[a-f0-9-]{36}$/i.test(generation.thread_id)) return null;
@@ -183,9 +209,10 @@ function progressView(job, network, now = Date.now()) {
   if (stage === "transcribe" && p.phase === "prepare") { title = "正在准备 Buzz 转录音频"; explanation = "先从录像提取本段音频，再交给 Buzz 识别；音频准备与语音识别分别计量。"; }
   const legacy = active && !job.approval && !job.progress && /^Checking attachment /.test(job.message || "");
   if (legacy) { title = "正在处理课程附件"; explanation = "这次由旧版启动，未报告附件内部的子步骤。下载、提取或转录可能耗时，保持任务运行，无需重新开始。"; }
-  const ready = items.filter(x => !documentAnswersIncomplete(x) && (["document_ready", "document_needs_user", "form_opened"].includes(x.status) || x.document_fill?.documents?.length || x.form_fill?.forms?.some(f=>f.prefilled_fields > 0))).length;
-  const localReady = items.filter(x => !documentAnswersIncomplete(x) && (x.status === "ready" || x.answer_document)).length;
+  const ready = items.filter(x => !answersIncomplete(x) && (["document_ready", "document_needs_user", "form_opened"].includes(x.status) || x.document_fill?.documents?.length || x.form_fill?.forms?.some(f=>f.prefilled_fields > 0))).length;
+  const localReady = items.filter(x => !answersIncomplete(x) && (x.status === "ready" || x.answer_document)).length;
   const incompleteDocuments = items.filter(documentAnswersIncomplete).length;
+  const incompleteForms = items.filter(formAnswersIncomplete).length;
   const failed = items.filter(x => x.status === "failed").length;
   const needsInput = items.filter(x => ["needs_user", "document_needs_user", "needs_document", "needs_form"].includes(x.status)).length;
   const finished = items.filter(x => ["ready", "document_ready", "document_needs_user", "form_opened", "needs_form", "needs_document", "needs_user", "materials_ready", "failed"].includes(x.status)).length;
@@ -224,9 +251,15 @@ function progressView(job, network, now = Date.now()) {
   if (!active) {
     title = failed && stage === "validate" ? "结果核验未通过" : ready || localReady ? "答案已交付 · 请审阅" : labels[job.status] || job.status;
     explanation = failed ? `本次 ${failed} 项未完成；请查看具体原因。点击重试会自动核对原题和缓存资料后继续；已生成的答案入口仍保留。` : ready ? "请在已填入的原文档或预填原表单审阅，最后由你手动提交。" : localReady ? (items.some(x => x.answer_document) ? "本机答案文件已生成，请点击打开答案或下载 Word 审阅，最后手动提交。" : "逐题答案已核验；请继续自动填写后在原页面审阅，最后手动提交。") : needsInput ? "这条历史记录尚无可审阅的完整答案。点击重试会自动核对资料并继续作答；调整说明为可选操作。" : "请查看各项作业的结果与审阅提示。";
-    const forms = items.flatMap(x=>x.form_fill?.forms || []), remaining = forms.flatMap(f=>f.remaining_fields || []).filter(f=>f.required).length;
-    if (ready && remaining) explanation += ` 已准备 ${forms.reduce((n,f)=>n+(f.prefilled_fields || 0),0)} 栏候选答案；${remaining} 项实际个人信息请在原页面审阅时核对，其他答案已交付。`;
     if (incompleteDocuments) { title = "原文档仍有题目未完成"; explanation = `${incompleteDocuments} 项作业仍有未填写的题目或答案栏。已写入的答案已保留，点击重试会重新核对题目并补全。`; }
+    if (incompleteForms) {
+      const inputs = items.flatMap(x=>formUserInputGaps(x.form_fill, ["user_input_fields"])), native = items.flatMap(x=>formUserInputGaps(x.form_fill, ["unsupported_fields"])), sources = items.flatMap(x=>formSourceGaps(x.form_fill));
+      title = sources.length ? "原表单的作答资料尚未读全" : "原表单仍有必填栏未完成";
+      explanation = `${incompleteForms} 项表单尚未填完，已有答案已保留。`
+        + (sources.length ? `${sources.length} 个必答题缺少作答资料。${formSourceDetail(sources)}点击“再次读取资料并补全”继续。` : items.some(formGenerationIncomplete) ? "点击重试会重新核对题目并补全答案。" : "")
+        + (inputs.length ? `请补充 ${inputs.length} 栏必填信息后重新填入。` : "")
+        + (native.length ? `另有 ${native.length} 栏需要在原表单使用原生控件完成。` : "");
+    }
   }
   const index = !active && (ready || localReady) ? 3 : ["fill", "form_fill", "document_create"].includes(stage) ? 2 : ["ai", "validate", "approval"].includes(stage) ? 1 : 0;
   const nowOrEnd = job.finished_at ? Date.parse(job.finished_at) : now;
@@ -317,7 +350,7 @@ function hasAnswer(item) {
   return !!(item?.answer_document?.files?.["answer.docx"] || item?.document_fill?.documents?.length || item?.form_fill?.forms?.length);
 }
 function delivered(item) {
-  return !documentAnswersIncomplete(item) && hasAnswer(item) && ["ready", "document_ready", "document_needs_user", "form_opened"].includes(item.status);
+  return !answersIncomplete(item) && hasAnswer(item) && ["ready", "document_ready", "document_needs_user", "form_opened"].includes(item.status);
 }
 function selectTargets(visible, selected, latest) {
   return visible.filter(item => !delivered(latest.get(keyOf(item))?.item) && (!selected.size || selected.has(keyOf(item))));
@@ -392,12 +425,20 @@ function appendDocumentReceipt(parent, fill) {
   if (gaps.length) parent.append(node("p", `仍有 ${gaps.length} 个题目或答案栏未完成：` + gaps.map(gap => typeof gap === "string" ? gap : gap.label || gap.id || "未识别的题目").join("；"), "small warning"));
   for (const warning of fill?.identity_warnings || []) parent.append(node("p", warning, "small warning"));
 }
+function appendFormReceipt(parent, fill) {
+  const sources = formSourceGaps(fill);
+  if (sources.length) parent.append(node("p", `${sources.length} 个必答题缺少作答资料。${formSourceDetail(sources)}`, "small warning"));
+  for (const [fields, message] of [[formContentGaps(fill).filter(field => field.gap_reason !== "missing_source"), "必答题未填写"], [formUserInputGaps(fill, ["user_input_fields"]), "必填信息需要补充"], [formUserInputGaps(fill, ["unsupported_fields"]), "必填栏需要在原表单操作"]]) {
+    if (fields.length) parent.append(node("p", `${fields.length} 栏${message}：` + fields.map(field => field.title || field.label || field.entry_id).filter(Boolean).join("；"), "small warning"));
+  }
+}
 function assignmentRow(item, record, result = false) {
   const key = keyOf(item), row = node("article", undefined, "assignment-row");
   row.classList.toggle("selected", state.selected.has(key));
   const body = node("div", undefined, "assignment-main"), title = node("div", item.title || item.assignment_id, "assignment-title"), meta = node("div", item.course_name || "课程作业", "assignment-meta");
   body.append(title, meta);
   appendDocumentReceipt(body, record?.item.document_fill);
+  appendFormReceipt(body, record?.item.form_fill);
   if (!result) {
     const label = node("label"), check = node("input"); check.type = "checkbox"; check.checked = state.selected.has(key); check.disabled = !!state.active || delivered(record?.item);
     check.setAttribute("aria-label", "选择作业 " + (item.title || item.assignment_id));
@@ -415,8 +456,8 @@ function assignmentRow(item, record, result = false) {
     if (delivered(record.item)) {
       side.append(node("span", "答案已生成 · Classroom 尚未提交", "result-status"));
       actions.append(resultAction(record.job, record.item));
-    } else if (documentAnswersIncomplete(record.item) || ["failed", "paused", "interrupted", "needs_user", "needs_document", "needs_form"].includes(record.item.status)) {
-      side.append(node("span", documentAnswersIncomplete(record.item) ? "仍有题目未完成 · 可重试补全" : labels[record.item.status] || "上次未完成", "small warning"));
+    } else if (answersIncomplete(record.item) || ["failed", "paused", "interrupted", "needs_user", "needs_document", "needs_form"].includes(record.item.status)) {
+      side.append(node("span", answersIncomplete(record.item) ? "仍有必填栏未完成 · 请继续处理" : labels[record.item.status] || "上次未完成", "small warning"));
       if (record.item.error) body.append(node("p", friendlyError(record.item.error), "small warning"));
       if (hasAnswer(record.item)) actions.append(resultAction(record.job, record.item));
     }
@@ -425,6 +466,8 @@ function assignmentRow(item, record, result = false) {
   if (record?.item.package) actions.append(button("详情", "text-button small", () => openReview(record.job.id, key)));
   else if (record?.item.error) actions.append(button("查看原因", "text-button small", () => showJob(record.job.id)));
   else { const link = safeLink(item.url, "查看课堂 ↗", "text-button small"); if (link) actions.append(link); }
+  const input = record && inputAction(record.item);
+  if (input?.count && !state.monitorOnly) actions.append(button(input.label, "button primary small-button", () => openSupplement(record.job.id, key)));
   side.append(actions); row.append(side); return row;
 }
 function renderResults() {
@@ -515,7 +558,7 @@ function jobCard(job, full = false) {
   if (full) intro.append(node("span", dateLabel(job.created_at, true), "muted small")); heading.append(intro);
   if (activeStates.has(job.status) && !state.monitorOnly) { const pause = button(job.status === "stopping" ? "正在暂停…" : "暂停", "button secondary small-button", () => jobAction(job.id, "pause")); pause.disabled = job.status === "stopping"; heading.append(pause); }
   else if (!state.monitorOnly && later) heading.append(button("查看最新结果", "button secondary", ()=>showJob(later.job.id)));
-  else if (!state.monitorOnly && (job.kind === "review" || job.status !== "completed")) heading.append(button("重试 / 继续", "button secondary small-button", () => jobAction(job.id, "retry")));
+  else if (!state.monitorOnly && (job.kind === "review" || job.status !== "completed")) heading.append(button(retryActionLabel(job), "button secondary small-button", () => jobAction(job.id, "retry")));
   card.append(heading);
   if (later) { const note = node("div", undefined, "job-live-detail"); note.append(node("strong", "旧记录中的缺口已在后续处理补齐"),node("p", `最新结果：${dateLabel(later.job.created_at,true)}。这条记录保留当时的处理状态，无需再次填写。`)); card.append(note); } else card.append(jobProgress(job));
   const items = node("div", undefined, "job-items");
@@ -638,6 +681,7 @@ async function openReview(jobId, key, initialTab) {
       appendDocumentReceipt($("originalDocumentAction"), data.document_fill);
     }
     else if (prefilled) $("reviewStatus").textContent += ` · 原表单已准备 ${prefilled.prefilled_fields} 栏预填答案，请在原表单审阅`;
+    if (prefilled) appendFormReceipt($("originalDocumentAction"), data.form_fill);
     if (prefilled) { const note = node("p", "预填入口会重新带入候选答案；已在 Google 中修改过的内容请从下方原始链接继续审阅。浏览器草稿保存状态以 Google 页面为准。", "small"); $("originalDocumentAction").append(note); const saved = safeLink(prefilled.original_url, "继续 Google 中保存的草稿 ↗"); if (saved) $("originalDocumentAction").append(saved); for (const question of prefilled.needs_user || []) $("originalDocumentAction").append(node("p", question, "small warning")); }
     $("fillDocumentButton").textContent = responseForm ? "自动填入原表单" : "填入已有初稿";
     $("downloadAnswerButton").hidden = !data.text["draft.md"] || state.monitorOnly;

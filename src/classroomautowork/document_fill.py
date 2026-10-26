@@ -18,6 +18,7 @@ from google_auth_httplib2 import AuthorizedHttp
 from googleapiclient.discovery import build
 
 from .document_slots import (
+    explicit_answer_slots,
     identity_slots,
     inline_slots,
     paragraph_options,
@@ -177,6 +178,8 @@ def inspect_form(document, *, include_identity=False):
             continue
         section, academic_section, question_context, option_context = "", "", "", ""
         prompt_counts = {}
+        section_instructions = []
+        section_number = -1
         answer_paragraphs = set()
         for i, element in enumerate(body):
             if i in answer_paragraphs:
@@ -225,23 +228,64 @@ def inspect_form(document, *, include_identity=False):
             elif "paragraph" in element:
                 label = paragraph_text(element).strip()
                 instructions.append(label)
+                # Native list numbering can belong to questions as well as options.
+                # Keep ordinary list items protected, while recognizing explicit
+                # question prompts whose following paragraph is the answer slot.
+                if "bullet" in element["paragraph"] and not (
+                    SECTION.match(label)
+                    or WRITTEN_PROMPT.search(label)
+                    or REASON_PROMPT.fullmatch(label)
+                    or re.search(r"[?？]$", label)
+                ):
+                    if label:
+                        section_instructions.append(label)
+                    continue
                 if re.match(r"^(?:課題|問)[①-⑳0-9０-９]", label):
                     section = label
                 if SECTION.match(label):
                     academic_section, question_context, option_context = label, "", ""
+                    section_instructions = []
+                    section_number += 1
                 slots = inline_slots(paragraph_text(element)) if plain_container([element]) else []
+                labeled_slots = (
+                    explicit_answer_slots(paragraph_text(element))
+                    if plain_container([element])
+                    else []
+                )
+                slots += labeled_slots
                 if include_identity and plain_container([element]):
                     slots += identity_slots(paragraph_text(element))
                 if slots:
                     text = paragraph_text(element)
-                    context = [section, slot_template(text, slots)]
+                    context = (
+                        [*section_instructions, slot_template(text, slots)]
+                        if labeled_slots
+                        else [section, slot_template(text, slots)]
+                    )
                     for slot in slots:
                         start, end = slot["span"]
+                        field_id = f"{tab['id']}/paragraph:{i}/{slot['kind']}"
+                        if labeled_slots:
+                            count_key = (academic_section, slot["label"])
+                            occurrence = prompt_counts.get(count_key, 0)
+                            prompt_counts[count_key] = occurrence + 1
+                            field_id = (
+                                f"{tab['id']}/labeled:"
+                                + digest([academic_section, slot["label"], occurrence])[:16]
+                            )
                         fields.append(
                             {
                                 **slot,
-                                "id": f"{tab['id']}/paragraph:{i}/{slot['kind']}",
+                                "id": field_id,
                                 "tab_id": tab["id"],
+                                **(
+                                    {
+                                        "section": academic_section,
+                                        "section_id": f"{tab['id']}/section:{section_number}",
+                                    }
+                                    if labeled_slots
+                                    else {}
+                                ),
                                 "context": "\n".join(context),
                                 "context_sha256": digest(context),
                                 "index": element["startIndex"] + utf16_length(text[:start]),
@@ -250,6 +294,8 @@ def inspect_form(document, *, include_identity=False):
                             }
                         )
                     continue
+                if label:
+                    section_instructions.append(label)
                 written_prompt = bool(WRITTEN_PROMPT.search(label))
                 legacy_prompt = (
                     label.startswith("■")
@@ -296,6 +342,12 @@ def inspect_form(document, *, include_identity=False):
                 if "paragraph" not in following or not plain_container([following]):
                     if new_prompt and not SECTION.match(label):
                         unrecognized.append({"label": label, "context": context})
+                    continue
+                if "bullet" in following["paragraph"] or explicit_answer_slots(
+                    paragraph_text(following)
+                ):
+                    # The explicit label owns its answer span; list options remain
+                    # protected instructions even when they follow a written prompt.
                     continue
                 # Only a label followed by an actual answer paragraph. A heading followed
                 # by instructions (not a blank paragraph) is never treated as a fill slot.
@@ -639,6 +691,60 @@ def own_document_ids(reader, course_id, assignment_id):
     ]
 
 
+def template_matches_source(document, source_text):
+    """Require every protected paragraph in order in the verified source export.
+
+    PDF exports add line wraps, list numbers and numeric page footers;
+    do not remap a saved draft onto changed questions with familiar answer labels.
+    """
+
+    def normalize(value):
+        return re.sub(r"\s+", "", unicodedata.normalize("NFKC", value))
+
+    def export_numbers(value):
+        return re.fullmatch(r"[0-9.()\[\]、]*", value) is not None
+
+    source = normalize(source_text)
+    if not source:
+        return False
+    form = inspect_form(document, include_identity=True)
+    editable, inline = set(), {}
+    for field in form["fields"]:
+        if "span" in field:
+            inline.setdefault((field["tab_id"], field["paragraph_index"]), []).append(field)
+        else:
+            editable.add((field["tab_id"], field["index"]))
+
+    def paragraphs(content):
+        for element in content:
+            if "paragraph" in element:
+                yield element
+            elif "table" in element:
+                for row in element["table"].get("tableRows", []):
+                    for cell in row.get("tableCells", []):
+                        yield from paragraphs(cell.get("content", []))
+
+    cursor, checked = 0, 0
+    for tab in document_tabs(document):
+        for paragraph in paragraphs(tab["content"]):
+            key = (tab["id"], paragraph["startIndex"])
+            if key in editable:
+                continue
+            text = paragraph_text(paragraph)
+            for field in sorted(inline.get(key, []), key=lambda f: f["span"][0], reverse=True):
+                start, end = field["span"]
+                text = text[:start] + text[end:]
+            protected = normalize(text)
+            if not protected:
+                continue
+            found = source.find(protected, cursor)
+            if found < 0 or not export_numbers(source[cursor:found]):
+                return False
+            cursor = found + len(protected)
+            checked += 1
+    return bool(checked) and export_numbers(source[cursor:])
+
+
 def fill_personal_document(
     reader,
     documents,
@@ -649,6 +755,8 @@ def fill_personal_document(
     answers,
     record_dir: Path,
     student_profile=None,
+    verified_draft=None,
+    original_text=None,
 ):
     """Fresh personal-submission allowlist, private lock/plan/receipt and verified write."""
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,200}", document_id):
@@ -669,6 +777,23 @@ def fill_personal_document(
         ):
             raise PermissionDenied("文档必须由当前学校账户拥有并可编辑，不修改共享的教师原件。")
         before = documents.get(document_id)
+        recovery = None
+        if verified_draft and original_text:
+            from .document_answer_recovery import recover_labeled_answers
+
+            recovered = recover_labeled_answers(inspect_form(before), verified_draft, answers)
+            if recovered is not None and recovered != answers:
+                if not template_matches_source(before, original_text):
+                    raise WorkflowError("原题与已核验初稿的来源不一致，请重新读题；未修改文档。")
+                recovery = {
+                    "kind": "verified_draft_labels",
+                    "draft_sha256": hashlib.sha256(verified_draft.encode("utf-8")).hexdigest(),
+                    "source_sha256": hashlib.sha256(original_text.encode("utf-8")).hexdigest(),
+                    "original_answers": answers,
+                    "recovered_answers": recovered,
+                    "recovered_at": utc_now(),
+                }
+                answers = recovered
         plan = plan_fill(before, answers, student_profile=student_profile)
         attempt_dir = record_dir / "attempts" / uuid.uuid4().hex
         attempt_dir.mkdir(parents=True)
@@ -676,6 +801,8 @@ def fill_personal_document(
             atomic_json(record_dir / "original.json", before)
         atomic_json(attempt_dir / "before.json", before)
         atomic_json(attempt_dir / "plan.json", plan)
+        if recovery:
+            atomic_json(attempt_dir / "mapping-recovery.json", recovery)
         atomic_json(record_dir / "status.json", {"status": "writing", "started_at": utc_now()})
         write_error = None
         if plan["requests"]:
@@ -700,6 +827,13 @@ def fill_personal_document(
                 "自动填入未通过核验，初稿已保留。"
                 + ("Google 写入权限、文档版本或网络需要检查。" if write_error else str(exc))
             ) from exc
+        if recovery:
+            receipt["mapping_recovery"] = {
+                "kind": recovery["kind"],
+                "draft_sha256": recovery["draft_sha256"],
+                "source_sha256": recovery["source_sha256"],
+                "answer_count": len(answers),
+            }
         atomic_json(record_dir / "receipt.json", receipt)
         atomic_json(attempt_dir / "receipt.json", receipt)
         atomic_json(record_dir / "status.json", receipt)
@@ -745,10 +879,28 @@ def fill_review(settings, package, *, progress=lambda _: None):
             raise WorkflowError("答案栏文件已变化，未修改原文档。")
         structured = json.loads(path.read_text(encoding="utf-8")).get("answers", [])
     receipts = []
+    draft_path, requirements_path = package / "draft.md", package / "requirements.json"
+    draft_bytes = draft_path.read_bytes() if draft_path.is_file() else None
+    if (
+        draft_bytes is not None
+        and hashlib.sha256(draft_bytes).hexdigest() != validated["draft_sha256"]
+    ):
+        raise WorkflowError("已核验初稿文件发生变化，未修改原文档。")
+    verified_draft = draft_bytes.decode("utf-8") if draft_bytes is not None else None
+    requirements_bytes = requirements_path.read_bytes() if requirements_path.is_file() else None
+    requirements = json.loads(requirements_bytes) if requirements_bytes is not None else {}
+    recovery_source_verified = requirements_bytes is not None and hashlib.sha256(
+        requirements_bytes
+    ).hexdigest() == generation.get("source_files_sha256", {}).get("requirements.json")
     for doc_id in own_document_ids(reader, manifest["course_id"], manifest["assignment_id"]):
         if reader.file_metadata(doc_id)["mimeType"] != "application/vnd.google-apps.document":
             continue
         answers = [a for a in structured if a.get("document_id") == doc_id]
+        original_text = "\n".join(
+            s["text"]
+            for s in requirements.get("sources", [])
+            if s.get("source_id") == "file:" + doc_id
+        )
         # One-time migration of previous real ○/× worksheet drafts. It is deterministic,
         # preserves model provenance and never manufactures an extra model invocation.
         if not answers and not structured:
@@ -756,12 +908,18 @@ def fill_review(settings, package, *, progress=lambda _: None):
             original_text = "\n".join(
                 s["text"] for s in requirements["sources"] if s.get("source_id") == "file:" + doc_id
             )
-            answers = legacy_answers(
-                docs.get(doc_id),
-                (package / "draft.md").read_text(encoding="utf-8"),
-                original_text=original_text,
-            )
-        if not answers:
+            try:
+                answers = legacy_answers(
+                    docs.get(doc_id),
+                    (package / "draft.md").read_text(encoding="utf-8"),
+                    original_text=original_text,
+                )
+            except WorkflowError:
+                if not (verified_draft and original_text and recovery_source_verified):
+                    raise
+                # A fully labeled verified draft can recover an entirely empty old
+                # mapping after the fresh document read inside the write lock.
+        if not answers and not (verified_draft and original_text and recovery_source_verified):
             raise WorkflowError("这份个人文档没有已核验的答案栏映射，初稿已保留。")
         progress("正在填入个人 Google 文档；写入后会回读核对")
         receipt = fill_personal_document(
@@ -777,6 +935,8 @@ def fill_review(settings, package, *, progress=lambda _: None):
             / manifest["assignment_id"]
             / doc_id,
             student_profile=StudentProfile.load(settings.data_dir),
+            verified_draft=verified_draft,
+            original_text=original_text if recovery_source_verified else None,
         )
         receipts.append(receipt)
         progress(

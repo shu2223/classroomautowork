@@ -24,6 +24,130 @@ from .student import StudentProfile
 from .user_answers import load_user_answers, merge_answers
 
 SUPPORTED = {"short_text", "paragraph", "single_choice", "dropdown", "checkbox", "scale"}
+IDENTITY = {
+    "学籍番号": "student_id",
+    "学号": "student_id",
+    "studentid": "student_id",
+    "氏名": "name",
+    "姓名": "name",
+    "名前": "name",
+    "name": "name",
+    "学科": "department",
+    "学部学科": "department",
+    "所属学科": "department",
+    "クラス": "class_name",
+    "班级": "class_name",
+    "学年": "year",
+    "年级": "year",
+}
+
+
+def identity_key(title):
+    label = re.sub(r"^\s*(?:[0-9０-９]+\s*[.)）:：、]|[①-⑳])\s*", "", title)
+    return IDENTITY.get(re.sub(r"[\s:：*＊]", "", label).lower())
+
+
+def form_gap_reason(title, review_note=""):
+    """A review flag alone does not establish that a blank needs personal facts.
+
+    Older model outputs use ``needs_user`` for both missing sources and personal
+    facts. Keep those outputs intact, but interpret their explanation when deciding
+    whether the next action is answer repair or asking for the student's own data.
+    """
+    if identity_key(title):
+        return "personal_fact"
+    note = review_note or ""
+    personal = (
+        r"(?:本人|用户|使用者|學生|学生|自分|あなた).{0,20}"
+        r"(?:事実|事实|个人|個人|经历|経歴|経験|健康|体重|身長|身高|出席|学籍|学号|記録|记录)|"
+        r"(?:実際|真实|实际).{0,12}(?:個人|个人|健康|体重|身長|身高|出席|記録|记录)|"
+        r"(?:personal|your\s+own|student['’]s\s+own).{0,20}(?:fact|data|experience|record|health)|"
+        r"(?:actual|real).{0,15}(?:attendance|weight|height|health|personal)"
+    )
+    if re.search(personal, title, re.I):
+        return "personal_fact"
+    source = (
+        r"原文|本文|文章|阅读|聴解|听力|音声|音频|音訊|录音|録音|教材|课文|課文|图片|图像|画像|"
+        r"トランスクリプト|スクリプト|逐字稿|转录|字幕|対話|对话|会话|會話|会話|"
+        r"audio|recording|transcript|passage|source\s+material|listening|reading\s+text|"
+        r"conversation|dialogue|image|picture"
+    )
+    unavailable = (
+        r"缺少|缺失|未提供|未读取|未读到|未取得|未获取|未包含|未能|未下载|未转录|"
+        r"无法读取|无法获取|不可读|不可用|不足|未入包|没有|不在|未収録|未読|"
+        r"含まれ|確認でき|不明|ありません|ない|missing|unavailable|"
+        r"not\s+(?:provided|available|included|read|include)|cannot\s+(?:read|access)"
+    )
+    if re.search(source, note, re.I) and re.search(unavailable, note, re.I):
+        return "missing_source"
+    if re.search(personal, note, re.I):
+        return "personal_fact"
+    if re.search(
+        r"资料|資料|素材|(?:女子|男子|女人|男人|文中).{0,40}(?:评价|态度|意见|打算|想法|计划)",
+        note,
+    ) and re.search(unavailable, note, re.I):
+        return "missing_source"
+    return "missing_answer"
+
+
+def form_answer_coverage(forms, answers, profile=None):
+    """Account for every required native field, including deliberate personal blanks.
+
+    Validation of supplied rows alone cannot detect omitted questions. Optional
+    feedback remains optional; unsupported controls and unknown personal facts are
+    exposed separately so an automatic repair never has to invent those values.
+    """
+    supplied = {(a["form_url"], a["entry_id"]): a for a in answers}
+    coverage = {
+        "missing_fields": [],
+        "user_input_fields": [],
+        "optional_empty_fields": [],
+        "unsupported_fields": [],
+    }
+    for form in forms:
+        for question in form["questions"]:
+            for field in question["fields"]:
+                answer = supplied.get((form["url"], field["entry_id"]))
+                if answer and answer.get("values"):
+                    continue
+                detail = {
+                    "form_url": form["url"],
+                    "item_id": question["item_id"],
+                    "entry_id": field["entry_id"],
+                    "title": question["title"],
+                    "type": question["type"],
+                    "required": field["required"],
+                }
+                if question["type"] not in SUPPORTED:
+                    coverage["unsupported_fields"].append(detail)
+                    continue
+                personal_key = identity_key(question["title"])
+                unknown_identity = (
+                    personal_key and profile is not None and not getattr(profile, personal_key, "")
+                )
+                reason = form_gap_reason(question["title"], (answer or {}).get("review_note", ""))
+                if unknown_identity or (
+                    answer and answer.get("needs_user") and reason == "personal_fact"
+                ):
+                    coverage["user_input_fields"].append(
+                        {
+                            **detail,
+                            "gap_reason": "personal_fact",
+                            "review_note": (answer or {}).get("review_note")
+                            or "尚无用户提供的真实个人资料，请本人补充。",
+                        }
+                    )
+                elif field["required"]:
+                    coverage["missing_fields"].append(
+                        {
+                            **detail,
+                            "gap_reason": reason if reason != "personal_fact" else "missing_answer",
+                            "review_note": (answer or {}).get("review_note", ""),
+                        }
+                    )
+                else:
+                    coverage["optional_empty_fields"].append(detail)
+    return coverage
 
 
 def context_digest(form):
@@ -35,6 +159,23 @@ def context_digest(form):
                 "sections": form["sections"],
                 "description": form["description"],
                 "title": form["title"],
+                **(
+                    {
+                        "media": sorted(
+                            [
+                                {
+                                    key: value
+                                    for key, value in picture.items()
+                                    if key not in {"image_path", "sha256"}
+                                }
+                                for picture in form["media"]
+                            ],
+                            key=lambda picture: picture["item_id"],
+                        )
+                    }
+                    if form.get("media")
+                    else {}
+                ),
             },
             sort_keys=True,
             ensure_ascii=False,
@@ -189,15 +330,15 @@ def fill_response_forms(settings, package: Path, *, progress=lambda _: None, ope
     )
     if {x["url"] for x in forms} - allowed:
         raise WorkflowError("表单不再属于这项本人待完成作业，未填写其他课程链接。")
-    answers = validate_answers(
-        forms,
-        json.loads(answers_path.read_text(encoding="utf-8"))["answers"],
-        StudentProfile.load(settings.data_dir),
-    )
+    answer_record = json.loads(answers_path.read_text(encoding="utf-8"))
+    supplied = answer_record["answers"] + answer_record.get("deferred_answers", [])
+    profile = StudentProfile.load(settings.data_dir)
+    answers = validate_answers(forms, supplied, profile)
     user_record = load_user_answers(
         settings.data_dir, manifest, forms, StudentProfile.load(settings.data_dir)
     )
     answers = merge_answers(answers, user_record["answers"])
+    coverage = form_answer_coverage(forms, merge_answers(supplied, user_record["answers"]), profile)
     plans = []
     for form in forms:
         progress(ProgressUpdate("正在核对原表单题目与自动填写的栏位", "form_fill"))
@@ -218,13 +359,31 @@ def fill_response_forms(settings, package: Path, *, progress=lambda _: None, ope
                 "url": url,
                 "original_url": form["url"],
                 "prefilled_fields": len(selected),
-                "needs_user": [x["review_note"] for x in selected if x.get("needs_user")],
+                "needs_user": [x["review_note"] for x in selected if x.get("needs_user")]
+                + [
+                    x["review_note"]
+                    for x in coverage["user_input_fields"]
+                    if x["form_url"] == form["url"]
+                ],
                 "remaining_fields": [
-                    {"title": q["title"], "required": field["required"]}
+                    {
+                        "entry_id": field["entry_id"],
+                        "item_id": q["item_id"],
+                        "title": q["title"],
+                        "type": q["type"],
+                        "required": field["required"],
+                    }
                     for q in form["questions"]
                     for field in q["fields"]
                     if field["entry_id"] not in filled
                 ],
+                "remaining_answer_fields": [
+                    x for x in coverage["missing_fields"] if x["form_url"] == form["url"]
+                ],
+                **{
+                    key: [x for x in coverage[key] if x["form_url"] == form["url"]]
+                    for key in ("user_input_fields", "optional_empty_fields", "unsupported_fields")
+                },
                 "browser_values_verified": False,
                 "question_verification": "fresh_anonymous_read_or_browser_capture_within_24h",
                 "draft_saved_verified": False,
@@ -235,6 +394,7 @@ def fill_response_forms(settings, package: Path, *, progress=lambda _: None, ope
     record = {
         "status": "prefill_prepared",
         "forms": plans,
+        "form_mapping_complete": not coverage["missing_fields"],
         "answers_sha256": hashlib.sha256(
             (sha256_file(answers_path) + user_record["sha256"]).encode()
         ).hexdigest()
@@ -269,6 +429,12 @@ def _open_plans(path, record, progress, opener):
                     raise WorkflowError("预填记录的地址已经变化，不能复用未知链接。")
                 plan["opened"] = old.get("opened") is True
             if previous.get("status") == "opened_native_prefill":
+                # Refresh coverage for older receipts too. Reusing the same GET
+                # must not preserve a stale claim that all native fields exist.
+                previous.update(
+                    form_mapping_complete=record.get("form_mapping_complete", True), forms=plans
+                )
+                atomic_json(path, previous)
                 return {**previous, "reused": True}
     atomic_json(path, record)
     open_url = opener or webbrowser.open

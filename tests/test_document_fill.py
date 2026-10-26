@@ -213,6 +213,195 @@ def apply_inline_edits(document, plan):
     return updated
 
 
+def labeled_list_document():
+    """Synthetic worksheet with native list metadata, never private course text."""
+    document = native_document()
+    sample = document["tabs"][0]["documentTab"]["body"]["content"][0]
+    lines = [
+        ("学籍番号：", None),
+        ("氏名：", None),
+        ("■設問①　観察🎵", None),
+        ("観察の結果について理由を説明してください。", None),
+        ("判断した理由：", None),
+        ("", None),
+        ("■設問②　色", None),
+        ("候補から番号を２つ選び、理由を書いてください。", None),
+        *[(f"色の候補 {i}", "colors") for i in range(1, 5)],
+        ("", None),
+        ("選択した番号(2つ)：", None),
+        ("選んだ理由：", None),
+        ("", None),
+        ("■設問③　形", None),
+        ("好きな形を選びます。", None),
+        *[(f"形の候補 {i}", "shapes") for i in range(1, 13)],
+        ("選んだ番号(複数回答可) ：", None),
+        ("", None),
+        ("■設問④　音", None),
+        ("候補から番号を１つ選び、理由を書いてください。", None),
+        *[(f"音🎵の候補 {i}", "sounds") for i in range(1, 5)],
+        ("　選んだ番号(1つ)：", None),
+        ("　選んだ理由：", None),
+        ("", None),
+    ]
+    content, offset = [], 1
+    for text, list_id in lines:
+        element = deepcopy(sample)
+        length = len((text + "\n").encode("utf-16-le")) // 2
+        element.update(startIndex=offset, endIndex=offset + length)
+        run = element["paragraph"]["elements"][0]
+        run.update(startIndex=offset, endIndex=offset + length)
+        run["textRun"]["content"] = text + "\n"
+        if list_id:
+            element["paragraph"]["bullet"] = {"listId": list_id, "nestingLevel": 0}
+        content.append(element)
+        offset += length
+    document["tabs"][0]["documentTab"]["body"]["content"] = content
+    return document
+
+
+def test_labeled_answers_after_native_numbered_lists_fill_all_six_and_preserve_template():
+    before = labeled_list_document()
+    form = inspect_form(before)
+    fields = form["fields"]
+    assert len(fields) == len(required_answer_fields(form)) == 6
+    assert form["unrecognized_questions"] == []
+    assert [field["kind"] for field in fields] == [
+        "labeled_answer",
+        "number_selection",
+        "labeled_answer",
+        "number_selection",
+        "number_selection",
+        "labeled_answer",
+    ]
+    assert all(not field["current"] and "/labeled:" in field["id"] for field in fields)
+    repeated = [field for field in fields if field["label"] == "選んだ理由："]
+    assert len(repeated) == 2
+    assert repeated[0]["id"] != repeated[1]["id"]
+    assert repeated[0]["section_id"] != repeated[1]["section_id"]
+    body = before["tabs"][0]["documentTab"]["body"]["content"]
+    for field in fields:
+        paragraph = next(p for p in body if p["startIndex"] == field["paragraph_index"])
+        text = paragraph["paragraph"]["elements"][0]["textRun"]["content"]
+        assert "bullet" not in paragraph["paragraph"]
+        assert field["index"] == paragraph["startIndex"] + len(text[:-1].encode("utf-16-le")) // 2
+        assert field["index"] == field["end_index"]
+    supplied = [
+        {
+            "field_id": field["id"],
+            "context_sha256": field["context_sha256"],
+            "text": "1、2" if field["kind"] == "number_selection" else "観察から考えた理由🎵。",
+        }
+        for field in fields
+    ]
+    profile = StudentProfile(student_id="12345", name="Sample Student")
+    plan = plan_fill(before, supplied, student_profile=profile)
+    after = apply_inline_edits(before, plan)
+    receipt = verify_fill(before, after, plan)
+    assert receipt["status"] == "filled_verified"
+    assert receipt["inserted_fields"] == receipt["verified_fields"] == 8
+    assert receipt["verified_by_kind"] == {
+        "identity": 2,
+        "number_selection": 3,
+        "labeled_answer": 3,
+    }
+    assert inspect_form(after)["question_sha256"] == form["question_sha256"]
+    assert plan_fill(after, supplied, student_profile=profile)["requests"] == []
+    after_body = after["tabs"][0]["documentTab"]["body"]["content"]
+    for original, actual in zip(body, after_body, strict=True):
+        if "bullet" in original["paragraph"]:
+            assert original["paragraph"]["bullet"] == actual["paragraph"]["bullet"]
+            assert (
+                original["paragraph"]["elements"][0]["textRun"]
+                == (actual["paragraph"]["elements"][0]["textRun"])
+            )
+
+
+def test_labeled_answers_keep_user_contents_and_reject_changed_prompts_or_label_styles():
+    before = labeled_list_document()
+    field = inspect_form(before)["fields"][0]
+    answer = {
+        "field_id": field["id"],
+        "context_sha256": field["context_sha256"],
+        "text": "本人の回答。",
+    }
+    plan = plan_fill(before, [answer])
+    after = apply_inline_edits(before, plan)
+    with pytest.raises(WorkflowError, match="保留你已填写"):
+        plan_fill(after, [{**answer, "text": "別の回答。"}])
+    changed = deepcopy(before)
+    changed["tabs"][0]["documentTab"]["body"]["content"][3]["paragraph"]["elements"][0]["textRun"][
+        "content"
+    ] = "新しい観察の理由を説明してください。\n"
+    with pytest.raises(WorkflowError, match="原题"):
+        plan_fill(changed, [answer])
+    changed = deepcopy(after)
+    changed["tabs"][0]["documentTab"]["body"]["content"][4]["paragraph"]["elements"][0]["textRun"][
+        "textStyle"
+    ]["bold"] = True
+    with pytest.raises(WorkflowError, match="非答案"):
+        verify_fill(before, changed, plan)
+
+
+@pytest.mark.parametrize("prompt", ["観察した理由を説明してください。", "観察した理由は？"])
+def test_native_numbered_questions_keep_existing_answers_and_options_protected(prompt):
+    before = native_document()
+    sample = before["tabs"][0]["documentTab"]["body"]["content"][0]
+    lines = [
+        (prompt, "questions"),
+        ("", None),
+        ("もう一つの理由を説明してください。", "questions"),
+        ("本人がすでに書いた理由。", None),
+        ("候補から番号を選んでください。", None),
+        ("色の候補 1", "colors"),
+        ("色の候補 2", "colors"),
+        ("", None),
+        ("選んだ番号：", None),
+    ]
+    content, offset = [], 1
+    for text, list_id in lines:
+        element = deepcopy(sample)
+        length = len((text + "\n").encode("utf-16-le")) // 2
+        element.update(startIndex=offset, endIndex=offset + length)
+        run = element["paragraph"]["elements"][0]
+        run.update(startIndex=offset, endIndex=offset + length)
+        run["textRun"]["content"] = text + "\n"
+        if list_id:
+            element["paragraph"]["bullet"] = {"listId": list_id, "nestingLevel": 0}
+        content.append(element)
+        offset += length
+    before["tabs"][0]["documentTab"]["body"]["content"] = content
+    form = inspect_form(before)
+    assert [field["label"] for field in form["fields"]] == [
+        prompt,
+        "もう一つの理由を説明してください。",
+        "選んだ番号：",
+    ]
+    assert form["unrecognized_questions"] == []
+    supplied = [
+        {
+            "field_id": field["id"],
+            "context_sha256": field["context_sha256"],
+            "text": "1" if field.get("kind") == "number_selection" else "観察から考えた理由。",
+        }
+        for field in form["fields"]
+        if not field["current"]
+    ]
+    plan = plan_fill(before, supplied)
+    after = apply_inline_edits(before, plan)
+    receipt = verify_fill(before, after, plan)
+    assert receipt["status"] == "filled_verified"
+    assert receipt["inserted_fields"] == 2
+    assert inspect_form(after)["fields"][1]["current"] == "本人がすでに書いた理由。"
+    after_body = after["tabs"][0]["documentTab"]["body"]["content"]
+    for original, actual in zip(content, after_body, strict=True):
+        if "bullet" in original["paragraph"]:
+            assert original["paragraph"]["bullet"] == actual["paragraph"]["bullet"]
+            assert (
+                original["paragraph"]["elements"][0]["textRun"]
+                == (actual["paragraph"]["elements"][0]["textRun"])
+            )
+
+
 def test_saved_identity_fills_only_blank_labels_and_retry_is_idempotent():
     before = inline_document(["学籍番号：", "氏　　名："])
     fields = inspect_form(before)["fields"]
