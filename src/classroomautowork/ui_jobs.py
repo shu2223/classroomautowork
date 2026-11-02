@@ -8,6 +8,7 @@ from dataclasses import asdict, replace
 from pathlib import Path
 
 from .answer_document import create_answer_document, valid_answer_document
+from .api_key import key_status, save_key
 from .auth import documents_authorized
 from .batch import course_batches
 from .claude_agent import model_catalog
@@ -241,6 +242,7 @@ class FrontendJobs:
                         "jobs": [self._snapshot(x) for x in jobs],
                         "result_jobs": result_jobs,
                         "active_job_id": self._active,
+                        "api_key": key_status(self.settings.data_dir),
                         "submission": "manual_only",
                     }
                 )
@@ -304,6 +306,11 @@ class FrontendJobs:
             if job_id in self._progress:
                 self._progress[job_id].item(entry, values)
             self._save(job)
+
+    def set_api_key(self, values):
+        if set(values) != {"key"}:
+            raise WorkflowError("密钥设置只接受 key。")
+        return save_key(self.settings.data_dir, values["key"])
 
     def models(self):
         with self._models_lock:

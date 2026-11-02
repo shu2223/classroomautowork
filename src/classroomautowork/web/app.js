@@ -613,7 +613,7 @@ setInterval(updateProgressClock, 1000);
 setInterval(renderShutdown, 1000);
 async function loadState() {
   const shutdownVersion = shutdownRequestVersion;
-  const data = await api("/api/bootstrap"); connection.lastSuccess = Date.now(); connection.error = null; state.monitorOnly = !!data.monitor_only; state.documentsAuthorized = !!data.documents_authorized; state.pending = data.pending; state.jobs = data.jobs; state.resultJobs = data.result_jobs || []; state.policies = data.policies; state.active = data.active_job_id; state.timezone = data.timezone; $("accountEmail").textContent = data.account;
+  const data = await api("/api/bootstrap"); connection.lastSuccess = Date.now(); connection.error = null; state.monitorOnly = !!data.monitor_only; renderApiKey(data.api_key); state.documentsAuthorized = !!data.documents_authorized; state.pending = data.pending; state.jobs = data.jobs; state.resultJobs = data.result_jobs || []; state.policies = data.policies; state.active = data.active_job_id; state.timezone = data.timezone; $("accountEmail").textContent = data.account;
   if (shutdownVersion === shutdownRequestVersion && !state.shutdownPending) receiveShutdown(data.shutdown || {enabled:false, state:"off", supported:false, message:"当前后台尚未提供自动关机，请重新打开新版助手。"}); startShutdownPolling();
   const running = state.jobs.find(x => x.id === state.active); if (running && ["review", "fill"].includes(running.kind)) $("aiConfirmed").checked = !!running.ai_confirmed;
   if (state.monitorOnly) { document.body.classList.add("monitor-mode"); $("notice").hidden = false; $("notice").replaceChildren(node("span", "这是只读进度窗口，不会影响原任务。审批和作业操作请返回原作业助手。 ")); const back = node("a", "返回作业助手 ↗"); back.href = data.source_url; back.target = "_blank"; back.rel = "noopener noreferrer"; $("notice").append(back); }
@@ -775,6 +775,19 @@ else {
   }).catch(error => { $("notice").textContent = error.message; $("notice").hidden = false; toast(error.message); });
 }
 
+function renderApiKey(status) {
+  state.apiKey = status || null;
+  $("apiKeyStatus").textContent = !status ? "无法读取密钥状态。" : status.configured ? `已设置 · 末尾 ${status.last4}${status.updated_at ? " · 更新于 " + new Date(status.updated_at).toLocaleString() : ""}` : "尚未设置。没有密钥时不会调用 Claude。";
+  $("apiKeyClear").hidden = !status?.configured;
+}
+async function saveApiKey(key) {
+  const buttons = $("apiKeyForm").querySelectorAll("button"); buttons.forEach(x => x.disabled = true);
+  try { renderApiKey(await api("/api/settings/api-key", "PUT", {key})); $("apiKeyInput").value = ""; toast(key ? "API 密钥已验证并保存" : "API 密钥已删除"); }
+  catch (error) { toast(error.message); }
+  finally { buttons.forEach(x => x.disabled = false); }
+}
+$("apiKeyForm").addEventListener("submit", event => { event.preventDefault(); saveApiKey($("apiKeyInput").value.trim()); });
+$("apiKeyClear").addEventListener("click", () => { if (confirm("删除已保存的 Claude API 密钥？删除后无法作答，直到重新填写。")) saveApiKey(""); });
 $("authorizeDocuments").addEventListener("click", () => { $("settingsDialog").close(); setView("pending"); action("/api/documents/authorize", {}); });
 $("fillDocumentButton").addEventListener("click", () => { const {jobId, key} = state.preview; $("reviewDialog").close(); action(`/api/jobs/${jobId}/items/${key}/fill`, {}); });
 

@@ -8,6 +8,14 @@ from test_workflow import prepared_fixture
 from classroomautowork import claude_agent, drafting
 from classroomautowork.errors import WorkflowError
 
+INIT = {
+    "type": "system",
+    "subtype": "init",
+    "model": "unit-model",
+    "apiKeySource": "ANTHROPIC_API_KEY",
+    "tools": [],
+}
+
 
 def test_overlong_result_is_kept_private_and_not_validated(tmp_path, monkeypatch):
     package, _, _, review = prepared_fixture(tmp_path)
@@ -58,10 +66,23 @@ def test_silent_turn_times_out_without_claiming_success(tmp_path, monkeypatch):
 @pytest.mark.parametrize(
     "events, message",
     [
-        ([{"type": "system", "subtype": "init", "model": "other-model", "tools": []}], "不一致"),
+        ([{"type": "system", "subtype": "init", "model": "unit-model", "tools": []}], "API 密钥"),
         (
-            [{"type": "system", "subtype": "init", "model": "unit-model", "tools": ["Bash"]}],
-            "额外工具",
+            [{**INIT, "apiKeySource": "none"}],
+            "API 密钥",
+        ),
+        ([{**INIT, "model": "other-model"}], "不一致"),
+        ([{**INIT, "tools": ["Bash"]}], "额外工具"),
+        (
+            [
+                {
+                    "type": "result",
+                    "subtype": "success",
+                    "is_error": True,
+                    "result": "Invalid API key",
+                }
+            ],
+            "Invalid API key",
         ),
         (
             [
@@ -89,3 +110,30 @@ def test_unexpected_cli_events_never_count_as_an_answer(tmp_path, events, messag
             cwd=tmp_path,
             command=[sys.executable, str(script)],
         )
+
+
+def test_saved_key_reaches_the_cli_environment(tmp_path, monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    script = tmp_path / "env.py"
+    script.write_text(
+        "import json,os,sys\nsys.stdin.readline()\n"
+        "key=os.environ.get('ANTHROPIC_API_KEY','')\n"
+        "print(json.dumps({'type':'system','subtype':'init','model':'unit-model',"
+        "'apiKeySource':'ANTHROPIC_API_KEY' if key else 'none','tools':[]}),flush=True)\n"
+        "print(json.dumps({'type':'result','subtype':'success','is_error':False,"
+        "'structured_output':{'key_tail':key[-4:]}}),flush=True)\n",
+        encoding="utf-8",
+    )
+    options = dict(
+        model="unit-model", effort=None, cwd=tmp_path, command=[sys.executable, str(script)]
+    )
+    with pytest.raises(WorkflowError, match="API 密钥"):
+        claude_agent.run_turn([{"type": "text", "text": "unit"}], {"type": "object"}, **options)
+    outcome = claude_agent.run_turn(
+        [{"type": "text", "text": "unit"}],
+        {"type": "object"},
+        api_key="sk-ant-unit-1234",
+        **options,
+    )
+    assert outcome["output"] == {"key_tail": "1234"}
+    assert outcome["api_key_source"] == "ANTHROPIC_API_KEY"

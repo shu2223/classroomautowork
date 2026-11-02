@@ -5,7 +5,7 @@
 2.0 与旧版的区别：
 
 - **数据来源**：不再自己登录 Google 抓取 Classroom 和 Drive，也不再用 Buzz 转录录像。题目、资料、公告、录像转写和画面文字全部来自小主机上的课程本地化工作流（`/opt/knowledge`），通过它的只读接口 `knowledge-api` 读取。两边是独立的服务，助手读不到 `/opt/knowledge` 目录本身。
-- **作答模型**：不再依赖 Codex。每份作业调用一次本机的 Claude Code（`claude -p`），没有任何工具，只把资料当数据返回结构化结果，由本程序核验。
+- **作答模型**：不再依赖 Codex。每份作业调用一次本机的 Claude Code（`claude -p`），没有任何工具，只把资料当数据返回结构化结果，由本程序核验。按 Claude API 用量计费，密钥在网页的“设置”里填写和更换。
 - **运行位置**：常驻 systemd 服务，不再是 Windows 桌面程序；Windows 启动器、自动关机、Codex 会话审批和浏览器代读题目都已删除。
 
 ## 组成
@@ -36,10 +36,11 @@ flowchart LR
 
 ## Claude 调用
 
-- 命令：`claude -p --input-format stream-json --output-format stream-json --tools "" --disallowedTools "mcp__*" --no-session-persistence --safe-mode --json-schema …`。启动时检查实际模型与所选一致、没有额外工具，否则停止。
+- 命令：`claude -p --bare --input-format stream-json --output-format stream-json --tools "" --disallowedTools "mcp__*" --no-session-persistence --json-schema …`。启动时检查使用的是 API 密钥、实际模型与所选一致、没有额外工具，否则停止。
 - 模型在“设置”里选择：Opus 5.5、Sonnet 5.5（默认，强度 high）、Haiku 5.5、Fable 5.1。
 - 单次回合最长 15 分钟，连续 5 分钟没有输出即停止；结果超过 64,000 字符不接受。
-- **认证**：服务以 root 运行，使用这台机器上已登录的 Claude 账号。如果改用 API 按量计费，在服务环境里设置 `ANTHROPIC_API_KEY`（例如 systemd 的 `EnvironmentFile=`），`claude -p` 会自动优先使用它，代码不需要改。
+- **计费**：只用 Claude API 密钥。`--bare` 不读取这台机器上的 Claude 登录，所以没有密钥时不会退回订阅额度，而是直接停止并提示去设置里填写。
+- **密钥**：在网页“设置 → Claude API 密钥”填写。保存前用 Anthropic 的模型列表接口验证（不消耗 token），通过后存为 `data_dir/anthropic-api-key.json`（只有 root 可读），之后只显示末尾 4 位和更新时间，完整密钥不会再返回给网页。换密钥直接重新填写，删除后不能作答。保存后下一次作答立即生效，不用重启服务。
 
 ## 部署
 

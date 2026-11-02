@@ -16,7 +16,7 @@ from filelock import FileLock, Timeout
 
 from .config import Settings
 from .errors import WorkflowError
-from .local import atomic_json, require_private_path, sha256_file
+from .local import atomic_json, prefer_ipv4, require_private_path, sha256_file
 from .ui_jobs import FILES, FrontendJobs, read_json
 
 ASSETS = Path(__file__).parent / "web"
@@ -367,6 +367,9 @@ class LocalHandler(BaseHTTPRequestHandler):
         if not self._guard(mutation=True):
             return
         try:
+            if self._path() == "/api/settings/api-key":
+                self._send(200, self.server.jobs.set_api_key(self._body()))
+                return
             match = re.fullmatch(r"/api/policies/([0-9]+)", self._path())
             if not match:
                 self._send(404, {"error": "找不到课程规则。"})
@@ -375,7 +378,7 @@ class LocalHandler(BaseHTTPRequestHandler):
             self._send(200, result)
         except Exception as exc:
             self._send(
-                400, {"error": str(exc) if isinstance(exc, WorkflowError) else "规则保存失败。"}
+                400, {"error": str(exc) if isinstance(exc, WorkflowError) else "设置保存失败。"}
             )
 
 
@@ -437,6 +440,7 @@ def main():
     parser.add_argument("--no-browser", action="store_true")
     parser.add_argument("--port", type=int, default=0)
     args = parser.parse_args()
+    prefer_ipv4()
     try:
         serve(Settings.load(args.config), open_browser=not args.no_browser, port=args.port)
     except WorkflowError as exc:

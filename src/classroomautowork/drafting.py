@@ -8,6 +8,7 @@ import time
 from dataclasses import asdict
 from pathlib import Path
 
+from .api_key import load_key
 from .claude_agent import DEFAULT_EFFORT, DEFAULT_MODEL, EFFORTS, image_block, run_turn
 from .completion import MODE, candidate_mode
 from .document_fill import missing_answer_fields
@@ -638,9 +639,11 @@ def generate_review(
             cwd=package,
             cancelled=cancelled,
             on_activity=activity,
+            api_key=load_key(package.parents[3]),
         )
         generation.update(
             thread_id=outcome["session_id"],
+            api_key_source=outcome["api_key_source"],
             model=outcome["model"],
             token_usage=outcome["usage"],
             cost_usd=outcome["cost_usd"],

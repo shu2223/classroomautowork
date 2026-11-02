@@ -1,7 +1,8 @@
 """One tool-free Claude Code turn per answer. Course text is data, so the model gets no tools.
 
-Authentication is whatever the local `claude` binary uses: ANTHROPIC_API_KEY when the service
-environment sets one, otherwise the machine's Claude login. Prompts go through stdin, never a shell.
+Billing is the Claude API: `--bare` never reads the machine's Claude login, so ANTHROPIC_API_KEY
+must be set in the service environment, and a turn without it stops before any request is made.
+Prompts go through stdin, never a shell.
 """
 
 import base64
@@ -82,6 +83,7 @@ def run_turn(
     cwd: Path,
     cancelled=lambda: False,
     on_activity=lambda _label: None,
+    api_key: str | None = None,
     command=None,
     clock=time.monotonic,
 ) -> dict:
@@ -101,7 +103,7 @@ def run_turn(
         "--disallowedTools",
         "mcp__*",
         "--no-session-persistence",
-        "--safe-mode",
+        "--bare",
         "--json-schema",
         json.dumps(schema, ensure_ascii=False),
     ]
@@ -116,6 +118,7 @@ def run_turn(
         process = subprocess.Popen(
             arguments,
             cwd=cwd,
+            env={**os.environ, "ANTHROPIC_API_KEY": api_key} if api_key else None,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
@@ -140,7 +143,7 @@ def run_turn(
 
     threading.Thread(target=read, daemon=True).start()
     started = last = clock()
-    reported = {"model": None, "session_id": None, "rate_limit": None}
+    reported = {"model": None, "session_id": None, "rate_limit": None, "api_key_source": None}
     try:
         process.stdin.write(json.dumps(message, ensure_ascii=False) + "\n")
         process.stdin.close()
@@ -165,6 +168,12 @@ def run_turn(
                     event.get("model"),
                     event.get("session_id"),
                 )
+                reported["api_key_source"] = event.get("apiKeySource")
+                if reported["api_key_source"] in (None, "none"):
+                    raise WorkflowError(
+                        "还没有设置 Claude API 密钥，未调用 Claude。请在作业助手的“设置”里填写；"
+                        "资料已保留。"
+                    )
                 if reported["model"] != model:
                     raise WorkflowError("Claude 实际使用的模型与所选模型不一致，已停止生成。")
                 if event.get("tools") not in ([], ["StructuredOutput"]) or event.get("mcp_servers"):
@@ -180,15 +189,16 @@ def run_turn(
                     limit = reported["rate_limit"] or {}
                     if limit.get("status") == "rejected":
                         raise WorkflowError("Claude 用量已达上限，请等额度恢复后重试；资料已保留。")
-                    raise WorkflowError(
-                        f"Claude 回合未成功（{event.get('subtype', 'error')}），资料已保留，请重试。"
-                    )
+                    # On failure `result` holds the CLI's error text, such as an invalid key.
+                    detail = str(event.get("result") or event.get("subtype") or "error")[:200]
+                    raise WorkflowError(f"Claude 回合未成功（{detail}），资料已保留，请重试。")
                 if not isinstance(event.get("structured_output"), dict):
                     raise WorkflowError("Claude 没有返回符合格式的结构化结果。")
                 return {
                     "output": event["structured_output"],
                     "model": reported["model"],
                     "session_id": reported["session_id"] or event.get("session_id"),
+                    "api_key_source": reported["api_key_source"],
                     "usage": event.get("usage"),
                     "cost_usd": event.get("total_cost_usd"),
                     "duration_ms": event.get("duration_ms"),

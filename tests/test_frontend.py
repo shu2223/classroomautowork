@@ -124,7 +124,7 @@ def offline_rpc(tmp_path, monkeypatch, package, review):
         "def send(x): print(json.dumps(x),flush=True)\n"
         "message=json.loads(sys.stdin.readline())\n"
         "with (root/'requests.jsonl').open('a') as f: f.write(json.dumps({'method':'turn/start','params':{'input':message['message']['content'],'argv':argv}})+'\\n')\n"
-        "send({'type':'system','subtype':'init','model':model,'session_id':'unit-session','tools':['StructuredOutput'],'mcp_servers':[]})\n"
+        "send({'type':'system','subtype':'init','model':model,'session_id':'unit-session','apiKeySource':'ANTHROPIC_API_KEY','tools':['StructuredOutput'],'mcp_servers':[]})\n"
         "send({'type':'assistant','message':{'content':[{'type':'tool_use','name':'StructuredOutput'}]}})\n"
         "send({'type':'result','subtype':'success','is_error':False,'structured_output':result,'usage':{'output_tokens':1}})\n",
         encoding="utf-8",
@@ -164,7 +164,8 @@ def test_checked_ai_uses_selected_model_preserves_permissions_and_reuses_only_va
     assert argv[argv.index("--effort") + 1] == "high"
     # Course text is data: the model gets no tools, no MCP servers and no saved session.
     assert argv[argv.index("--tools") + 1] == ""
-    assert {"--no-session-persistence", "--safe-mode"} <= set(argv)
+    # --bare never reads the machine's Claude login, so billing is always the API key.
+    assert {"--no-session-persistence", "--bare"} <= set(argv)
     assert not {"--dangerously-skip-permissions", "--permission-mode"} & set(argv)
     assert drafting.generate_review(package, ai_confirmed=True, model="unit-model", effort="high")[
         "reused"

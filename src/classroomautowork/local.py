@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import socket
 import sys
 import tempfile
 import time
@@ -10,6 +11,20 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from .errors import ConfigurationError
+
+
+def prefer_ipv4() -> None:
+    """The mini PC's IPv6 has a route but no connectivity, so each IPv6 address in DNS order
+    costs a full connect timeout. Try IPv4 addresses first, for this process only."""
+    if getattr(socket.getaddrinfo, "prefers_ipv4", False):
+        return
+    original = socket.getaddrinfo
+
+    def ordered(*args, **kwargs):
+        return sorted(original(*args, **kwargs), key=lambda info: info[0] != socket.AF_INET)
+
+    ordered.prefers_ipv4 = True
+    socket.getaddrinfo = ordered
 
 
 def utc_now() -> str:

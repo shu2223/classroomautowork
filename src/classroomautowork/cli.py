@@ -12,7 +12,7 @@ from .form_capture import import_form_capture
 from .form_fill import fill_response_forms, prepare_response_forms
 from .form_read import form_references
 from .kb_client import KnowledgeClient
-from .local import require_private_path, state_root
+from .local import prefer_ipv4, require_private_path, state_root
 from .pending import discover_pending
 from .review import finalize
 from .search import retrieve
@@ -48,6 +48,7 @@ def doctor(settings: Settings | None) -> dict:
 
 
 def main(argv=None) -> int:
+    prefer_ipv4()
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8")
