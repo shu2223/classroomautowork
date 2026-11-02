@@ -95,7 +95,7 @@ def answer_blocks(draft, *, personal_templates=False):
 
 def _inputs(package):
     receipt = json.loads((package / "review-receipt.json").read_text(encoding="utf-8"))
-    generation = json.loads((package / "codex-generation.json").read_text(encoding="utf-8"))
+    generation = json.loads((package / "generation.json").read_text(encoding="utf-8"))
     if (
         generation.get("status") != "completed"
         or not receipt.get("draft_sha256")
@@ -105,7 +105,7 @@ def _inputs(package):
         raise WorkflowError("答案尚未完成核验或内容已变化，不能生成审阅文件。")
     return {
         name: sha256_file(package / name)
-        for name in ("draft.md", "review.json", "codex-generation.json", "manifest.json")
+        for name in ("draft.md", "review.json", "generation.json", "manifest.json")
     }
 
 

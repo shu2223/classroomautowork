@@ -864,7 +864,7 @@ def fill_review(settings, package, *, progress=lambda _: None):
     package = require_private_path(Path(package))
     validated = reusable_review(package)
     if not validated or not validated.get("draft_sha256"):
-        raise WorkflowError("只有通过证据核对的真实 Codex 初稿可以自动填入。")
+        raise WorkflowError("只有通过证据核对的真实 AI 初稿可以自动填入。")
     manifest = json.loads((package / "manifest.json").read_text(encoding="utf-8"))
     read_credentials, _ = credentials_for(settings)
     credentials, _ = credentials_for(settings, documents=True)
@@ -872,7 +872,7 @@ def fill_review(settings, package, *, progress=lambda _: None):
         raise WorkflowError("本次作业未获用户的 AI 生成确认，不自动填入。")
     reader, docs = GoogleReader(read_credentials), GoogleDocuments(credentials)
     path = package / "document-answers.json"
-    generation = json.loads((package / "codex-generation.json").read_text(encoding="utf-8"))
+    generation = json.loads((package / "generation.json").read_text(encoding="utf-8"))
     structured = []
     if path.is_file() and generation.get("document_answers_sha256"):
         if sha256_file(path) != generation["document_answers_sha256"]:

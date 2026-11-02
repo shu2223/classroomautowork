@@ -10,7 +10,7 @@ from test_forms_student import URL, published_page
 from test_frontend import offline_rpc
 from test_workflow import ReaderFixture, prepared_fixture
 
-from classroomautowork import drafting, followups, workflow
+from classroomautowork import drafting, workflow
 from classroomautowork.errors import NeedsInput, PermissionDenied, WorkflowError
 from classroomautowork.form_capture import authenticated_form_cache, import_form_capture
 from classroomautowork.local import atomic_json
@@ -78,58 +78,6 @@ def test_changed_or_expired_browser_capture_is_rejected(tmp_path, changed):
     atomic_json(file, record)
     with pytest.raises(PermissionDenied, match="过期或校验"):
         authenticated_form_cache(tmp_path, ACCOUNT, URL, PermissionDenied("HTTP 401"))
-
-
-def test_followup_reads_only_completed_turn_of_exact_recorded_chat(tmp_path, monkeypatch):
-    package, _, _, _ = prepared_fixture(tmp_path)
-    atomic_json(
-        package / "codex-generation.json", {"thread_id": "unit-thread", "turn_id": "original"}
-    )
-    thread = {
-        "id": "unit-thread",
-        "cwd": str(package),
-        "model": "unit-model",
-        "turns": [
-            {"id": "original", "status": "completed", "items": []},
-            {
-                "id": "followup",
-                "status": "completed",
-                "items": [
-                    {
-                        "type": "userMessage",
-                        "content": [{"type": "text", "text": "My actual follow-up"}],
-                    },
-                    {"type": "agentMessage", "text": "Candidate answer"},
-                ],
-            },
-            {"id": "still-running", "status": "inProgress", "items": []},
-        ],
-    }
-    requests = []
-
-    class Reader:
-        def __init__(self, *_):
-            pass
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_):
-            pass
-
-        def request(self, method, payload):
-            requests.append((method, payload))
-            assert method == "thread/read"
-            return {"thread": thread}
-
-    monkeypatch.setattr(followups, "CodexClient", Reader)
-    result = followups.read_followup(package, ["unit-fixture"])
-    assert result["turn_id"] == "followup" and result["model"] == "unit-model"
-    assert followups.read_followup(package, ["unit-fixture"]) == result
-    assert json.loads((package / "codex-generation.json").read_text())["turn_id"] == "original"
-    thread["cwd"] = str(tmp_path)
-    with pytest.raises(WorkflowError, match="不匹配"):
-        followups.read_followup(package, ["unit-fixture"])
 
 
 def test_missing_actual_questions_produces_actionable_needs_input_not_approved_draft(tmp_path):

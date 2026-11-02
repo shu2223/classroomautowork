@@ -34,20 +34,21 @@ def assignment_ids(url: str) -> tuple[str, str]:
 
 @dataclass(frozen=True)
 class Settings:
-    school_email: str
-    client_json: Path
-    data_dir: Path
+    # Only Google document filling needs these two; course data comes from the knowledge API.
+    school_email: str = ""
+    client_json: Path | None = None
+    data_dir: Path | None = None
     course_id: str = ""
     assignment_id: str = ""
     timezone: str = "Asia/Tokyo"
+    kb_url: str = "http://127.0.0.1:8772"
+    kb_token_file: Path = Path("/etc/knowledge-api/token")
 
     @classmethod
     def load(cls, path: Path | None = None) -> "Settings":
         path = require_private_path(path or state_root() / "settings.json")
         if not path.is_file():
-            raise ConfigurationError(
-                "Settings missing. Run classroomaw init with real OAuth client and assignment."
-            )
+            raise ConfigurationError("Settings missing. Run classroomaw init first.")
         try:
             values = json.loads(path.read_text(encoding="utf-8-sig"))
             return cls(**values).validated()
@@ -55,8 +56,10 @@ class Settings:
             raise ConfigurationError("Invalid local settings JSON.") from exc
 
     def validated(self) -> "Settings":
-        if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", self.school_email):
-            raise ConfigurationError("A school email is required to pin the authorized identity.")
+        if self.school_email and not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", self.school_email):
+            raise ConfigurationError("School email is not a valid address.")
+        if urlparse(self.kb_url).hostname not in {"127.0.0.1", "localhost"}:
+            raise ConfigurationError("The knowledge API must be on this machine.")
         if (self.course_id or self.assignment_id) and not (
             self.course_id.isdigit() and self.assignment_id.isdigit()
         ):
@@ -67,17 +70,21 @@ class Settings:
             ZoneInfo(self.timezone)
         except ZoneInfoNotFoundError as exc:
             raise ConfigurationError("Unknown timezone in local settings.") from exc
+        if not self.data_dir:
+            raise ConfigurationError("A private data directory is required.")
         return Settings(
             school_email=self.school_email.lower(),
-            client_json=require_private_path(Path(self.client_json)),
+            client_json=require_private_path(Path(self.client_json)) if self.client_json else None,
             data_dir=require_private_path(Path(self.data_dir)),
             course_id=self.course_id,
             assignment_id=self.assignment_id,
             timezone=self.timezone,
+            kb_url=self.kb_url,
+            kb_token_file=Path(self.kb_token_file),
         )
 
     def save(self, path: Path | None = None) -> Path:
         settings = self.validated()
         path = require_private_path(path or state_root() / "settings.json")
-        atomic_json(path, {k: str(v) for k, v in asdict(settings).items()})
+        atomic_json(path, {k: str(v) for k, v in asdict(settings).items() if v is not None})
         return path

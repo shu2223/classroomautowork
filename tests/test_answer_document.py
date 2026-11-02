@@ -30,9 +30,7 @@ def verified_package(tmp_path):
     review["requirement_checks"][0]["status"] = "needs_user"
     atomic_json(review_path, review)
     finalize(package, review_path, draft)
-    atomic_json(
-        package / "codex-generation.json", {"status": "completed", "model": "offline-fixture"}
-    )
+    atomic_json(package / "generation.json", {"status": "completed", "model": "offline-fixture"})
     return package
 
 
@@ -62,11 +60,11 @@ def test_verified_report_is_readable_and_reuses_exact_files_without_ai(tmp_path)
 def test_changed_or_unfinished_ai_output_is_never_exported_as_verified(tmp_path):
     package = verified_package(tmp_path)
     create_answer_document(package)
-    atomic_json(package / "codex-generation.json", {"status": "running"})
+    atomic_json(package / "generation.json", {"status": "running"})
     assert valid_answer_document(package) is None
     with pytest.raises(WorkflowError, match="尚未完成核验"):
         create_answer_document(package)
-    atomic_json(package / "codex-generation.json", {"status": "completed"})
+    atomic_json(package / "generation.json", {"status": "completed"})
     (package / "draft.md").write_text("unverified modification", encoding="utf-8")
     assert valid_answer_document(package) is None
     with pytest.raises(WorkflowError, match="内容已变化"):
@@ -113,7 +111,7 @@ def test_requested_templates_have_complete_body_and_keep_fact_confirmation_outsi
     atomic_json(receipt_path, receipt)
     source_hashes = {
         name: sha256_file(package / name)
-        for name in ("draft.md", "review.json", "codex-generation.json", "manifest.json")
+        for name in ("draft.md", "review.json", "generation.json", "manifest.json")
     }
     result = create_answer_document(package)
     assert result["personal_templates"] and result["template_transform_count"] == 2

@@ -1,33 +1,35 @@
-"""Callable orchestration: live read, incremental processing, retrieval, review handoff.
+"""Callable orchestration: read the knowledge base, prepare review packages, hand off.
 
-Remote reads use explicit Google API adapters and the bounded Forms GET reader. Course text never
-becomes a command, executable path, configuration, scope, approval or account selection.
+Course data comes from the knowledge API, plus the bounded Forms GET reader for form questions the
+knowledge base does not hold. Course text never becomes a command, executable path, configuration,
+scope, approval or account selection.
 """
 
 import json
+import re
 from dataclasses import asdict
 from pathlib import Path
 
-from .attachment_cache import content_signature, download_revision, legacy_download
-from .auth import credentials_for
-from .buzz import BuzzConfig, transcribe_media, validation_session
+import pypdfium2 as pdfium
+
 from .config import Settings
 from .errors import ConfigurationError, PermissionDenied, RunCancelled, WorkflowError
 from .external_sources import external_chunks, source_urls
-from .extract import extract_document, processor_identity
 from .form_capture import attach_form_images, authenticated_form_cache
 from .form_read import PARSER_VERSION, form_chunks, form_references, read_form
-from .google_read import GoogleReader, attachment_metadata, drive_attachments
-from .local import atomic_json, sha256_file, utc_now
+from .google_read import drive_attachments
+from .kb_client import KnowledgeClient
+from .local import atomic_json, utc_now
 from .pending import PENDING_STATES, discover_pending
 from .policy import CoursePolicy
-from .progress import ProgressUpdate, report
+from .progress import report
 from .search import retrieve
 from .store import Store, artifact, fingerprint
 from .student import StudentProfile
 from .supplements import load_supplement
 
-MEDIA = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".mp3", ".wav", ".m4a", ".ogg", ".flac"}
+MAX_PAGE_IMAGES = 12
+PAGE_IMAGE_SCALE = 110 / 72
 
 
 def stable_source(value):
@@ -37,26 +39,6 @@ def stable_source(value):
     if isinstance(value, list):
         return [stable_source(item) for item in value]
     return value
-
-
-def require_connection(settings: Settings):
-    path = settings.data_dir / "connection-receipt.json"
-    try:
-        receipt = json.loads(path.read_text(encoding="utf-8"))
-        attachment = Path(receipt["attachment"]["path"])
-        valid = (
-            receipt["status"] == "verified"
-            and receipt["identity"]["email"].lower() == settings.school_email
-            and attachment.is_relative_to(settings.data_dir)
-            and attachment.is_file()
-            and sha256_file(attachment) == receipt["attachment"]["sha256"]
-        )
-    except (OSError, KeyError, ValueError, TypeError):
-        valid = False
-    if not valid:
-        raise PermissionDenied(
-            "Real connection checkpoint is incomplete; run auth and verify first."
-        )
 
 
 def text_chunks(item: dict, kind: str) -> list[dict]:
@@ -96,15 +78,66 @@ def text_chunks(item: dict, kind: str) -> list[dict]:
     ]
 
 
+def document_chunks(reader, doc_id, *, source_kind, title, url):
+    # A long page yields several chunks with the same locator; evidence IDs need each one distinct.
+    return [
+        {
+            "source_kind": source_kind,
+            "title": title,
+            "url": url,
+            "locator": f"{chunk['locator'] or '正文'} · kb:{doc_id}#{chunk['ord']}",
+            "text": chunk["text"],
+        }
+        for chunk in reader.document_chunks(doc_id)
+    ]
+
+
+def attach_page_images(reader, settings, store, doc_id, chunks):
+    """Scanned worksheets need their pixels: OCR text can locate a question but not quote it."""
+    numbers = {}
+    for chunk in chunks:
+        match = re.match(r"第(\d+)页", chunk["locator"])
+        if match:
+            numbers.setdefault(int(match[1]), chunk)
+    if not numbers:
+        return chunks
+
+    def render(key):
+        destination = settings.data_dir / "processed" / key[:24]
+        destination.mkdir(parents=True, exist_ok=True)
+        try:
+            with pdfium.PdfDocument(reader.document_source(doc_id)) as document:
+                pages = {}
+                for number in sorted(numbers)[:MAX_PAGE_IMAGES]:
+                    if number > len(document):
+                        continue
+                    image = destination / f"page-{number:04d}.png"
+                    page = document[number - 1]
+                    try:
+                        bitmap = page.render(scale=PAGE_IMAGE_SCALE)
+                        try:
+                            bitmap.to_pil().save(image)
+                        finally:
+                            bitmap.close()
+                    finally:
+                        page.close()
+                    pages[str(number)] = str(image)
+        except pdfium.PdfiumError:
+            return {"pages": {}, "artifacts": []}
+        return {
+            "pages": pages,
+            "artifacts": [artifact(Path(path)) for path in pages.values()],
+        }
+
+    identity = [doc_id, fingerprint([c["text"] for c in chunks]), PAGE_IMAGE_SCALE]
+    rendered = store.memo("kb-pages", identity, render)["pages"]
+    for number, path in rendered.items():
+        numbers[int(number)]["image_path"] = path
+    return chunks
+
+
 def sync_course(
-    reader,
-    settings: Settings,
-    store: Store,
-    course_id: str,
-    *,
-    defer_media=False,
-    progress=None,
-    submissions=(),
+    reader, settings: Settings, store: Store, course_id: str, *, progress=None, submissions=()
 ) -> dict:
     policy = CoursePolicy.load(settings.data_dir, course_id)
     course = reader.course(course_id)
@@ -115,31 +148,19 @@ def sync_course(
         ("material", reader.course_materials),
         ("announcement", reader.announcements),
     ):
-        try:
-            report(
-                progress,
-                "正在读取同课程的"
-                + {"coursework": "历史作业", "material": "课程资料", "announcement": "公告"}[kind],
-                "course_sync",
-            )
-            records.extend((kind, stable_source(item)) for item in fetch(course_id))
-        except RunCancelled:
-            raise
-        except WorkflowError as exc:
-            warnings.append({"source": kind, "error": str(exc)})
-    records.extend(("submission", stable_source(item)) for item in submissions)
-    attachments, origins, resolutions, downloads = {}, {}, {}, {}
+        report(
+            progress,
+            "正在读取同课程的"
+            + {"coursework": "历史作业", "material": "课程资料", "announcement": "公告"}[kind],
+            "course_sync",
+        )
+        records.extend((kind, stable_source(item)) for item in fetch(course_id))
+    selected = {item["courseWorkId"] for item in submissions}
+    attachments, origins, resolutions = {}, {}, {}
     linked_forms, form_origins, response_forms = {}, {}, {}
     for kind, item in records:
-        source_id = kind + ":" + item.get("id", item.get("courseWorkId", ""))
+        source_id = kind + ":" + item.get("id", "")
         revision = fingerprint(item)
-
-        def snapshot(key, source=item):
-            path = settings.data_dir / "snapshots" / key[:24] / "source.json"
-            atomic_json(path, source)
-            return {"path": str(path), "artifacts": [artifact(path)]}
-
-        store.memo("classroom-snapshot", [course_id, source_id, revision], snapshot)
         store.replace_chunks(course_id, source_id, revision, text_chunks(item, kind))
         readable.add(source_id)
         for url in form_references(item):
@@ -149,9 +170,7 @@ def sync_course(
                 {
                     "source_id": source_id,
                     "url": item.get("alternateLink"),
-                    "assignment_id": item.get(
-                        "courseWorkId", item.get("id") if kind == "coursework" else None
-                    ),
+                    "assignment_id": item.get("id") if kind == "coursework" else None,
                     "role": kind,
                 }
             )
@@ -161,15 +180,13 @@ def sync_course(
                 {
                     "source_id": source_id,
                     "url": item.get("alternateLink"),
-                    "assignment_id": item.get(
-                        "courseWorkId", item.get("id") if kind == "coursework" else None
-                    ),
-                    "role": "student_document" if kind == "submission" else kind,
+                    "assignment_id": item.get("id") if kind == "coursework" else None,
+                    "role": kind,
                 }
             )
     report(
         progress,
-        f"已找到 {len(attachments)} 份课程附件，开始核对和处理",
+        f"已找到 {len(attachments)} 份课程附件，开始从资料库读取",
         "course_sync",
         course_id=course_id,
         workload_files=[
@@ -245,158 +262,79 @@ def sync_course(
                 "error": "课程表单数量超过本次 100 份只读预算，未读取。",
             }
         )
+    linked_docs = set()
     for number, (file_id, reference) in enumerate(attachments.items(), 1):
         name = str(reference.get("title") or "课程附件")[:200]
-
-        context = {
-            "course_id": course_id,
-            "file_id": file_id,
-            "filename": name,
-            "attachment_index": number,
-            "attachment_total": len(attachments),
-        }
-
-        def file_progress(update, context=context):
-            details = dict(getattr(update, "details", {"stage": "attachment"}))
-            report(
-                progress,
-                f"{context['filename']} · {update}",
-                **{
-                    **details,
-                    "course_id": context["course_id"],
-                    "file_id": context["file_id"],
-                    "filename": context["filename"],
-                    "attachment_index": context["attachment_index"],
-                    "attachment_total": context["attachment_total"],
-                },
-            )
-
-        try:
-            file_progress(ProgressUpdate("正在核验访问权限与文件版本", "attachment"))
-            metadata = attachment_metadata(reader, reference)
-            name = str(metadata["name"])[:200]
-            context["filename"] = name
-            file_progress(ProgressUpdate("已读取文件信息，正在检查缓存", "attachment"))
-            resolved_id = metadata["id"]
-            resolutions[file_id] = resolved_id
-            if not metadata.get("capabilities", {}).get("canDownload"):
-                raise PermissionDenied(
-                    "Download permission is unavailable; no cached attachment used."
-                )
-            suffix = Path(metadata["name"]).suffix.lower()
-            if defer_media and (
-                suffix in MEDIA or metadata["mimeType"].startswith(("video/", "audio/"))
-            ):
-                raise WorkflowError("Media processing explicitly deferred for this run.")
-            if not metadata.get("version") and not content_signature(metadata):
-                raise WorkflowError(
-                    "Drive revision is unavailable; cannot establish an incremental cache key."
-                )
-            revision = download_revision(metadata)
-
-            def download(key, meta=metadata):
-                # The budget limits new transfers. Completed, intact content
-                # matching the live revision can still pass Store's cache checks.
-                if int(meta.get("size", "0")) > policy.max_attachment_bytes:
-                    raise WorkflowError(
-                        "Attachment exceeds this course's download budget; increase max_attachment_bytes to process it."
-                    )
-                result = reader.download(
-                    meta,
-                    settings.data_dir / "attachments" / key[:24],
-                    **({"progress": file_progress} if progress else {}),
-                )
-                return {**result, "artifacts": [artifact(Path(result["path"]))]}
-
-            reused_before = store.stats["reused"]
-            raw = store.memo(
-                "drive-download",
-                revision,
-                download,
-                reuse=lambda meta=metadata: legacy_download(store, meta),
-            )
-            if store.stats["reused"] > reused_before:
-                file_progress(
-                    ProgressUpdate("附件内容未变，已复用完整本地文件；无需下载", "attachment")
-                )
-            file_progress(ProgressUpdate("附件已取得，正在复核版本和下载权限", "attachment"))
-            after = reader.file_metadata(resolved_id, metadata.get("resourceKey"))
-            if download_revision(metadata) != download_revision(after) or not after.get(
-                "capabilities", {}
-            ).get("canDownload"):
-                raise WorkflowError(
-                    "Attachment changed or permission was removed during processing; rerun."
-                )
-            path = Path(raw["path"])
-            downloads[resolved_id] = {
-                "id": resolved_id,
-                "title": metadata["name"],
-                "url": metadata.get("webViewLink"),
-                "path": str(path),
-                "sha256": raw["artifacts"][0]["sha256"],
-                "mime_type": metadata["mimeType"],
-            }
-            media = path.suffix.lower() in MEDIA or metadata["mimeType"].startswith(
-                ("video/", "audio/")
-            )
-            config = None
-            if media:
-                config = BuzzConfig.load()
-                # Course language is trusted local config, not fetched course text.
-                from dataclasses import replace
-
-                config = replace(config, language=policy.language).validated()
-                processor = {**asdict(config), "backend": "buzz-whispercpp-v1"}
-            else:
-                processor = processor_identity(policy)
-            content_hash = raw["artifacts"][0]["sha256"]
-
-            def process(key, file=path, is_media=media, buzz_config=config):
-                destination = settings.data_dir / "processed" / key[:24]
-                return (
-                    transcribe_media(file, destination, store, buzz_config, progress=file_progress)
-                    if is_media
-                    else extract_document(file, destination, policy, progress=file_progress)
-                )
-
-            result = store.memo(
-                "media" if media else "document", [content_hash, processor], process
-            )
-            file_progress(ProgressUpdate("内容已处理并缓存，继续下一份附件", "attachment_done"))
-            source_id = "file:" + resolved_id
-            chunks = [
-                {
-                    **x,
-                    "source_kind": "transcript" if media else "document",
-                    "title": metadata["name"],
-                    "url": metadata.get("webViewLink"),
-                }
-                for x in result["chunks"]
-            ]
-            # Evidence identity follows actual content and processor settings. A Drive
-            # metadata-only version change must not invalidate identical extracted pages.
-            store.replace_chunks(
-                course_id, source_id, fingerprint([content_hash, processor]), chunks
-            )
-            readable.add(source_id)
-            warnings.extend({"source": source_id, "error": x} for x in result.get("warnings", []))
-        except RunCancelled:
-            raise
-        except WorkflowError as exc:
-            file_progress(
-                ProgressUpdate(
-                    "这份附件未能完成，继续处理其他资料", "attachment_failed", failed=True
-                )
-            )
+        report(
+            progress,
+            f"{name} · 正在从资料库读取",
+            "attachment",
+            course_id=course_id,
+            file_id=file_id,
+            filename=name,
+            attachment_index=number,
+            attachment_total=len(attachments),
+        )
+        resolutions[file_id] = file_id
+        found = reader.file_document(course_id, file_id)
+        if found:
+            linked_docs.add(found["doc"])
+        if not found or found["status"] != "ready":
             warnings.append(
                 {
                     "source": "file:" + file_id,
                     "title": reference.get("title"),
                     "url": reference.get("alternateLink"),
                     "origins": origins.get(file_id, []),
-                    "error": str(exc),
+                    "error": (
+                        f"资料库还没处理完这份附件（状态：{found['status']}）。"
+                        if found
+                        else "资料库里没有这份附件：可能是老师禁止下载、无权访问或还没抓取。"
+                    ),
                 }
             )
+            continue
+        document = next(
+            (d for d in reader.documents(course_id) if d["id"] == found["doc"]),
+            {"kind": "document"},
+        )
+        chunks = document_chunks(
+            reader,
+            found["doc"],
+            source_kind="transcript" if document["kind"] == "video" else "document",
+            title=name,
+            url=reference.get("alternateLink"),
+        )
+        if any(
+            origin.get("assignment_id") in selected for origin in origins.get(file_id, [])
+        ) and str(document.get("source", "")).lower().endswith(".pdf"):
+            chunks = attach_page_images(reader, settings, store, found["doc"], chunks)
+        source_id = "file:" + file_id
+        store.replace_chunks(course_id, source_id, fingerprint(chunks), chunks)
+        readable.add(source_id)
+    # Lecture videos and notes in the knowledge base usually belong to no Classroom attachment.
+    for document in reader.documents(course_id):
+        if document["kind"] == "post" or document["id"] in linked_docs:
+            continue
+        if document["status"] != "ready":
+            warnings.append(
+                {
+                    "source": "kb:" + document["id"],
+                    "title": document["title"],
+                    "error": f"资料库还没处理完这份内容（状态：{document['status']}）。",
+                }
+            )
+            continue
+        chunks = document_chunks(
+            reader,
+            document["id"],
+            source_kind="transcript" if document["kind"] == "video" else "document",
+            title=document["title"],
+            url=document.get("url"),
+        )
+        source_id = "kb:" + document["id"]
+        store.replace_chunks(course_id, source_id, fingerprint(chunks), chunks)
+        readable.add(source_id)
     allowed_link_urls = source_urls(records) | source_urls(
         [("cached", value) for value in store.chunks(course_id) if value["source_id"] in readable]
     )
@@ -414,12 +352,12 @@ def sync_course(
         "submissions": {item["courseWorkId"]: stable_source(item) for item in submissions},
         "attachment_origins": origins,
         "attachment_resolutions": resolutions,
-        "downloads": downloads,
+        "downloads": {},
         "response_forms": response_forms,
         "form_origins": form_origins,
         "resource_index": [
             {
-                "source_id": kind + ":" + item.get("id", item.get("courseWorkId", "")),
+                "source_id": kind + ":" + item.get("id", ""),
                 "title": item.get("title", kind),
                 "url": item.get("alternateLink"),
                 "kind": kind,
@@ -538,7 +476,7 @@ def prepare_assignment(
             questions.append("部分资料未处理或需目视核对，详见 manifest.json 的 warnings。")
         manifest = {
             "schema": 2,
-            "status": "prepared_for_codex",
+            "status": "prepared",
             "created_at": utc_now(),
             "course_id": course_id,
             "assignment_id": assignment_id,
@@ -578,7 +516,7 @@ def prepare_assignment(
             "\n".join("- " + x for x in questions) + "\n", encoding="utf-8"
         )
         (path / "checklist.md").write_text(
-            "Codex 尚未逐项检查作业要求。请先读取 requirements.json，再生成检查结果。\n",
+            "尚未逐项检查作业要求。\n",
             encoding="utf-8",
         )
         immutable = [
@@ -587,14 +525,13 @@ def prepare_assignment(
         return {
             "package": str(path),
             "can_draft": course["policy"]["can_draft"],
-            "status": "prepared_for_codex",
+            "status": "prepared",
             "artifacts": [artifact(x) for x in immutable],
         }
 
     return store.memo("review-preparation", identity, package)
 
 
-@validation_session()
 def prepare(
     settings: Settings,
     *,
@@ -602,7 +539,6 @@ def prepare(
     include_no_due=False,
     target: tuple[str, str] | None = None,
     targets: list[tuple[str, str]] | None = None,
-    defer_media=False,
     progress=None,
     extra_queries=(),
     on_assignment=None,
@@ -611,9 +547,7 @@ def prepare(
     settings = settings.validated()
     if targets is not None and (target is not None or due_before is not None):
         raise ConfigurationError("Select specific assignments or a date cutoff, not both.")
-    require_connection(settings)
-    credentials, _ = credentials_for(settings)
-    reader = GoogleReader(credentials)
+    reader = KnowledgeClient.from_settings(settings)
     with Store(settings.data_dir) as store:
         if target or targets is not None:
             requested = [target] if target else targets
@@ -680,7 +614,6 @@ def prepare(
                         settings,
                         store,
                         cid,
-                        defer_media=defer_media,
                         progress=progress,
                         submissions=[
                             x for x in own_submissions[cid] if x["courseWorkId"] in selected_ids
@@ -701,7 +634,7 @@ def prepare(
                 if on_assignment:
                     on_assignment(item, {"status": "failed", "error": str(exc)})
         batch = {
-            "status": "prepared_for_codex" if not failures else "partial",
+            "status": "prepared" if not failures else "partial",
             "finished_at": utc_now(),
             "due_before_inclusive": due_before,
             "timezone": settings.timezone,
@@ -709,7 +642,7 @@ def prepare(
             "selection": selection,
             "failures": failures,
             "cache": store.stats,
-            "note": "Codex must review course rules, draft allowed assignments, and finalize locally. Nothing was submitted.",
+            "note": "The model drafts each package and local code validates it. Nothing was submitted.",
         }
         atomic_json(settings.data_dir / "latest-batch.json", batch)
         return batch

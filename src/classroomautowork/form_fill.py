@@ -8,7 +8,6 @@ Opening is recorded separately from browser verification and Google's draft savi
 import hashlib
 import json
 import re
-import webbrowser
 from pathlib import Path
 from urllib.parse import urlencode
 
@@ -300,9 +299,8 @@ def current_response_urls(reader, course_id, assignment_id):
 
 def fill_response_forms(settings, package: Path, *, progress=lambda _: None, opener=None) -> dict:
     """Revalidate actual model output, current rules and fresh original questions."""
-    from .auth import credentials_for
     from .drafting import reusable_review
-    from .google_read import GoogleReader
+    from .kb_client import KnowledgeClient
 
     package = require_private_path(package)
     manifest = json.loads((package / "manifest.json").read_text(encoding="utf-8"))
@@ -324,9 +322,8 @@ def fill_response_forms(settings, package: Path, *, progress=lambda _: None, ope
     ):
         raise WorkflowError("旧初稿没有核验过的逐栏表单答案，请使用所选模型重新生成。")
     forms = prepare_response_forms(package)
-    read_credentials, _ = credentials_for(settings)
     allowed = current_response_urls(
-        GoogleReader(read_credentials), manifest["course_id"], manifest["assignment_id"]
+        KnowledgeClient.from_settings(settings), manifest["course_id"], manifest["assignment_id"]
     )
     if {x["url"] for x in forms} - allowed:
         raise WorkflowError("表单不再属于这项本人待完成作业，未填写其他课程链接。")
@@ -428,7 +425,7 @@ def _open_plans(path, record, progress, opener):
                 if old.get("url") != plan["url"]:
                     raise WorkflowError("预填记录的地址已经变化，不能复用未知链接。")
                 plan["opened"] = old.get("opened") is True
-            if previous.get("status") == "opened_native_prefill":
+            if previous.get("status") in {"opened_native_prefill", "prefill_ready"}:
                 # Refresh coverage for older receipts too. Reusing the same GET
                 # must not preserve a stale claim that all native fields exist.
                 previous.update(
@@ -436,8 +433,13 @@ def _open_plans(path, record, progress, opener):
                 )
                 atomic_json(path, previous)
                 return {**previous, "reused": True}
+    if opener is None:
+        # The assistant runs on a server: the user opens each prefilled link from the result.
+        record["status"] = "prefill_ready"
+        atomic_json(path, record)
+        return record
     atomic_json(path, record)
-    open_url = opener or webbrowser.open
+    open_url = opener
     for plan in plans:
         if plan.get("opened"):
             continue

@@ -48,8 +48,8 @@ def test_source_gap_repair_receives_specific_reason_and_retains_previous_native_
     assert retained["fields"] == [{"form_url": known["form_url"], "entry_id": "200"}]
     assert retained["source_result_sha256"] == context["source_result_sha256"]
     # Keeping old rows is a recorded validation step, never a fabricated model reply.
-    assert json.loads((output / "codex-result.json").read_text(encoding="utf-8")) == repaired
-    assert generation["result_sha256"] == sha256_file(output / "codex-result.json")
+    assert json.loads((output / "model-result.json").read_text(encoding="utf-8")) == repaired
+    assert generation["result_sha256"] == sha256_file(output / "model-result.json")
     assert generation["source_files_sha256"]["form-repair-input.json"] == sha256_file(
         output / "form-repair-input.json"
     )

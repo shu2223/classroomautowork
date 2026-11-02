@@ -9,7 +9,6 @@ import pytest
 from defusedxml.common import EntitiesForbidden
 from pypdf import PdfWriter
 
-from classroomautowork.buzz import parse_srt
 from classroomautowork.errors import ConfigurationError, WorkflowError
 from classroomautowork.extract import extract_document
 from classroomautowork.local import atomic_json
@@ -91,15 +90,6 @@ def test_document_entities_are_not_executed(tmp_path):
     assert not (tmp_path / "result/extraction.json").exists()
 
 
-def test_transcript_preserves_offset_and_rejects_reversed_time():
-    text = "1\n00:00:01,000 --> 00:00:02,500\n実際の講義\n"
-    chunks = parse_srt(text, 300)
-    assert chunks[0]["start_seconds"] == 301
-    assert chunks[0]["end_seconds"] == 302.5
-    with pytest.raises(WorkflowError):
-        parse_srt(text.replace("00:00:02,500", "00:00:00,500"))
-
-
 def test_cjk_retrieval_and_course_isolation(tmp_path):
     with Store(tmp_path) as store:
         for course, text in (("1", "食品安全 食中毒について"), ("2", "食品安全 他の授業")):
@@ -128,12 +118,13 @@ def test_course_ai_gate_needs_evidence_and_limits(tmp_path):
 
 
 class ReaderFixture:
-    """An explicit offline unit fixture, never used by the production CLI."""
+    """An explicit offline stand-in for the knowledge API, never used by the production CLI."""
 
-    denied = False
-    version = "1"
-    downloads = 0
+    revision = "1"
+    missing = False
     thumbnail = "unit-thumbnail-1"
+    lecture_status = "ready"
+    pdf = None
 
     def course(self, cid):
         return {"id": cid, "name": "Unit course"}
@@ -160,95 +151,117 @@ class ReaderFixture:
     def announcements(self, _):
         return [{"id": "3", "text": "Unit announcement"}]
 
-    def file_metadata(self, file, _key=None):
-        return {
-            "id": file,
-            "name": "unit.txt",
-            "mimeType": "text/plain",
-            "version": self.version,
-            "capabilities": {"canDownload": not self.denied},
-        }
+    def file_document(self, _course, file_id):
+        if file_id == "unit-file-01" and not self.missing:
+            return {"doc": "aaaa0001", "status": "ready"}
+        return None
 
-    def download(self, metadata, destination, *, progress=None):
-        self.downloads += 1
-        destination.mkdir(parents=True)
-        path = destination / "unit.txt"
-        path.write_text("食品安全 unit revision " + self.version, encoding="utf-8")
-        return {"path": str(path)}
+    def documents(self, _course):
+        return [
+            {
+                "id": "aaaa0001",
+                "kind": "document",
+                "status": "ready",
+                "title": "unit",
+                "source": "/kb/unit.pdf" if self.pdf else "/kb/unit.txt",
+            },
+            {
+                "id": "bbbb0002",
+                "kind": "video",
+                "status": self.lecture_status,
+                "title": "Unit lecture",
+                "source": "/kb/lecture.mp4",
+                "url": None,
+            },
+            {"id": "cccc0003", "kind": "post", "status": "ready", "title": "post"},
+        ]
+
+    def document_chunks(self, doc):
+        if doc == "bbbb0002":
+            return [{"ord": 1, "locator": "00:01:00", "text": "[讲话]\n量子力学の講義"}]
+        return [
+            {"ord": 1, "locator": "第1页", "text": "食品安全 unit revision " + self.revision},
+            {"ord": 2, "locator": "第1页", "text": "続き"},
+        ]
+
+    def document_source(self, _doc):
+        return self.pdf
 
 
-def test_live_metadata_gate_before_reuse_and_changed_revision(tmp_path):
-    settings = SimpleNamespace(data_dir=tmp_path)
+def test_attachment_follows_knowledge_base_content_and_disappears_when_missing(tmp_path):
+    settings = SimpleNamespace(data_dir=tmp_path, school_email="")
     reader = ReaderFixture()
     with Store(tmp_path) as store:
         sync_course(reader, settings, store, "1")
+        first = {c["id"] for c in store.chunks("1") if c["source_id"] == "file:unit-file-01"}
+        assert len(first) == 2  # Same page locator twice still gives distinct evidence.
         reader.thumbnail = "unit-thumbnail-2"
         sync_course(reader, settings, store, "1")
-        assert reader.downloads == 1
-        assert store.stats["processed"] == 4  # two snapshots, one download, one extraction
-        reader.version = "2"
+        assert first == {
+            c["id"] for c in store.chunks("1") if c["source_id"] == "file:unit-file-01"
+        }
+        reader.revision = "2"
         sync_course(reader, settings, store, "1")
-        assert reader.downloads == 2
         assert any("revision 2" in c["text"] for c in store.chunks("1"))
-        reader.denied = True
+        reader.missing = True
         result = sync_course(reader, settings, store, "1")
         assert not any(c["source_id"] == "file:unit-file-01" for c in store.chunks("1"))
-        assert "no cached attachment" in result["warnings"][0]["error"]
+        assert "资料库里没有这份附件" in result["warnings"][0]["error"]
 
 
-def test_own_document_is_required_alternate_id_retries_and_unranked_lecture_stays_searchable(
-    tmp_path,
-):
-    from classroomautowork.errors import PermissionDenied
+def test_unattached_lectures_are_searchable_and_unfinished_ones_are_reported(tmp_path):
+    settings = SimpleNamespace(data_dir=tmp_path, school_email="")
+    reader = ReaderFixture()
+    with Store(tmp_path) as store:
+        sync_course(reader, settings, store, "1")
+        lecture = [c for c in store.chunks("1") if c["source_id"] == "kb:bbbb0002"]
+        assert lecture[0]["source_kind"] == "transcript"
+        assert "kb:bbbb0002#1" in lecture[0]["locator"]
+        assert not any(c["source_id"] == "kb:cccc0003" for c in store.chunks("1"))
+        reader.lecture_status = "pending"
+        result = sync_course(reader, settings, store, "1")
+        assert not any(c["source_id"] == "kb:bbbb0002" for c in store.chunks("1"))
+        assert "还没处理完" in result["warnings"][0]["error"]
 
-    class OwnDocumentReader(ReaderFixture):
-        reads = []
 
+def test_selected_assignment_pdf_gets_page_images(tmp_path):
+    import io
+
+    buffer = io.BytesIO()
+    writer = PdfWriter()
+    writer.add_blank_page(width=400, height=300)
+    writer.write(buffer)
+    reader = ReaderFixture()
+    reader.pdf = buffer.getvalue()
+    settings = SimpleNamespace(data_dir=tmp_path, school_email="")
+    with Store(tmp_path) as store:
+        sync_course(reader, settings, store, "1")
+        assert not any(c["image_path"] for c in store.chunks("1"))
+        sync_course(reader, settings, store, "1", submissions=[{"courseWorkId": "2"}])
+        images = [c["image_path"] for c in store.chunks("1") if c["image_path"]]
+    assert len(images) == 1 and Path(images[0]).is_file()
+    assert Path(images[0]).is_relative_to(tmp_path / "processed")
+
+
+def test_student_copy_template_is_a_requirement_and_unranked_lecture_stays_searchable(tmp_path):
+    class TemplateReader(ReaderFixture):
         def assignments(self, cid):
             assignment = super().assignments(cid)[0]
-            assignment["materials"][0]["driveFile"] = {
-                "shareMode": "STUDENT_COPY",
-                "driveFile": {
-                    "id": "unit-denied-template",
-                    "alternateLink": "https://docs.google.com/document/d/unit-reachable-template/edit",
-                },
-            }
+            assignment["materials"][0]["driveFile"]["shareMode"] = "STUDENT_COPY"
             return [assignment]
 
         def course_materials(self, _):
             return [{"id": "9", "title": "Unmatched lecture", "description": "量子力学"}]
 
-        def file_metadata(self, file, key=None):
-            self.reads.append(file)
-            if file == "unit-denied-template":
-                raise PermissionDenied("Offline denied")
-            return super().file_metadata(file, key)
-
-    reader = OwnDocumentReader()
-    submission = {
-        "id": "own-unit",
-        "courseWorkId": "2",
-        "assignmentSubmission": {
-            "attachments": [
-                {
-                    "driveFile": {
-                        "id": "unit-own-document",
-                        "alternateLink": "https://docs.google.com/document/d/unit-own-document/edit",
-                    }
-                }
-            ]
-        },
-    }
-    settings = SimpleNamespace(data_dir=tmp_path)
+    settings = SimpleNamespace(data_dir=tmp_path, school_email="")
     with Store(tmp_path) as store:
-        course = sync_course(reader, settings, store, "1", submissions=[submission])
+        course = sync_course(TemplateReader(), settings, store, "1")
         result = prepare_assignment(settings, store, course, "2")
     package = Path(result["package"])
     requirements = json.loads((package / "requirements.json").read_text(encoding="utf-8"))
     evidence = json.loads((package / "evidence.json").read_text(encoding="utf-8"))
-    assert any(x["source_id"] == "file:unit-own-document" for x in requirements["sources"])
+    assert any(x["source_id"] == "file:unit-file-01" for x in requirements["sources"])
     assert any(x["source_id"] == "material:9" for x in evidence["sources"])
-    assert "unit-denied-template" in reader.reads and "unit-reachable-template" in reader.reads
     assert not course["warnings"]
 
 
@@ -257,7 +270,7 @@ def prepared_fixture(root, ai_use="allowed"):
         root / "courses/1.json",
         asdict(CoursePolicy(ai_use=ai_use, policy_evidence="Unit syllabus")),
     )
-    settings = SimpleNamespace(data_dir=root)
+    settings = SimpleNamespace(data_dir=root, school_email="")
     reader = ReaderFixture()
     with Store(root) as store:
         course = sync_course(reader, settings, store, "1")

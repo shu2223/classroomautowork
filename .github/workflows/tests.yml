@@ -6,7 +6,7 @@ jobs:
   offline:
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest]
         python: ['3.11', '3.13']
     runs-on: ${{ matrix.os }}
     steps:

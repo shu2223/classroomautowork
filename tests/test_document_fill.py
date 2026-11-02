@@ -911,7 +911,7 @@ def test_fill_review_aggregates_missing_questions_and_reports_partial(tmp_path, 
     answer_path.write_text(
         json.dumps({"answers": [{"document_id": "offline-doc"}]}), encoding="utf-8"
     )
-    (package / "codex-generation.json").write_text(
+    (package / "generation.json").write_text(
         json.dumps({"document_answers_sha256": sha256_file(answer_path)}), encoding="utf-8"
     )
     reader = PersonalReader()

@@ -1,14 +1,13 @@
 """Offline regression checks for scheduling and binary validation, not OAuth proof."""
 
-import hashlib
 from pathlib import Path
 
 import pytest
 from test_frontend import unit_settings
 
-from classroomautowork import buzz, ui_jobs
+from classroomautowork import ui_jobs
 from classroomautowork.batch import course_batches
-from classroomautowork.errors import ConfigurationError, WorkflowError
+from classroomautowork.errors import WorkflowError
 from classroomautowork.local import atomic_json
 from classroomautowork.ui_jobs import FrontendJobs
 
@@ -43,7 +42,7 @@ def test_deliver_first_course_before_reading_next_and_isolate_course_failures(
         packages = []
         for c, a in targets:
             result = {"course_id": c, "assignment_id": a, "package": str(tmp_path / a)}
-            on_assignment(result, {**result, "status": "prepared_for_codex"})
+            on_assignment(result, {**result, "status": "prepared"})
             packages.append(result)
         return {"packages": packages, "cache": {"reused": 2, "processed": 1, "failed": 0}}
 
@@ -73,43 +72,6 @@ def test_deliver_first_course_before_reading_next_and_isolate_course_failures(
         ]
         assert saved["status"] == "completed"
         assert saved["cache"] == {"reused": 4, "processed": 2, "failed": 0}
-
-
-def test_binary_hash_is_reused_only_inside_one_run_and_changes_are_detected(tmp_path, monkeypatch):
-    path = tmp_path / "local-model.bin"
-    path.write_bytes(b"offline model bytes")
-    calls = []
-
-    def digest(file):
-        calls.append(file)
-        return hashlib.sha256(file.read_bytes()).hexdigest()
-
-    monkeypatch.setattr(buzz, "sha256_file", digest)
-    with buzz.validation_session():
-        first = buzz._verified_hash(path)
-        with buzz.validation_session():
-            assert buzz._verified_hash(path) == first
-        assert len(calls) == 1
-        path.write_bytes(b"changed local model bytes")
-        assert buzz._verified_hash(path) != first
-        assert len(calls) == 2
-    with buzz.validation_session():
-        buzz._verified_hash(path)
-    assert len(calls) == 3
-
-
-def test_binary_changed_while_hashing_is_never_cached(tmp_path, monkeypatch):
-    path = tmp_path / "changing.bin"
-    path.write_bytes(b"first")
-
-    def changing(file):
-        result = hashlib.sha256(file.read_bytes()).hexdigest()
-        file.write_bytes(b"changed while reading")
-        return result
-
-    monkeypatch.setattr(buzz, "sha256_file", changing)
-    with buzz.validation_session(), pytest.raises(ConfigurationError, match="changed while"):
-        buzz._verified_hash(path)
 
 
 def test_retry_fill_failure_does_not_download_or_generate_again(tmp_path, monkeypatch):
@@ -147,7 +109,7 @@ def test_main_button_retries_only_fill_when_document_mapping_exists(tmp_path, mo
     target = {"course_id": "1", "assignment_id": "2"}
     atomic_json(jobs.root / "pending.json", {"assignments": [target]})
     atomic_json(
-        jobs.root / "codex-models.json",
+        jobs.root / "models.json",
         {
             "default_model": "offline-model",
             "default_effort": None,

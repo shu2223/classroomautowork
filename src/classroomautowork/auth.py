@@ -30,6 +30,8 @@ DOCUMENT_SERVICE = "classroomautowork.google-documents-oauth"
 
 def documents_authorized(settings: Settings) -> bool:
     """Local scope status only; real identity/API validation occurs before every write."""
+    if not settings.client_json:
+        return False
     try:
         secure_keyring()
         client = json.loads(settings.client_json.read_text(encoding="utf-8-sig"))["installed"]
@@ -105,7 +107,7 @@ def credentials_for(
     scopes = DOCUMENT_SCOPES if documents else SCOPES
     service = DOCUMENT_SERVICE if documents else SERVICE
     client_path = settings.client_json
-    if not client_path.is_file():
+    if not client_path or not client_path.is_file():
         raise ConfigurationError(
             "OAuth client JSON does not exist. Create a Desktop app client in Google Cloud."
         )

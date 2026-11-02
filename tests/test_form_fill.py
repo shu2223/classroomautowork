@@ -10,7 +10,7 @@ import pytest
 from test_forms_student import URL, published_page
 from test_workflow import prepared_fixture
 
-from classroomautowork import auth, drafting, form_fill, google_read
+from classroomautowork import drafting, form_fill, kb_client
 from classroomautowork.errors import WorkflowError
 from classroomautowork.form_read import form_chunks, parse_form
 from classroomautowork.local import atomic_json, sha256_file
@@ -127,12 +127,11 @@ def fill_fixture(tmp_path, monkeypatch):
     monkeypatch.setattr(
         drafting, "reusable_review", lambda _: {"draft_sha256": "unit", "generation": generation}
     )
-    monkeypatch.setattr(auth, "credentials_for", lambda _: (object(), {}))
     reader = SimpleNamespace(
         own_submissions=lambda _: [{"courseWorkId": "2", "state": "CREATED"}],
         assignment=lambda *args: {"materials": [{"link": {"url": URL}}]},
     )
-    monkeypatch.setattr(google_read, "GoogleReader", lambda _: reader)
+    monkeypatch.setattr(kb_client.KnowledgeClient, "from_settings", lambda _: reader)
     monkeypatch.setattr(form_fill, "read_form", lambda _: form)
     settings = SimpleNamespace(data_dir=tmp_path, school_email="unit@school.test")
     return package, settings, form, generation

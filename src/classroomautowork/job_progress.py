@@ -88,7 +88,7 @@ class JobProgress:
     def update(self, details):
         data = {**self.context, **details}
         if data.get("stage") == "ai" and self.active_item:
-            # The worker also reports Codex thread IDs; the timed operation is
+            # The worker also reports model session IDs; the timed operation is
             # this assignment, including connection/model startup.
             data["item_id"] = self.active_item
         course = data.get("course_id")

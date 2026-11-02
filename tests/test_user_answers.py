@@ -8,7 +8,7 @@ from test_form_fill import answer, fill_fixture
 from test_frontend import offline_rpc, unit_settings
 from test_workflow import prepared_fixture
 
-from classroomautowork import drafting, user_answers
+from classroomautowork import claude_agent, drafting, user_answers
 from classroomautowork.errors import WorkflowError
 from classroomautowork.local import atomic_json
 from classroomautowork.student import StudentProfile
@@ -88,7 +88,7 @@ def test_saving_inputs_during_active_work_preserves_generation_and_does_not_star
         jobs, "fill_existing", lambda *_: pytest.fail("Don't interrupt active work")
     )
     monkeypatch.setattr(
-        drafting, "codex_command", lambda: pytest.fail("No AI regeneration for user inputs")
+        claude_agent, "claude_command", lambda: pytest.fail("No AI regeneration for user inputs")
     )
     result = jobs.save_form_inputs(
         "unit-job", "1:2", {"answers": [input_value(form)], "apply": True}
@@ -120,22 +120,22 @@ def test_completed_turn_validation_recovery_keeps_actual_model_and_refuses_tampe
     from pathlib import Path
 
     variant = Path(receipt["package"])
-    raw = (variant / "codex-result.json").read_bytes()
+    raw = (variant / "model-result.json").read_bytes()
     generation = receipt["generation"]
     generation.update(status="failed", error="Offline local validation failure")
-    atomic_json(variant / "codex-generation.json", generation)
-    monkeypatch.setattr(drafting, "codex_command", lambda: pytest.fail("No second model call"))
+    atomic_json(variant / "generation.json", generation)
+    monkeypatch.setattr(claude_agent, "claude_command", lambda: pytest.fail("No second model call"))
     restored = drafting.generate_review(
         package, ai_confirmed=True, model="unit-model", effort="high"
     )
-    assert restored["reused"] and restored["generation"]["turn_id"] == "unit-turn"
+    assert restored["reused"] and restored["generation"]["thread_id"] == "unit-session"
     assert (
         restored["generation"]["model"] == "unit-model"
-        and (variant / "codex-result.json").read_bytes() == raw
+        and (variant / "model-result.json").read_bytes() == raw
     )
     generation["status"] = "failed"
-    atomic_json(variant / "codex-generation.json", generation)
-    (variant / "codex-result.json").write_bytes(b"tampered")
+    atomic_json(variant / "generation.json", generation)
+    (variant / "model-result.json").write_bytes(b"tampered")
     assert drafting.recover_completed_result(variant, model="unit-model", effort="high") is None
 
 

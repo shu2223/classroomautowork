@@ -9,7 +9,7 @@ from PIL import Image
 from test_forms_student import URL, published_page
 from test_workflow import ReaderFixture
 
-from classroomautowork import browser_questions, drafting, form_fill, workflow
+from classroomautowork import drafting, form_fill, workflow
 from classroomautowork.errors import PermissionDenied, WorkflowError
 from classroomautowork.form_capture import (
     attach_form_images,
@@ -18,7 +18,6 @@ from classroomautowork.form_capture import (
     import_form_images,
 )
 from classroomautowork.form_read import form_chunks, parse_form
-from classroomautowork.local import atomic_json
 from classroomautowork.store import Store
 
 ACCOUNT = "student@example.invalid"
@@ -140,7 +139,7 @@ def test_workflow_carries_verified_form_pixels_into_required_evidence_and_model_
         (skill / "SKILL.md").write_text("Offline test skill", encoding="utf-8")
         (skill / "references/review-format.md").write_text("Offline format", encoding="utf-8")
         inputs, metadata = drafting.build_input(package, skill, manifest)
-        assert {"type": "localImage", "path": image_path} in inputs
+        assert drafting.image_block(Path(image_path)) in inputs
         assert media_source["id"] in metadata["source_ids"]
         assert not any("图片材料尚未读取" in warning["error"] for warning in manifest["warnings"])
         Path(image_path).write_bytes(b"corrupted after processing")
@@ -178,77 +177,3 @@ def test_unknown_duplicate_or_nonimage_captures_are_rejected(tmp_path):
         import_form_images(tmp_path, ACCOUNT, URL, [{"item_id": "120", "path": str(path)}], [URL])
     with pytest.raises(WorkflowError, match="原始表单"):
         import_form_images(tmp_path, ACCOUNT, URL, [], [])
-
-
-def test_browser_recovery_handles_current_visual_gap_and_reports_unread_images(
-    tmp_path, monkeypatch
-):
-    package = tmp_path / "package"
-    package.mkdir()
-    atomic_json(
-        package / "manifest.json",
-        {
-            "assignment_id": "2",
-            "assignment": {"title": "Unit task"},
-            "source_index": [{"url": URL, "required": True}],
-            "warnings": [{"url": URL, "error": "Google Forms 第 2 页图片材料尚未读取"}],
-        },
-    )
-    requests = []
-
-    class Client:
-        approval_wait_seconds = 0
-
-        def __init__(self, *args, **kwargs):
-            self.events = iter(
-                [
-                    {
-                        "method": "item/completed",
-                        "params": {
-                            "item": {
-                                "type": "agentMessage",
-                                "text": json.dumps(
-                                    {
-                                        "readable": True,
-                                        "question_script": image_page(),
-                                        "images": [],
-                                        "message": "The next page requires existing answers before it can be opened.",
-                                    }
-                                ),
-                            }
-                        },
-                    },
-                    {
-                        "method": "turn/completed",
-                        "params": {"turn": {"id": "unit-turn", "status": "completed"}},
-                    },
-                ]
-            )
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            pass
-
-        def request(self, method, params):
-            requests.append((method, params))
-            if method == "thread/start":
-                return {"model": params["model"], "thread": {"id": "unit-thread"}}
-            return {"turn": {"id": "unit-turn"}}
-
-        def next_event(self, **kwargs):
-            return next(self.events)
-
-    monkeypatch.setattr(browser_questions, "CodexClient", Client)
-    monkeypatch.setattr(browser_questions, "codex_command", lambda: ["offline"])
-    assert browser_questions.recover_questions(
-        SimpleNamespace(data_dir=tmp_path, school_email=ACCOUNT), package, model="unit-model"
-    )
-    record = json.loads(next(package.glob("browser-read-*.json")).read_text(encoding="utf-8"))
-    assert record["read_complete"] is False and record["image_count"] == 0
-    assert record["missing_images"] == [{"item_id": "120", "page": 2, "title": "Reading passage"}]
-    prompt = next(params for method, params in requests if method == "turn/start")["input"][0][
-        "text"
-    ]
-    assert "type=11" in prompt and "不能猜答案" in prompt

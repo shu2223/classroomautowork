@@ -2,94 +2,53 @@
 
 ```mermaid
 flowchart LR
-  UI[本地前端：刷新 / 勾选 / 一键审核] --> J[持久 FrontendJobs]
-  J --> W[Python workflow]
-  S[Codex Skill / CLI] --> W
-  W --> G[固定只读 GoogleReader]
-  G --> C[Classroom / Drive]
+  UI[网页：刷新 / 勾选 / 一键完成] --> J[持久 FrontendJobs]
+  J --> W[workflow.prepare]
+  W --> K[KnowledgeClient → knowledge-api]
+  W --> FR[form_read 匿名读取表单题目]
   W --> T[SQLite 任务与来源索引]
-  W --> E[PDF / OOXML 提取]
-  W --> B[Buzz 本地 Whisper.cpp]
   T --> R[本地 BM25 检索]
-  R --> D[Codex 按课程规则撰写]
-  D --> V[本地审核校验]
-  V --> F[固定答案栏规划与本人文档核验]
-  F --> GD[Google Docs 独立读写授权]
-  GD --> H[用户打开原文档审阅与手动提交]
+  R --> D[drafting.generate_review]
+  D --> C[claude_agent.run_turn：claude -p 无工具]
+  D --> V[review.finalize 本地核验]
+  V --> A[answer_document：draft / Word]
+  V --> FF[form_fill：原生预填链接]
 ```
 
-## 公共调用
+## 模块
 
-```python
-from classroomautowork.config import Settings
-from classroomautowork.workflow import prepare
+| 模块 | 职责 |
+| --- | --- |
+| `kb_client.py` | 课程数据的唯一来源。方法名沿用旧的 reader 接口（`courses`、`assignments`、`own_submissions`、`course_materials`、`announcements`），所以 `pending.discover_pending` 和 `form_fill.current_response_urls` 不关心数据从哪来。一个实例对每门课只读一次 `posts`，同一次运行看到一致的快照。 |
+| `workflow.py` | `sync_course` 把一门课的帖子、附件文档、未挂在帖子上的资料库文档（录像、笔记）写入本机检索库；`prepare_assignment` 组装资料包；`prepare` 是公共入口。 |
+| `claude_agent.py` | 一次无工具的 `claude -p` 回合：stdin 传入文字和 base64 页图，stdout 读 stream-json，返回 `structured_output`。处理暂停、超时、用量上限和模型或工具不一致。 |
+| `drafting.py` | 组装提示词与证据预算，调用 `claude_agent`，用 `accept_model_result` 核验并落盘；缓存与复用规则不变。 |
+| `ui_jobs.py` / `webapp.py` | 持久任务与 HTTP 适配层。`webapp` 同时服务本机令牌访问和 `yishuapp.com/classroom/` 前缀下的公网访问。 |
+| `form_fill.py` | 核验答案后生成原生预填链接。服务器上不打开浏览器，状态记为 `prefill_ready`，由用户在结果里点开。 |
+| `document_fill.py` / `auth.py` / `google_read.py` | 后续版本的 Google 文档自动填写；当前运行路径不调用。 |
 
-settings = Settings.load()  # Git 外的真实用户配置；OAuth 必须先完成
-result = prepare(settings, due_before="2026-10-10", progress=print)
-# 明确勾选的作业，不扩展到其他任务；重新读取本人提交状态后处理：
-# result = prepare(settings, targets=[("真实数字课程ID", "真实数字作业ID")])
-for package in result["packages"]:
-    print(package["package"], package["can_draft"])
+## 资料库数据如何变成证据
 
-# 用户明确确认 AI 后，独立调用生成模块；未确认默认只整理资料：
-from pathlib import Path
-from classroomautowork.drafting import generate_review
+- 帖子：`coursework:<id>`、`material:<id>`、`announcement:<id>`，正文和附件列表按 1,600 字切段。
+- 帖子附件：`file:<Drive 文件 ID>`。`knowledge-api` 的 `files` 映射给出对应的资料库文档；不存在或状态不是 `ready` 的列为 `warnings`。
+- 资料库中未挂在任何帖子上的文档、笔记、录像：`kb:<DOC>`。
+- 每段的 `locator` 形如 `第3页 · kb:4362e087#7`，同一页切成多段时也唯一，并且可以直接用 `kb read 4362e087#7` 在小主机上找到原文。
+- 选中作业附带的 PDF 由 `kb-pages` 阶段渲染页图（最多 12 页，110 DPI），只挂在该页的第一段上。页图按文档 ID、文字指纹和缩放比缓存。
 
-receipt = generate_review(
-    Path(result["packages"][0]["package"]),
-    ai_confirmed=True,
-    model="用户所选真实模型",
-    effort="high",
-)
-```
+证据 ID 按课程、来源、修订（内容指纹）和 locator 计算。资料库内容不变，ID 就不变，已有的 AI 结果可以复用；内容变化后旧结果失效。
 
-prepare 不依赖 argparse，不生成模型答案；连接、附件提取、检索与审核均可独立调用。
-GoogleReader 只公开明确读取方法，没有通用 HTTP 路由或由资料决定的方法名。
-测试可替换 reader，但生产 CLI 没有 fake/mock 成功模式。
+## 前端与访问控制
 
-## 前端适配与任务
-
-webapp 只监听随机端口的 127.0.0.1。HTML/CSS/JS 都来自本机包，无 CDN。
-API 需要随机本机访问凭证，校验 Host，写操作同时校验 Origin；不接受命令、解释器、权限或任意文件路径。
-所有课程文字以 textContent 呈现，来源链接只作为用户手动打开的链接。
-
-FrontendJobs 把真实待办刷新时间和每批明确选择写入 Git 外的 ui/，一个助手实例只运行一个任务。
-资料准备复用 Store 的跨进程锁及内容缓存；safe-boundary 暂停不会被吞成附件错误。
-重启将未完成的前端记录标成 interrupted，用户重试时重新核对远端状态并复用已完成阶段。
-
-AI 确认复选框默认 false，未勾选保存资料与原要求，不调用模型；禁用规则同样阻止生成。
-勾选后 drafting.generate_review 使用 CodexClient 的官方 app-server stdio 协议；从 model/list 与 config/read 读取目录和默认值，创建持久 thread，再用 turn/start 传入文本、实际页图、输出 schema 及用户选择的模型和强度。沿用现有权限、审批、hook 和规则；不覆盖 sandbox 或 approvalPolicy。
-用户确认写入任务及模型独立包的 ai_confirmation，不改写教师 ai_use 和来源；finalize 对当前课程规则应用相同本地确认后比较，课程修改会使旧结果失效。
-仅 turn/completed=completed、结构化输出和来源检查通过后标为初稿待审阅。codex-generation.json 保存实际模型、会话、回合、用量、来源及输入摘要；失败与暂停保留真实状态，不声称模型成功。
-审核复用要求文件校验值、当前来源与课程规则都仍匹配。预览/导出不暴露未核验初稿，规则变化后要求重新准备。
-Drive 版本号仅控制真实下载复查，附件证据 ID 按实际内容 SHA-256 与处理器身份计算。新下载与原文件字节相同、全文/页图/要求/规则相同且模型与强度一致时，复用已完成的原始 AI 回合，不伪造新的生成时间。历史证据 ID 只在当前可读来源的正文、类型、标题、链接、位置和页图路径完全一致时建立等价映射；内容或文件校验值变化仍失效。
-ZIP 导出仅包含已知审核文件，拒绝跨目录链接；页面图像只读取已记录的 processed/ PNG。
+- 本机访问：`Host` 必须是 `127.0.0.1:<port>`，需要随机 Bearer 令牌，写操作要求本机 `Origin`。
+- 公网访问：`Host: yishuapp.com`，路径必须在 `/classroom/` 下，必须带 Cloudflare Access 添加的 `Cf-Access-Jwt-Assertion` 请求头（只检查存在，与状态页一致），写操作要求 `Origin: https://yishuapp.com`。前端用相对路径加载资源，并根据路径自动给接口加前缀。
+- 所有课程文字以 `textContent` 呈现；接口不接受命令、解释器、权限或任意文件路径。
 
 ## 缓存与恢复
 
-Store 在 Git 外使用 SQLite WAL 和跨进程文件锁。键为阶段名与输入指纹的 SHA-256。
-状态为 running / done / failed / interrupted，记录尝试次数、更新时间及安全错误。
-新进程持锁后将遗留 running 改成 interrupted；失败/中断阶段在下次调用重做。
-done 的声明输出必须存在且 SHA-256 一致才能复用。
+Store 在 Git 外使用 SQLite WAL 和跨进程文件锁。键为阶段名与输入指纹的 SHA-256；状态为 running / done / failed / interrupted。新进程持锁后把遗留的 running 改成 interrupted，下次调用重做。done 的输出文件必须存在且 SHA-256 一致才复用。阶段有 `form-questions`、`kb-pages`、`review-preparation`。
 
-阶段为 classroom-snapshot、drive-download、document、media、transcript-segment、review-preparation。
-缓存命中不代表远端权限仍有效；每次 sync 先读最新 metadata，并在下载后核对版本与权限。
-来源索引只保留本次成功读取/处理的源，不把撤权或读取失败的陈旧文字当成现有证据。
-原缓存为恢复保留在私人目录，不参与当前检索。
-
-同一 source 更新时替换 chunks；每段带源类型、标题、链接、locator、revision 和稳定 ID。
-中文、日文按双字切分，拉丁词分词，BM25 排序。按课程隔离，不索引其他学生答案。
-Buzz 先由本地 ffmpeg 转成 16kHz 单声道 PCM，每五分钟独立缓存，字幕加上片段时间偏移。
-模型与引擎身份变化失效推理缓存；课程内容从不传给 shell。
+来源索引只保留本次读取到的来源，资料库删除或撤下的内容不会作为旧证据留下。
 
 ## 审核与信任
 
-用户维护私人配置。课程内容只提供资料和作业约束，不能设置权限或审批。
-manifest/evidence/requirements 是准备阶段的输入，不允许为通过校验而修改。
-finalize 检查来源是否仍匹配当前索引，核对课程配置、引文、个人事实索引和显示的证据 ID，
-生成 checksum receipt 后停止。机械检查不判断所有主张是否被证据蕴含，不代替人工审阅。
-用户要求自动填入时，经过文档填入模块继续写入本人副本并回读，生成单独 document-fill receipt。
-Classroom 仍无写接口。Docs OAuth 独立固定 scopes；模型只能返回字段内容，不能提供远端写入请求。
-写入针对原生空答案栏，使用 requiredRevisionId；版本冲突停止，未知响应先回读，相同答案不重复插入。
-真实验证与离线测试分离：token 在 OS 凭据库，connection-receipt 在私人目录。
-源码不携带账户、客户端 JSON、课程 ID、材料、缓存或真实验证样本。
+模型只返回数据：答案、检查表、来源 ID、表单逐栏答案。`finalize` 检查来源是否仍在当前索引、引文是否逐字匹配、个人事实是否对应用户提供的索引，生成 checksum receipt。`generation.json` 记录实际模型、会话 ID、用量、输入来源与页图摘要。机械检查不判断主张是否被证据蕴含，不代替人工审阅。

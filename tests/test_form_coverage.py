@@ -153,7 +153,7 @@ def test_cached_source_deferral_is_reclassified_without_changing_model_provenanc
     deferred["values"] = []
     result["form_answers"] = [answer(form, "200", ["UNIT"]), deferred]
     drafting.accept_model_result(package, generation, result, json.dumps(result))
-    path = package / "codex-generation.json"
+    path = package / "generation.json"
     legacy = json.loads(path.read_text(encoding="utf-8"))
     source_gap = legacy["missing_form_fields"][0]
     legacy.update(
@@ -161,7 +161,7 @@ def test_cached_source_deferral_is_reclassified_without_changing_model_provenanc
     )
     atomic_json(path, legacy)
     original = {
-        name: (package / name).read_bytes() for name in ("codex-result.json", "form-answers.json")
+        name: (package / name).read_bytes() for name in ("model-result.json", "form-answers.json")
     }
     receipt = drafting.reusable_review(package)
     assert receipt["generation"]["form_mapping_complete"] is False
@@ -249,13 +249,13 @@ def test_verified_legacy_reviews_recompute_field_coverage_without_rewriting_mode
         unanswered["values"] = []
         result["form_answers"].append(unanswered)
     drafting.accept_model_result(package, generation, result, json.dumps(result))
-    generation_path = package / "codex-generation.json"
+    generation_path = package / "generation.json"
     legacy = json.loads(generation_path.read_text(encoding="utf-8"))
     for key in ("form_mapping_complete", "missing_form_fields", "form_user_input_fields"):
         legacy.pop(key)
     atomic_json(generation_path, legacy)
     before = {
-        name: (package / name).read_bytes() for name in ("codex-result.json", "form-answers.json")
+        name: (package / name).read_bytes() for name in ("model-result.json", "form-answers.json")
     }
     reused = drafting.reusable_review(package)
     assert reused["generation"]["form_mapping_complete"] is deferred
@@ -299,7 +299,7 @@ def test_retry_does_not_reuse_the_same_incomplete_repair_forever(tmp_path, monke
     atomic_json(tmp_path / "fixture-result.json", result)
     first = drafting.generate_answer(package, ai_confirmed=True, model="unit-model", effort="high")
     assert first["generation"]["form_mapping_complete"] is False
-    for generation_path in package.parent.glob("*/codex-generation.json"):
+    for generation_path in package.parent.glob("*/generation.json"):
         legacy = json.loads(generation_path.read_text(encoding="utf-8"))
         for key in ("form_mapping_complete", "missing_form_fields", "form_user_input_fields"):
             legacy.pop(key, None)

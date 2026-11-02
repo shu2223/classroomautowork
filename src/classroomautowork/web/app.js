@@ -2,7 +2,7 @@
 const $ = id => document.getElementById(id);
 const state = {documentsAuthorized: false, pending: null, jobs: [], policies: {}, selected: new Set(), active: null, focus: null, view: "pending", busy: false, preview: null, policyCourse: null, images: [], models: null, modelsLoading: false, hideOverdue: localStorage.getItem("classroom-hide-overdue") === "true"};
 const activeStates = new Set(["queued", "running", "stopping"]);
-const labels = {queued: "等待开始", running: "正在处理", stopping: "正在暂停", waiting: "等待处理", preparing: "读取题目与资料", prepared: "资料已准备", drafting: "Codex 正在分析", ready: "答案已生成 · 打开答案审阅", filling_form: "正在自动填入原表单", form_opened: "已打开预填表单 · 在原表单审阅", needs_form: "初稿已保留 · 表单填入需重试", filling_document: "正在填入原文档", document_ready: "已填入 · 打开文档审阅", document_needs_user: "已填入可用答案 · 请审阅", needs_document: "初稿已保留 · 填入需处理", needs_user: "历史结果 · 可自动重试", materials_ready: "资料已整理 · 未调用 AI", paused: "已暂停", interrupted: "上次已中断", failed: "处理失败", completed: "处理已结束", completed_with_issues: "部分处理未完成"};
+const labels = {queued: "等待开始", running: "正在处理", stopping: "正在暂停", waiting: "等待处理", preparing: "读取题目与资料", prepared: "资料已准备", drafting: "AI 正在分析", ready: "答案已生成 · 打开答案审阅", filling_form: "正在自动填入原表单", form_opened: "预填表单已准备 · 在原表单审阅", needs_form: "初稿已保留 · 表单填入需重试", filling_document: "正在填入原文档", document_ready: "已填入 · 打开文档审阅", document_needs_user: "已填入可用答案 · 请审阅", needs_document: "初稿已保留 · 填入需处理", needs_user: "历史结果 · 可自动重试", materials_ready: "资料已整理 · 未调用 AI", paused: "已暂停", interrupted: "上次已中断", failed: "处理失败", completed: "处理已结束", completed_with_issues: "部分处理未完成"};
 const keyOf = item => item.course_id + ":" + item.assignment_id;
 let token = location.hash.slice(1);
 if (token) { sessionStorage.setItem("classroom-access", token); history.replaceState(null, "", location.pathname); }
@@ -192,13 +192,13 @@ function progressView(job, network, now = Date.now()) {
     attachment: ["核验课程附件", "检查文件权限、版本与缓存，只处理新增或修改的材料。"],
     download: ["下载课程附件", "下载量来自真实收到的字节；大文件可能耗时，之后还要校验完整性。"],
     download_verify: ["校验附件完整性", "核对下载大小和校验值，避免使用不完整文件。"],
-    extract: ["提取文档文字和页图", "逐页读取内容并保留必要图像，供 Codex 阅读题目与课堂资料。"],
+    extract: ["提取文档文字和页图", "从课程资料库读取内容和必要页图，供 AI 阅读题目与课堂资料。"],
     transcribe: ["Buzz 大模型正在本机转录录像", "使用本地 Whisper 大模型分段识别语音并保存时间戳。单段处理期间计数可能暂时不变，完成后继续更新。"],
     attachment_done: ["附件内容已准备", "材料已处理并缓存，继续检查其他附件。"],
     attachment_failed: ["这份附件未能处理完成", "已保留具体原因，继续检查其他资料；请在处理记录中核对受影响的附件。"],
     document_inspect: ["核对作业填写方式", "检查有无个人 Google 文档答案栏；模型逐栏作答后，自动填入个人文档或原表单。"],
     document_create: ["创建本人作业文档", "在当前作业页面创建个人ドキュメントシート，核验实际附件和编辑权限后继续作答；不会提交。"],
-    ai: ["Codex 正在阅读与作答", "使用所选模型分析真实题目和资料。AI 没有可测量的总百分比；显示实际活动与会话入口。"],
+    ai: ["Claude 正在阅读与作答", "使用所选模型分析真实题目和资料。AI 没有可测量的总百分比；显示实际活动。"],
     validate: ["核验 AI 结果", "检查来源、格式与题目完整性，通过后才填入文档。"],
     form_fill: ["自动填入原 Google 表单", "核对原题与选项，打开已预填答案的原表单；在原表单审阅，程序不会点击提交。浏览器是否保存草稿以 Google 页面提示为准。"],
     fill: ["填写并回读 Google 文档", "填写个人作业的答案栏，回读核验后由你审阅并手动提交。"],
@@ -219,8 +219,8 @@ function progressView(job, network, now = Date.now()) {
   const stepAt = job.approval?.requested_at || p.started_at || item?.stage_started_at || job.started_at || job.created_at;
   const ai = active && stage === "ai" ? aiActivity(item?.generation) : null;
   if (ai && job.status === "running") {
-    title = ai.generation.activity_label || "Codex 会话已启动，等待模型响应";
-    explanation = "活动计数来自本次模型的真实通知，不能换算成完成百分比。点击下方按钮可直接查看本次 Codex 会话。";
+    title = ai.generation.activity_label || "Claude 已启动，等待模型响应";
+    explanation = "活动计数来自本次模型的真实输出，不能换算成完成百分比。";
   }
   const activityAt = [p.activity_at, item?.generation?.activity_at, job.events?.at(-1)?.at, job.updated_at].filter(x=>Number.isFinite(Date.parse(x))).sort((a,b)=>Date.parse(b)-Date.parse(a))[0];
   const silence = ageOf(activityAt, now);
@@ -229,8 +229,8 @@ function progressView(job, network, now = Date.now()) {
   if (active && disconnected) warning = "暂时无法读取新状态；后台任务不一定停止。恢复连接后会自动重连，请先不要重复启动。";
   else if (active && ["approval", "authorization"].includes(stage)) warning = explanation;
   else if (active && silence !== null && silence >= (stage === "transcribe" ? 300000 : 120000)) warning = `已有 ${durationLabel(silence)} 没有新进展记录。${stage === "transcribe" ? "一段转录可能较慢，不能仅凭时间认定失败。" : "服务响应正常不代表这一步有进展，可展开处理记录核对。"}`;
-  if (ai && warning && !disconnected) warning = `已有 ${durationLabel(silence)} 未收到新的模型活动通知。会话已创建，但尚未确认本次回合完成；请打开本次 Codex 会话查看，不能仅凭服务连接正常认定模型有进展。`;
-  const outputAt = ai?.generation.output_stream?.output_started_at || [...(job.events || [])].reverse().find(x=>x.message === "Codex 正在输出回答，完整返回后再核验")?.at;
+  if (ai && warning && !disconnected) warning = `已有 ${durationLabel(silence)} 未收到新的模型活动通知。尚未确认本次回合完成，不能仅凭服务连接正常认定模型有进展。`;
+  const outputAt = ai?.generation.output_stream?.output_started_at || [...(job.events || [])].reverse().find(x=>x.message === "Claude 正在输出结构化答案，完整返回后再核验")?.at;
   const outputElapsed = ageOf(outputAt,now);
   if (ai && !disconnected && /输出回答/.test(ai.generation.activity_label || job.message || "") && outputElapsed !== null && outputElapsed >= 300000) warning = `答案已连续输出 ${durationLabel(outputElapsed)}，等待时间异常。仍未收到回合结束通知，活动更新增加也不代表答案能正常完成。本次回合继续保留，尚未核验或填入；可以打开真实会话查看。`;
   let measurement = null;
@@ -289,7 +289,7 @@ function receiveShutdown(snapshot) {
 }
 function renderShutdown() {
   const view = shutdownView(state.shutdown, Date.now(), state.shutdownReceivedAt);
-  $("shutdownControl").hidden = !!state.monitorOnly || !state.shutdown;
+  $("shutdownControl").hidden = !!state.monitorOnly || !state.shutdown?.supported;
   $("shutdownControl").classList.toggle("shutdown-countdown", view.urgent);
   $("shutdownEnabled").checked = view.enabled;
   $("shutdownEnabled").disabled = !!state.monitorOnly || !view.supported || state.shutdownPending || view.status === "shutting_down";
@@ -325,14 +325,16 @@ function icon(name) { const svg = document.createElementNS("http://www.w3.org/20
 function button(text, className, handler) { const el = node("button", text, className); el.type = "button"; el.addEventListener("click", handler); return el; }
 function friendlyError(message) { return ({"A known AI policy requires the user's source evidence.": "请填写教师实际 AI 规定的原文与来源，才能确认允许或禁止使用。", "Limited AI use requires explicit limits.": "选择有限度允许时，请填写允许的具体用途和限制。", "Invalid attachment/page processing budget.": "附件上限需在 1 字节至 20GB 内；PDF 页数上限需在 1–5000 页内。", "Selected assignment is no longer confirmed pending; refresh the list before retrying.": "有选中作业的提交状态已变化，请刷新待办并重新勾选。", "Another local run is active; wait for it to finish.": "另一个本机处理正在运行，请等它结束后重试。", "Course policy changed since preparation; prepare the package again.": "课程规则已变化，请重新生成审核包。"})[message] || message; }
 function toast(message) { clearTimeout(toastTimer); $("toast").textContent = message; $("toast").hidden = false; toastTimer = setTimeout(() => $("toast").hidden = true, 7000); }
+// On yishuapp.com the page lives under /classroom/ and Cloudflare Access authenticates the request.
+const BASE = location.pathname.startsWith("/classroom/") ? "/classroom" : "";
 async function api(path, method = "GET", body) {
-  const options = {method, cache: "no-store", credentials: "omit", headers: {Authorization: "Bearer " + token}};
+  const options = {method, cache: "no-store", credentials: BASE ? "same-origin" : "omit", headers: token ? {Authorization: "Bearer " + token} : {}};
   if (body !== undefined) { options.headers["Content-Type"] = "application/json"; options.body = JSON.stringify(body); }
   const controller = method === "GET" ? new AbortController() : null;
   if (controller) options.signal = controller.signal;
-  const timer = controller ? setTimeout(() => controller.abort(), path === "/api/codex/models" ? 90000 : 10000) : null;
+  const timer = controller ? setTimeout(() => controller.abort(), path === "/api/models" ? 90000 : 10000) : null;
   let response;
-  try { response = await fetch(path, options); }
+  try { response = await fetch(BASE + path, options); }
   catch (error) { throw new Error(error.name === "AbortError" ? "本机状态读取超时，等待连接恢复。" : error.message); }
   finally { clearTimeout(timer); }
   if (!response.ok) { const data = await response.json().catch(() => ({})), error = new Error(friendlyError(data.error || "本机连接失败，请重新打开助手。")); error.status = response.status; throw error; }
@@ -342,7 +344,8 @@ function dateLabel(value, time = false) { if (!value) return "无截止日期"; 
 function localDay(value) { return value ? value.slice(0, 10) : ""; }
 function safeLink(url, text, className) { try { const u = new URL(url); if (u.protocol !== "https:" || !(u.hostname.endsWith(".google.com") || ["google.com", "youtube.com", "www.youtube.com", "youtu.be"].includes(u.hostname))) return null; const a = node("a", text, className); a.href = u.href; a.target = "_blank"; a.rel = "noopener noreferrer"; return a; } catch { return null; } }
 function pill(status) { return node("span", labels[status] || status, "pill " + ({ready: "success", needs_user: "warning", failed: "failure", interrupted: "warning", paused: "warning"}[status] || "")); }
-function codexLink(generation) { const id = generation?.thread_id; if (!id || !/^[a-f0-9-]{36}$/i.test(id)) return null; const link = node("a", "在 Codex 中打开真实会话 ↗", "generation-link"); link.href = "codex://threads/" + id; return link; }
+// Claude runs without a saved session, so there is nothing to open.
+function codexLink() { return null; }
 function overdue(item) { return !!item.due_utc && new Date(item.due_utc) < new Date(); }
 function latestItems() { const found = new Map(); for (const job of [...state.jobs, ...(state.resultJobs || [])].sort((a,b) => b.created_at.localeCompare(a.created_at))) if (["review", "fill"].includes(job.kind)) for (const item of job.items) if (!found.has(keyOf(item))) found.set(keyOf(item), {job, item}); return found; }
 // One-click selection: only visible, confirmed pending work without delivered results.
@@ -523,7 +526,7 @@ function jobProgress(job) {
   if (["review", "fill"].includes(job.kind) && job.ai_confirmed) {
     const steps = node("ol", undefined, "job-steps");
     const localOnly = !v.active && v.localReady && !v.ready;
-    for (const [i, title] of ["准备资料", "Codex 作答", localOnly ? "生成答案文件" : "自动填写", localOnly ? "打开答案审阅" : "原页面审阅"].entries()) { const step = node("li", undefined, i === v.index ? "current" : i < v.index ? "past" : ""); step.append(node("span", i < v.index ? "✓" : String(i + 1)), node("b", title)); steps.append(step); }
+    for (const [i, title] of ["准备资料", "Claude 作答", localOnly ? "生成答案文件" : "自动填写", localOnly ? "打开答案审阅" : "原页面审阅"].entries()) { const step = node("li", undefined, i === v.index ? "current" : i < v.index ? "past" : ""); step.append(node("span", i < v.index ? "✓" : String(i + 1)), node("b", title)); steps.append(step); }
     box.append(steps);
   }
   box.append(node("strong", v.title), node("p", v.explanation));
@@ -538,8 +541,8 @@ function jobProgress(job) {
   }
   if (v.ai) {
     const g = v.ai.generation, session = node("div", undefined, "job-session");
-    session.append(node("span", `${g.thread_title || "本次 Codex 会话"} · ${g.model || "等待核验模型"} · ${g.reasoning_effort || "默认强度"}`, "job-session-meta"));
-    const link = codexLink(g); if (link) { link.textContent = "打开本次 Codex 会话 ↗"; link.className = "button secondary small-button"; session.append(link); }
+    session.append(node("span", `${g.thread_title || "本次 Claude 作答"} · ${g.model || "等待核验模型"} · ${g.reasoning_effort || "默认强度"}`, "job-session-meta"));
+    const link = codexLink(g); if (link) { link.textContent = "打开本次会话 ↗"; link.className = "button secondary small-button"; session.append(link); }
     box.append(session);
   }
   if (v.filename) box.append(node("p", `${v.attachments ? v.attachments + " · " : ""}${v.filename}`, "job-file"));
@@ -563,7 +566,7 @@ function jobCard(job, full = false) {
   if (later) { const note = node("div", undefined, "job-live-detail"); note.append(node("strong", "旧记录中的缺口已在后续处理补齐"),node("p", `最新结果：${dateLabel(later.job.created_at,true)}。这条记录保留当时的处理状态，无需再次填写。`)); card.append(note); } else card.append(jobProgress(job));
   const items = node("div", undefined, "job-items");
   for (const item of job.items) { const row = node("div", undefined, "job-item"); const title = node("span", item.title || item.assignment_id); if (item.error) title.append(node("p", friendlyError(item.error))); row.append(title, later ? node("span", "历史状态：" + (labels[item.status] || item.status), "pill") : pill(item.status)); if (item.package) { const actual = !!item.answer_document || (item.status === "ready" && item.generation?.status === "completed"); row.append(button(actual ? "打开答案" : "查看资料与分析", actual ? "button primary small-button" : "text-button", () => openReview(job.id, keyOf(item), actual ? "draft" : "assignment"))); if (actual && !state.monitorOnly) row.append(button("下载 Word", "button secondary small-button", () => downloadAnswer(job.id, keyOf(item)))); if (item.answer_document?.pending_requirements?.length) row.append(node("p", item.answer_document.personal_templates ? "答案已交付，请在审阅时核对个人部分；调整答案或说明为可选操作。" : "答案已交付，另有审阅提示；请打开答案核对。", "small warning")); } const g = item.generation; if (g?.thread_id) { const meta = node("div", undefined, "job-model"); meta.append(node("span", `实际模型 ${g.model} · ${g.reasoning_effort || "默认强度"} · ${g.status === "completed" ? "AI 回合完成" : g.status === "running" ? "正在生成" : "尚未成功"} `)); const link = codexLink(g); if (link) meta.append(link); row.append(meta); } else if (item.package) row.append(node("span", "资料已准备 · 没有已核验的 AI 生成记录", "job-model")); for (const f of (later?.item.form_fill || item.form_fill)?.forms || []) { const link = safeLink(f.url, "在原表单审阅答案 ↗", "button primary small-button"); if (link) row.prepend(link); const saved = safeLink(f.original_url, "继续已保存的草稿 ↗", "text-button"); if (saved) row.append(saved); } for (const d of (later?.item.document_fill || item.document_fill)?.documents || []) { const link = safeLink(d.url, "在原文档审阅 ↗", "button primary small-button"); if (link) row.prepend(link); } if (item.package && g?.status === "completed" && ["needs_document", "needs_form"].includes(item.status)) row.append(button("填入已有初稿", "text-button", () => action(`/api/jobs/${job.id}/items/${keyOf(item)}/fill`, {}))); if (item.browser_read?.thread_id) { const readLink = codexLink(item.browser_read); if (readLink) { readLink.textContent = "查看登录题目读取会话 ↗"; row.append(readLink); } } const input = inputAction(item); if (!state.monitorOnly && !later) row.append(button(input?.label || "调整答案或说明（可选）", input ? "button primary small-button" : "text-button", () => openSupplement(job.id, keyOf(item)))); items.append(row); } card.append(items);
-  if (job.approval && !state.monitorOnly) { const box = node("section", undefined, "approval-card"); box.append(node("h3", "Codex 请求本次操作审批"), node("p", job.approval.reason), node("pre", job.approval.command || job.approval.cwd), node("p", "此请求来自 Codex 的现有权限规则；批准仅适用于本次，不会扩大长期权限。")); const actions = node("div", undefined, "approval-actions"); for (const [choice, label] of [["accept", "批准本次"], ["decline", "拒绝"], ["cancel", "取消操作"]]) actions.append(button(label, "button secondary small-button", async () => { try { await api(`/api/jobs/${job.id}/approval`, "POST", {id: job.approval.id, decision: choice}); await pollJob(); } catch(error) { toast(error.message); } })); box.append(actions); card.append(box); }
+  if (job.approval && !state.monitorOnly) { const box = node("section", undefined, "approval-card"); box.append(node("h3", "AI 请求本次操作审批"), node("p", job.approval.reason), node("pre", job.approval.command || job.approval.cwd), node("p", "此请求来自 Claude 的现有权限规则；批准仅适用于本次，不会扩大长期权限。")); const actions = node("div", undefined, "approval-actions"); for (const [choice, label] of [["accept", "批准本次"], ["decline", "拒绝"], ["cancel", "取消操作"]]) actions.append(button(label, "button secondary small-button", async () => { try { await api(`/api/jobs/${job.id}/approval`, "POST", {id: job.approval.id, decision: choice}); await pollJob(); } catch(error) { toast(error.message); } })); box.append(actions); card.append(box); }
   if (job.cache) card.append(node("p", `资料缓存：复用 ${job.cache.reused} 个阶段 · 新增 ${job.cache.processed} · 缓存阶段失败 ${job.cache.failed}`, "small"));
   if (job.events.length) { const details = node("details"), summary = node("summary", "查看处理记录"), events = node("div", undefined, "event-list"); for (const entry of job.events) { const line = node("div", undefined, "event-line"); line.append(node("time", new Date(entry.at).toLocaleTimeString("zh-CN", {timeZone: state.timezone || "Asia/Tokyo", hour: "2-digit", minute: "2-digit", second: "2-digit"})), node("span", entry.message)); events.append(line); } details.dataset.jobLog = job.id; details.append(summary, events); card.append(details); }
   return card;
@@ -652,7 +655,7 @@ window.addEventListener("focus", syncWhenIdle);
 document.addEventListener("visibilitychange", () => { if (!document.hidden) syncWhenIdle(); });
 async function jobAction(id, verb) { await action(`/api/jobs/${id}/${verb}`, {}); }
 function renderEfforts(preferred) { const model = state.models.models.find(x => x.model === $("modelSelect").value); $("effortSelect").replaceChildren(); const labels = {none: "无", minimal: "最少", low: "低", medium: "中", high: "高", xhigh: "很高", max: "最高", ultra: "极高"}; for (const value of model?.supportedReasoningEfforts || []) { const option = node("option", labels[value.reasoningEffort] || value.reasoningEffort); option.value = value.reasoningEffort; $("effortSelect").append(option); } if (!$("effortSelect").children.length) { const option = node("option", "沿用模型默认"); option.value = ""; $("effortSelect").append(option); } const selected = preferred || model?.defaultReasoningEffort; if ([...$("effortSelect").options].some(x => x.value === selected)) $("effortSelect").value = selected; }
-async function loadModels() { state.modelsLoading = true; setButtons(); $("modelStatus").textContent = "正在从本机 Codex 读取模型与当前配置…"; try { const catalog = await api("/api/codex/models"); state.models = catalog; $("modelSelect").replaceChildren(); for (const model of catalog.models) { const option = node("option", model.displayName || model.model); option.value = model.model; $("modelSelect").append(option); } const saved = localStorage.getItem("classroom-model"); const selected = catalog.models.some(x => x.model === saved) ? saved : catalog.default_model; if (catalog.models.some(x => x.model === selected)) $("modelSelect").value = selected; renderEfforts(saved === selected ? localStorage.getItem("classroom-effort") : selected === catalog.default_model ? catalog.default_effort : null); $("modelStatus").textContent = "来自本机 Codex 目录与配置；实际模型、会话和生成记录会保存在每份结果中。"; } catch (error) { state.models = null; $("modelStatus").textContent = error.message; toast(error.message); } finally { state.modelsLoading = false; setButtons(); } }
+async function loadModels() { state.modelsLoading = true; setButtons(); $("modelStatus").textContent = "正在读取可用模型…"; try { const catalog = await api("/api/models"); state.models = catalog; $("modelSelect").replaceChildren(); for (const model of catalog.models) { const option = node("option", model.displayName || model.model); option.value = model.model; $("modelSelect").append(option); } const saved = localStorage.getItem("classroom-model"); const selected = catalog.models.some(x => x.model === saved) ? saved : catalog.default_model; if (catalog.models.some(x => x.model === selected)) $("modelSelect").value = selected; renderEfforts(saved === selected ? localStorage.getItem("classroom-effort") : selected === catalog.default_model ? catalog.default_effort : null); $("modelStatus").textContent = "使用小主机上的 Claude；实际模型和生成记录会保存在每份结果中。"; } catch (error) { state.models = null; $("modelStatus").textContent = error.message; toast(error.message); } finally { state.modelsLoading = false; setButtons(); } }
 function setView(view) {
   state.view = view;
   for (const name of ["pending", "results", "history"]) $(name + "View").hidden = view !== name;
@@ -667,7 +670,7 @@ async function openReview(jobId, key, initialTab) {
     $("reviewTitle").textContent = data.manifest.assignment.title || "资料与结果";
     $("reviewCourse").textContent = data.manifest.course_name || "";
     const g = data.generation;
-    $("reviewStatus").textContent = data.policy_changed ? "补充或设置已变化，请继续处理" : data.text["draft.md"] && g?.status === "completed" ? `实际初稿已核验 · ${g.model} · ${g.reasoning_effort || "默认强度"} · 尚未提交` : g?.status === "completed" ? `Codex 资料分析已完成 · ${g.model} · 尚无答案初稿` : "资料与待确认包 · 没有已核验的 AI 生成结果";
+    $("reviewStatus").textContent = data.policy_changed ? "补充或设置已变化，请继续处理" : data.text["draft.md"] && g?.status === "completed" ? `实际初稿已核验 · ${g.model} · ${g.reasoning_effort || "默认强度"} · 尚未提交` : g?.status === "completed" ? `Claude 资料分析已完成 · ${g.model} · 尚无答案初稿` : "资料与待确认包 · 没有已核验的 AI 生成结果";
     $("downloadButton").textContent = "下载辅助证据（可选）";
     const filled = data.document_fill?.documents?.[0];
     const attached = data.requirements.student_submission?.assignmentSubmission?.attachments?.find(x => x.driveFile)?.driveFile;
@@ -719,14 +722,14 @@ function renderTab(tab) {
   if (tab === "questions") { content.append(button("调整答案或说明（可选）", "button secondary", () => openSupplement(jobId, key))); const questions = data.review?.questions; if (questions?.length) for (const q of questions) content.append(node("p", "• " + q)); else content.append(node("pre", data.text["questions.md"] || "暂无审核问题，请先完成审核。")); }
   if (tab === "checklist") { if (data.review?.requirement_checks) for (const c of data.review.requirement_checks) { const box = node("div", undefined, "source-card"); box.append(node("div", ({met: "已满足", partial: "部分满足", unmet: "未满足", needs_user: "待你确认"}[c.status] || c.status) + " · E:" + c.requirement_source_id, "locator"), node("pre", c.requirement), node("p", c.draft_location || "详见审阅提示")); content.append(box); } else content.append(node("pre", data.text["checklist.md"] || "审核尚未完成。")); }
   if (tab === "warnings") { if (!data.manifest.warnings.length) content.append(node("p", "本次没有记录资料缺口。引用和内容仍需你审阅。")); for (const warning of data.manifest.warnings) { const box = node("div", undefined, "source-card"); box.append(node("div", warning.source, "locator"), node("pre", warning.error)); content.append(box); } }
-  if (tab === "generation") { const g = data.generation; if (!g || g.status === "not_invoked") { content.append(node("h3", "没有调用 AI"), node("p", "这份包只包含已读取的资料和待确认项，不能当作已完成的作业或 AI 初稿。")); } else { content.append(node("h3", g.status === "completed" ? "真实 Codex 回合已完成" : "Codex 回合尚未成功"), node("p", `实际模型：${g.model || "尚未确认"}\n请求模型：${g.requested_model}\n推理强度：${g.reasoning_effort || "默认"}\n会话 ID：${g.thread_id || "尚未创建"}\n回合 ID：${g.turn_id || "尚未开始"}\n开始：${g.started_at ? dateLabel(g.started_at, true) : "—"}\n结束：${g.finished_at ? dateLabel(g.finished_at, true) : "—"}\n模式：${g.mode === "draft" ? "初稿生成" : "资料与题目分析"}`)); const link = codexLink(g); if (link) content.append(link); if (g.error) content.append(node("p", g.error)); content.append(node("h3", "实际送入模型的来源")); const ids = new Set(g.input?.source_ids || []); for (const source of data.manifest.source_index || []) if (source.evidence_ids.some(id => ids.has(id))) content.append(node("p", `${source.title} · ${source.locators.join("、")}`)); content.append(node("p", `另有 ${g.input?.images?.length || 0} 张实际页图送入模型。${g.input?.omitted_source_count ? "部分较长文本仅保存在可检索的本机证据中。" : ""}`), node("h3", "Codex 生成说明"), node("pre", data.text["codex-summary.md"] || "尚未返回完整说明。")); if (g.token_usage) { const details = node("details"); details.append(node("summary", "查看 Codex 返回的用量记录"), node("pre", JSON.stringify(g.token_usage, null, 2))); content.append(details); } } }
+  if (tab === "generation") { const g = data.generation; if (!g || g.status === "not_invoked") { content.append(node("h3", "没有调用 AI"), node("p", "这份包只包含已读取的资料和待确认项，不能当作已完成的作业或 AI 初稿。")); } else { content.append(node("h3", g.status === "completed" ? "真实 Claude 回合已完成" : "Claude 回合尚未成功"), node("p", `实际模型：${g.model || "尚未确认"}\n请求模型：${g.requested_model}\n推理强度：${g.reasoning_effort || "默认"}\n会话 ID：${g.thread_id || "尚未创建"}\n回合 ID：${g.turn_id || "尚未开始"}\n开始：${g.started_at ? dateLabel(g.started_at, true) : "—"}\n结束：${g.finished_at ? dateLabel(g.finished_at, true) : "—"}\n模式：${g.mode === "draft" ? "初稿生成" : "资料与题目分析"}`)); const link = codexLink(g); if (link) content.append(link); if (g.error) content.append(node("p", g.error)); content.append(node("h3", "实际送入模型的来源")); const ids = new Set(g.input?.source_ids || []); for (const source of data.manifest.source_index || []) if (source.evidence_ids.some(id => ids.has(id))) content.append(node("p", `${source.title} · ${source.locators.join("、")}`)); content.append(node("p", `另有 ${g.input?.images?.length || 0} 张实际页图送入模型。${g.input?.omitted_source_count ? "部分较长文本仅保存在可检索的本机证据中。" : ""}`), node("h3", "Claude 生成说明"), node("pre", data.text["summary.md"] || "尚未返回完整说明。")); if (g.token_usage) { const details = node("details"); details.append(node("summary", "查看 Claude 返回的用量记录"), node("pre", JSON.stringify(g.token_usage, null, 2))); content.append(details); } } }
   if (tab === "evidence") for (const source of data.evidence.sources) { const box = node("section", undefined, "source-card"), head = node("header"); head.append(node("span", source.title || source.source_kind)); const link = safeLink(source.url, "查看原来源 ↗"); if (link) head.append(link); box.append(head, node("div", source.locator + " · E:" + source.id, "locator"), node("pre", source.text)); if (source.image_path) { const show = button("查看保留的页面图像", "text-button small", async () => { show.disabled = true; try { const blob = await api(`/api/jobs/${jobId}/items/${key}/image/${source.id}`); const url = URL.createObjectURL(blob); state.images.push(url); const image = node("img"); image.src = url; image.alt = source.title + " · " + source.locator; box.append(image); show.remove(); } catch (error) { toast(error.message); show.disabled = false; } }); box.append(show); } content.append(box); }
 }
 async function openPolicy(courseId, courseName) {
   try { const policy = await api("/api/policies/" + courseId); state.policyCourse = courseId; $("policyTitle").textContent = courseName || "课程 AI 规则"; $("policyUse").value = policy.ai_use; $("policyEvidence").value = policy.policy_evidence; $("policyLimits").value = policy.limitations; $("policyDisclosure").value = policy.disclosure; $("personalFacts").value = policy.personal_facts.join("\n"); $("attachmentBudget").value = policy.max_attachment_bytes / 1048576; $("pdfBudget").value = policy.max_pdf_pages; $("policyError").hidden = true; $("policyDialog").showModal(); } catch (error) { toast(error.message); }
 }
 $("refreshButton").addEventListener("click", () => action("/api/refresh", {}));
-$("generateButton").addEventListener("click", () => { saveOptions(); action("/api/review", {selected: targets().map(({course_id, assignment_id}) => ({course_id, assignment_id})), defer_media: !$("processMedia").checked, ai_confirmed: $("aiConfirmed").checked, ...($("aiConfirmed").checked ? {model: $("modelSelect").value, effort: $("effortSelect").value || null} : {})}); });
+$("generateButton").addEventListener("click", () => { saveOptions(); action("/api/review", {selected: targets().map(({course_id, assignment_id}) => ({course_id, assignment_id})), ai_confirmed: $("aiConfirmed").checked, ...($("aiConfirmed").checked ? {model: $("modelSelect").value, effort: $("effortSelect").value || null} : {})}); });
 $("aiConfirmed").checked = localStorage.getItem("classroom-ai-enabled") !== "false";
 $("aiConfirmed").addEventListener("change", () => { localStorage.setItem("classroom-ai-enabled", String($("aiConfirmed").checked)); setButtons(); renderPending(); });
 $("shutdownEnabled").addEventListener("change", event => changeShutdown(event.currentTarget.checked));
@@ -792,7 +795,7 @@ async function openSupplement(jobId, key) {
     if (item.error) $("supplementQuestions").append(node("p", friendlyError(item.error))); if (item.browser_read?.thread_id) { const readLink = codexLink(item.browser_read); if (readLink) { readLink.textContent = "打开登录题目读取会话 ↗"; $("supplementQuestions").append(readLink); } }
     $("supplementAi").checked = !!job.ai_confirmed;
     $("supplementError").hidden = true;
-    $("followupNote").textContent = "已在这项作业的 Codex 会话里补充过？点击读取已完成的回复，随后继续核验与作答。";
+    $("followupNote").textContent = "";
     $("receiveFollowup").disabled = !item.generation?.thread_id || !!state.active;
     const links = $("restrictedFormLinks"); links.replaceChildren();
     const urls = [...new Set([...(data?.requirements?.response_forms || []).map(x=>x.url), ...(data?.manifest?.warnings || []).map(x=>x.url)].filter(url=>/^https:\/\/docs\.google\.com\/forms\//.test(url || "")))];
@@ -880,7 +883,7 @@ $("receiveFollowup").addEventListener("click", event => supplementAction(event.c
   $("supplementText").value = result.supplement.text;
   updateSupplementActions();
   $("followupNote").textContent = `已接收实际回合 ${result.followup.turn_id} · 模型 ${result.followup.model || "原会话"}。点击保存并继续，重新核验来源并作答。`;
-  toast("已接收 Codex 补充，尚未提交");
+  toast("已接收补充，尚未提交");
 }));
 $("importQuestions").addEventListener("click", event => supplementAction(event.currentTarget, async () => {
   const {jobId, key} = state.supplement;

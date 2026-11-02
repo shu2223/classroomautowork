@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "classroomautowork"
 version = "0.1.0"
-description = "Local, read-only Google Classroom assistance for Codex"
+description = "Classroom coursework assistant over the course knowledge base, drafted by Claude"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"

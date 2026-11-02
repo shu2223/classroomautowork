@@ -8,12 +8,9 @@ from dataclasses import asdict, replace
 from pathlib import Path
 
 from .answer_document import create_answer_document, valid_answer_document
-from .auth import credentials_for, documents_authorized
+from .auth import documents_authorized
 from .batch import course_batches
-from .browser_documents import ensure_document_sheet
-from .browser_questions import recover_questions
-from .buzz import validation_session
-from .codex_rpc import model_catalog
+from .claude_agent import model_catalog
 from .completion import (
     answers_incomplete,
     document_answers_incomplete,
@@ -25,15 +22,14 @@ from .completion import (
     review_cautions,
 )
 from .config import Settings
-from .document_fill import fill_review, prepare_document_forms
-from .drafting import codex_command, generate_answer, recover_completed_result
+from .document_fill import fill_review
+from .drafting import generate_answer, recover_completed_result
 from .errors import ConfigurationError, RunCancelled, WorkflowError
-from .followups import read_followup
 from .form_capture import import_form_capture
 from .form_fill import fill_response_forms, form_gap_reason, prepare_response_forms
 from .form_read import form_references, form_url
-from .google_read import GoogleReader
 from .job_progress import JobProgress
+from .kb_client import KnowledgeClient
 from .local import atomic_json, require_private_path, sha256_file, utc_now
 from .pending import discover_pending
 from .policy import CoursePolicy, confirmed_gate
@@ -53,9 +49,9 @@ FILES = {
     "draft.md",
     "checklist.md",
     "questions.md",
-    "codex-summary.md",
-    "codex-generation.json",
-    "codex-result.json",
+    "summary.md",
+    "generation.json",
+    "model-result.json",
     "README.txt",
     "document-fill.json",
     "document-answers.json",
@@ -134,7 +130,6 @@ class FrontendJobs:
         self._cancel = threading.Event()
         self._thread = None
         self._models_lock = threading.Lock()
-        self._approval_answers = {}
         self._jobs = {}
         self._progress = {}
         self._on_start = None
@@ -312,9 +307,7 @@ class FrontendJobs:
 
     def models(self):
         with self._models_lock:
-            result = model_catalog(codex_command())
-            atomic_json(self.root / "codex-models.json", result)
-            return result
+            return model_catalog()
 
     def _start(self, kind, items, defer_media=False, model=None, effort=None, ai_confirmed=False):
         with self._lock:
@@ -355,7 +348,9 @@ class FrontendJobs:
         return self._start("refresh", [])
 
     def authorize_documents(self):
-        return self._start("document_auth", [])
+        raise WorkflowError(
+            "填写 Google 文档的写入授权将在后续版本提供；现在请打开答案或下载 Word 审阅。"
+        )
 
     def fill_existing(self, job_id, key):
         package = self.package_path(job_id, key)
@@ -446,13 +441,11 @@ class FrontendJobs:
         reusable = [latest.get(item_key(item), {}) for item in items]
         if all(self._can_retry_fill(item) for item in reusable):
             return self._start("fill", reusable, ai_confirmed=True)
-        catalog = read_json(self.root / "codex-models.json") or self.models()
+        catalog = read_json(self.root / "models.json") or self.models()
         model = model or catalog["default_model"]
         entry = next((x for x in catalog["models"] if x["model"] == model), None)
         if not entry:
-            raise ConfigurationError(
-                "模型不在本机 Codex 返回的目录或当前配置中，请重新读取模型列表。"
-            )
+            raise ConfigurationError("所选模型不在可用模型列表中，请重新读取模型列表。")
         allowed = {x["reasoningEffort"] for x in entry.get("supportedReasoningEfforts", [])}
         if effort is None:
             effort = (
@@ -541,7 +534,7 @@ class FrontendJobs:
                 if item.get("status") != "failed" or not item.get("package"):
                     continue
                 package = self.package_path(job_id, item_key(item))
-                result = read_json(package / "codex-result.json", {})
+                result = read_json(package / "model-result.json", {})
                 if (
                     not job.get("ai_confirmed")
                     or result.get("document_answers")
@@ -576,7 +569,7 @@ class FrontendJobs:
                 )
                 self._log(
                     job_id,
-                    "已核验并复用上次完整 Codex 答案及审阅文件；未重新下载、未重新调用 AI。",
+                    "已核验并复用上次完整答案及审阅文件；未重新读取资料、未重新调用 AI。",
                 )
             # A reusable item must not prevent the rest of a batch from retrying.
             return recovered and job["status"] == "completed"
@@ -619,41 +612,7 @@ class FrontendJobs:
             )
 
     def import_followup(self, job_id, key):
-        if self.bootstrap()["active_job_id"]:
-            raise WorkflowError("请等当前处理结束后接收补充。")
-        package = self.package_path(job_id, key)
-        result = read_followup(package)
-        item = self.supplement_item(job_id, key)
-        supplement = load_supplement(
-            self.settings.data_dir, item["course_id"], item["assignment_id"]
-        )
-        marker = f"[Codex 补充回合 {result['turn_id']}]"
-        if marker not in supplement["text"]:
-            supplement = save_supplement(
-                self.settings.data_dir,
-                item["course_id"],
-                item["assignment_id"],
-                {
-                    "text": supplement["text"]
-                    + "\n\n"
-                    + marker
-                    + "\n"
-                    + "\n\n".join(
-                        (
-                            "用户补充："
-                            if record["role"] == "user"
-                            else "AI 候选内容（需要重新核验来源，不是个人事实）："
-                        )
-                        + record["text"]
-                        for record in result["records"]
-                    ),
-                    "personal_facts": supplement["personal_facts"],
-                },
-            )
-        return {
-            "supplement": supplement,
-            "followup": {k: v for k, v in result.items() if k != "records"},
-        }
+        raise WorkflowError("新版不再通过 Codex 会话接收补充；请在“调整答案或说明”里直接填写。")
 
     def import_questions(self, job_id, key, values):
         if set(values) != {"url", "question_script"}:
@@ -753,57 +712,6 @@ class FrontendJobs:
                         self._save(source)
             return None
 
-    def _request_approval(self, job_id, method, params):
-        identifier = uuid.uuid4().hex
-        with self._lock:
-            job = self._jobs[job_id]
-            job["approval"] = {
-                "id": identifier,
-                "method": method,
-                "command": str(params.get("command", ""))[:20000],
-                "cwd": str(params.get("cwd", params.get("grantRoot", "")))[:2000],
-                "reason": str(params.get("reason", "Codex 的现有权限规则要求确认本次操作。"))[
-                    :2000
-                ],
-                "thread_id": params.get("threadId"),
-            }
-            job["message"] = "Codex 正等待你的本次操作审批；课程内容不能自动批准。"
-            job["approval"]["requested_at"] = utc_now()
-            if job_id in self._progress:
-                self._progress[job_id].pause(True)
-            self._save(job)
-        try:
-            for _ in range(4500):
-                if self._cancel.wait(0.2):
-                    raise RunCancelled("已暂停等待审批的 Codex 会话。")
-                with self._lock:
-                    if identifier in self._approval_answers:
-                        return self._approval_answers.pop(identifier)
-            return "cancel"
-        finally:
-            with self._lock:
-                job["approval"] = None
-                if job_id in self._progress:
-                    self._progress[job_id].pause(False)
-                self._save(job)
-
-    def approve(self, job_id, identifier, decision):
-        with self._lock:
-            job = self._jobs.get(job_id)
-            if (
-                self._active != job_id
-                or not job
-                or not job.get("approval")
-                or job["approval"]["id"] != identifier
-            ):
-                raise WorkflowError("这个审批请求已经结束或不属于当前任务。")
-            if decision not in {"accept", "decline", "cancel"}:
-                raise ConfigurationError("只允许批准本次、拒绝或取消，不支持扩大长期权限。")
-            if identifier in self._approval_answers:
-                raise WorkflowError("这项审批已经回答。")
-            self._approval_answers[identifier] = decision
-            return {"status": "answered"}
-
     def pause(self, job_id):
         with self._lock:
             if self._active != job_id:
@@ -837,7 +745,6 @@ class FrontendJobs:
                 batch = prepare(
                     self.settings,
                     targets=[(x["course_id"], x["assignment_id"]) for x in items],
-                    defer_media=job["defer_media"],
                     progress=lambda msg: self._log(job_id, msg),
                     on_assignment=assignment_event,
                 )
@@ -864,7 +771,6 @@ class FrontendJobs:
             )
             yield from batch["packages"]
 
-    @validation_session()
     def _run(self, job_id):
         job = self._jobs[job_id]
         try:
@@ -872,18 +778,7 @@ class FrontendJobs:
                 job["status"] = "running"
                 job["started_at"] = utc_now()
                 self._save(job)
-            if job["kind"] == "document_auth":
-                self._log(
-                    job_id,
-                    "请在 Google 页面确认文档读写授权。权限允许编辑账户可编辑的文档；本程序只填写本人待完成作业副本。",
-                )
-                credentials_for(self.settings, authorize=True, documents=True)
-                self._log(
-                    job_id,
-                    "学校账户的文档读写授权已实际完成，可以自动填入；课堂提交与留言仍由你手动操作。",
-                )
-                status = "completed"
-            elif job["kind"] == "fill":
+            if job["kind"] == "fill":
                 for item in job["items"]:
                     if prepare_response_forms(Path(item["package"])):
                         self._fill_response_item(job_id, item, Path(item["package"]))
@@ -916,10 +811,11 @@ class FrontendJobs:
                     else "completed_with_issues"
                 )
             elif job["kind"] == "refresh":
-                self._log(job_id, "正在连接学校账户并读取真实待办")
-                credentials, _ = credentials_for(self.settings)
+                self._log(job_id, "正在从课程资料库读取待办")
+                reader = KnowledgeClient.from_settings(self.settings)
+                source = reader.status()
                 pending = discover_pending(
-                    GoogleReader(credentials),
+                    reader,
                     timezone=self.settings.timezone,
                     include_no_due=True,
                     progress=lambda msg: self._log(job_id, msg),
@@ -927,6 +823,13 @@ class FrontendJobs:
                 if self._cancel.is_set():
                     raise RunCancelled("刷新已暂停。")
                 pending["refreshed_at"] = utc_now()
+                classroom = source.get("classroom") or {}
+                pending["source"] = {
+                    "index_built": source.get("built"),
+                    "classroom_fetched": classroom.get("time"),
+                    "classroom_ok": classroom.get("ok"),
+                    "unmapped_courses": classroom.get("unmapped", []),
+                }
                 atomic_json(self.root / "pending.json", pending)
                 self._log(
                     job_id, f"已读取 {len(pending['assignments'])} 项真实待办，包含无截止日期作业"
@@ -947,84 +850,15 @@ class FrontendJobs:
                         job_id,
                         "真实题目与课堂资料已准备"
                         + (
-                            "，正在交给所选 Codex 模型"
+                            "，正在交给所选 Claude 模型"
                             if job.get("ai_confirmed")
                             else "；本次只整理资料"
                         ),
                     )
                     self._item(job_id, result, status="drafting")
                     try:
+                        # Filling personal Google Docs needs write authorization, added later.
                         forms = []
-                        if job.get("ai_confirmed"):
-                            recovered = False
-                            try:
-                                recovered = recover_questions(
-                                    self.settings,
-                                    Path(result["package"]),
-                                    model=job["model"],
-                                    effort=job.get("effort"),
-                                    cancelled=self._cancel.is_set,
-                                    progress=lambda msg: self._log(job_id, msg),
-                                    approval=lambda method, params: self._request_approval(
-                                        job_id, method, params
-                                    ),
-                                    on_generation=lambda value, item=result: self._item(
-                                        job_id, item, browser_read=value
-                                    ),
-                                )
-                            except RunCancelled:
-                                raise
-                            except WorkflowError as exc:
-                                self._log(
-                                    job_id,
-                                    "原题自动读取仍有缺口，继续处理已读材料并保留审阅提示："
-                                    + str(exc),
-                                )
-                            if recovered:
-                                refreshed = prepare(
-                                    self.settings,
-                                    targets=[(result["course_id"], result["assignment_id"])],
-                                    defer_media=job["defer_media"],
-                                    progress=lambda msg: self._log(job_id, msg),
-                                    on_assignment=assignment_event,
-                                )
-                                if not refreshed["packages"]:
-                                    raise WorkflowError(
-                                        "原题已读取，但资料重新核验失败；已保留读取结果，可重试。"
-                                    )
-                                result.update(refreshed["packages"][0])
-                            self._log(
-                                job_id,
-                                ProgressUpdate(
-                                    "正在核对原文档答案栏与表单逐栏映射，模型作答后将自动填写",
-                                    "document_inspect",
-                                ),
-                            )
-                            try:
-                                ensure_document_sheet(
-                                    self.settings,
-                                    Path(result["package"]),
-                                    model=job["model"],
-                                    effort=job.get("effort"),
-                                    cancelled=self._cancel.is_set,
-                                    progress=lambda msg: self._log(job_id, msg),
-                                    approval=lambda method, params: self._request_approval(
-                                        job_id, method, params
-                                    ),
-                                    on_generation=lambda value, item=result: self._item(
-                                        job_id, item, browser_write=value
-                                    ),
-                                )
-                                forms = prepare_document_forms(
-                                    self.settings, Path(result["package"])
-                                )
-                            except RunCancelled:
-                                raise
-                            except WorkflowError as exc:
-                                self._log(
-                                    job_id,
-                                    "原文档尚不能自动填写，继续生成可打开的本机答案：" + str(exc),
-                                )
                         if job_id in self._progress:
                             route = ["validate"] if job.get("ai_confirmed") else []
                             if forms:
@@ -1047,9 +881,6 @@ class FrontendJobs:
                                 item,
                                 generation=json.loads(json.dumps(value)),
                                 **({"package": value["package"]} if value.get("package") else {}),
-                            ),
-                            approval=lambda method, params: self._request_approval(
-                                job_id, method, params
                             ),
                         )
                         self._item(
@@ -1150,7 +981,7 @@ class FrontendJobs:
                     status="failed",
                     message=str(exc)
                     if isinstance(exc, WorkflowError)
-                    else "本机处理失败。私人错误详情未输出，请重试或在 Codex 中检查。",
+                    else "本机处理失败。私人错误详情未输出，请重试。",
                 )
         finally:
             with self._lock:
@@ -1192,7 +1023,7 @@ class FrontendJobs:
             result = fill_response_forms(
                 self.settings, package, progress=lambda msg: self._log(job_id, msg)
             )
-            generation = read_json(package / "codex-generation.json", {}) or {}
+            generation = read_json(package / "generation.json", {}) or {}
             self._item(
                 job_id,
                 item,
@@ -1281,9 +1112,9 @@ class FrontendJobs:
         changed = current_gate != manifest["policy"] or supplement != manifest.get(
             "supplement", normalized({})
         )
-        generation = read_json(self.package_file(package, "codex-generation.json"))
+        generation = read_json(self.package_file(package, "generation.json"))
         text = {}
-        for name in ("draft.md", "checklist.md", "questions.md", "codex-summary.md"):
+        for name in ("draft.md", "checklist.md", "questions.md", "summary.md"):
             path = self.package_file(package, name)
             if name == "draft.md" and (
                 changed

@@ -1,4 +1,4 @@
-"""Validate a Codex-produced review locally; never generate an answer from a template."""
+"""Validate a model-produced review locally; never generate an answer from a template."""
 
 import json
 import re

@@ -137,7 +137,6 @@ def test_current_form_is_required_cached_and_unavailable_form_is_removed(tmp_pat
         workflow.sync_course(reader, settings, store, "1")
         rows = [x for x in store.tasks() if x["kind"] == "form-questions"]
         assert len(rows) == 1 and rows[0]["attempts"] == 1
-        assert reader.downloads == 1
         monkeypatch.setattr(
             workflow,
             "read_form",

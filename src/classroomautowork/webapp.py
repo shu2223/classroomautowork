@@ -5,7 +5,6 @@ import io
 import json
 import re
 import secrets
-import threading
 import urllib.request
 import webbrowser
 import zipfile
@@ -18,12 +17,14 @@ from filelock import FileLock, Timeout
 from .config import Settings
 from .errors import WorkflowError
 from .local import atomic_json, require_private_path, sha256_file
-from .power import ShutdownController
-from .power_service import PowerWatch, is_new_work, latest_completed_job
 from .ui_jobs import FILES, FrontendJobs, read_json
 
 ASSETS = Path(__file__).parent / "web"
 ASSET_TYPES = {"index.html": "text/html", "app.js": "text/javascript", "style.css": "text/css"}
+# yishuapp.com reaches this server through Cloudflare Tunnel, behind Cloudflare Access.
+PUBLIC_HOST = "yishuapp.com"
+PUBLIC_ORIGIN = "https://" + PUBLIC_HOST
+PUBLIC_PREFIX = "/classroom"
 ITEM_ROUTE = re.compile(
     r"/api/jobs/([a-f0-9]{32})/items/([0-9]+:[0-9]+)(?:/(supplement|download|answer-docx|image/[a-f0-9]{24}))?"
 )
@@ -32,32 +33,11 @@ ITEM_ROUTE = re.compile(
 class LocalServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, jobs: FrontendJobs, port=0, *, token=None, power=None):
+    def __init__(self, jobs: FrontendJobs, port=0, *, token=None):
         self.jobs = jobs
         self.token = token or secrets.token_urlsafe(32)
         super().__init__(("127.0.0.1", port), LocalHandler)
         self.origin = f"http://127.0.0.1:{self.server_port}"
-        self.power = power if power is not None else ShutdownController(preflight=self._power_ready)
-        self.power_watch = PowerWatch(self.power, self._power_job)
-        self.jobs._on_start = self.power_watch.on_start
-        self.power_watch.start()
-
-    def _power_job(self, identifier):
-        with self.jobs._lock:
-            identifier = self.jobs._active or identifier
-            return self.jobs.job(identifier) if identifier in self.jobs._jobs else None
-
-    def _power_ready(self, identifier):
-        with self.jobs._lock:
-            return bool(
-                not self.jobs._active
-                and latest_completed_job(self.jobs._jobs.get(identifier), self.jobs._jobs.values())
-            )
-
-    def server_close(self):
-        self.power_watch.close()
-        self.jobs._on_start = None
-        super().server_close()
 
     @property
     def browser_url(self):
@@ -96,18 +76,37 @@ class LocalHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
-    def _guard(self, mutation=False):
+    def _public(self):
+        return self.headers.get("Host") == PUBLIC_HOST
+
+    def _path(self):
+        """Request path without the public prefix, or None when this host may not ask for it."""
+        path = urlparse(self.path).path
+        if self._public():
+            # Same rule as the mini PC status page: Cloudflare Access adds this header.
+            if not self.headers.get("Cf-Access-Jwt-Assertion"):
+                return None
+            if not path.startswith(PUBLIC_PREFIX + "/"):
+                return None
+            return path.removeprefix(PUBLIC_PREFIX)
         if self.headers.get("Host") != urlparse(self.server.origin).netloc:
+            return None
+        return path
+
+    def _guard(self, mutation=False):
+        if self._path() is None:
             self._deny(403, "只允许访问本机助手地址。")
             return False
-        token = self.headers.get("Authorization", "")
-        if not secrets.compare_digest(
-            token.encode("utf-8"), ("Bearer " + self.server.token).encode("utf-8")
-        ):
-            self._deny(401, "页面没有本机访问凭证，请重新打开作业助手快捷方式。")
-            return False
+        expected = PUBLIC_ORIGIN if self._public() else self.server.origin
+        if not self._public():
+            token = self.headers.get("Authorization", "")
+            if not secrets.compare_digest(
+                token.encode("utf-8"), ("Bearer " + self.server.token).encode("utf-8")
+            ):
+                self._deny(401, "页面没有本机访问凭证，请重新打开作业助手。")
+                return False
         origin = self.headers.get("Origin")
-        if (mutation and origin != self.server.origin) or (origin and origin != self.server.origin):
+        if (mutation and origin != expected) or (origin and origin != expected):
             self._deny(403, "拒绝外部网页请求。")
             return False
         return True
@@ -140,11 +139,17 @@ class LocalHandler(BaseHTTPRequestHandler):
             raise WorkflowError("请求内容或长度无效。") from None
 
     def do_GET(self):
-        path = urlparse(self.path).path
+        if self._public() and urlparse(self.path).path == PUBLIC_PREFIX:
+            self.send_response(301)
+            self.send_header("Location", PUBLIC_PREFIX + "/")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        path = self._path()
+        if path is None:
+            self._send(403, {"error": "地址无效。"})
+            return
         if not path.startswith("/api/"):
-            if self.headers.get("Host") != urlparse(self.server.origin).netloc:
-                self._send(403, {"error": "地址无效。"})
-                return
             name = "index.html" if path == "/" else path.removeprefix("/")
             if name not in ASSET_TYPES:
                 self._send(404, {"error": "找不到页面。"})
@@ -156,13 +161,10 @@ class LocalHandler(BaseHTTPRequestHandler):
         try:
             jobs = self.server.jobs
             if path == "/api/health":
-                result = {"app": "classroomautowork", "status": "running", "auto_shutdown": True}
+                result = {"app": "classroomautowork", "status": "running"}
             elif path == "/api/bootstrap":
                 result = jobs.bootstrap()
-                result["shutdown"] = self.server.power.snapshot()
-            elif path == "/api/shutdown":
-                result = self.server.power.snapshot()
-            elif path == "/api/codex/models":
+            elif path == "/api/models":
                 result = jobs.models()
             elif match := re.fullmatch(r"/api/jobs/([a-f0-9]{32})", path):
                 result = jobs.job(match[1])
@@ -193,7 +195,7 @@ class LocalHandler(BaseHTTPRequestHandler):
                                 else "没有已核验的 AI 答案初稿。这份包用于查看已获取资料、题目、来源和待确认项，不能当作作业已经完成。\n"
                             )
                             + f"实际模型：{generation.get('model') or '没有已核验的模型记录'}\n会话：{generation.get('thread_id') or '没有实际会话记录'}\n"
-                            + "codex-generation.json 记录真实模型、回合、输入来源和页图摘要；evidence.json 保存引用证据。\n"
+                            + "generation.json 记录真实模型、会话、输入来源和页图摘要；evidence.json 保存引用证据。\n"
                             + "sources/ 中为本次已授权下载、实际使用或当前作业必须的原文件/PDF 导出；pages/ 保留相应页图。\n"
                             + "未知教师规定保持未确认，用户要求继续生成不会被写成教师已经允许。\n"
                             + "document-fill.json / form-fill.json 记录实际填入或浏览器打开状态；程序不提交、不留言。\n"
@@ -291,20 +293,17 @@ class LocalHandler(BaseHTTPRequestHandler):
             return
         try:
             payload = self._body()
-            path = urlparse(self.path).path
+            path = self._path()
             jobs = self.server.jobs
-            if is_new_work(path):
-                self.server.power_watch.before_new_work()
             if path == "/api/refresh":
                 if payload:
                     raise WorkflowError("刷新请求不接受额外参数。")
                 result = jobs.refresh()
             elif path == "/api/review":
-                if set(payload) - {"selected", "defer_media", "model", "effort", "ai_confirmed"}:
+                if set(payload) - {"selected", "model", "effort", "ai_confirmed"}:
                     raise WorkflowError("生成请求包含不支持的参数。")
                 result = jobs.start_selected(
                     payload.get("selected"),
-                    defer_media=payload.get("defer_media", False),
                     model=payload.get("model"),
                     effort=payload.get("effort"),
                     ai_confirmed=payload.get("ai_confirmed", False),
@@ -350,32 +349,10 @@ class LocalHandler(BaseHTTPRequestHandler):
                 if payload:
                     raise WorkflowError("填入请求不接受远端文档 ID 或额外写入指令。")
                 result = jobs.fill_existing(match[1], match[2])
-            elif match := re.fullmatch(r"/api/jobs/([a-f0-9]{32})/approval", path):
-                if set(payload) != {"id", "decision"}:
-                    raise WorkflowError("审批只接受当前请求 ID 与本次决定。")
-                result = jobs.approve(match[1], payload["id"], payload["decision"])
             elif match := re.fullmatch(r"/api/jobs/([a-f0-9]{32})/(pause|retry)", path):
                 if payload:
                     raise WorkflowError("任务操作不接受额外参数。")
                 result = jobs.pause(match[1]) if match[2] == "pause" else jobs.retry(match[1])
-            elif path == "/api/shutdown":
-                if payload:
-                    if set(payload) != {"enabled"}:
-                        raise WorkflowError("自动关机只接受开关设置。")
-                    result = self.server.power_watch.set_enabled(payload["enabled"])
-                    self._send(200, result)
-                    return
-                active = jobs.bootstrap()["active_job_id"]
-                if active:
-                    raise WorkflowError("请先暂停当前任务并等它停止，再退出助手。")
-                self.server.power.close()
-                self._send(200, {"status": "stopping"})
-                threading.Thread(target=self.server.shutdown, daemon=True).start()
-                return
-            elif path == "/api/shutdown/cancel":
-                if payload:
-                    raise WorkflowError("取消关机不接受其他参数。")
-                result = self.server.power.cancel()
             else:
                 self._send(404, {"error": "找不到本机接口。"})
                 return
@@ -390,8 +367,7 @@ class LocalHandler(BaseHTTPRequestHandler):
         if not self._guard(mutation=True):
             return
         try:
-            path = urlparse(self.path).path
-            match = re.fullmatch(r"/api/policies/([0-9]+)", path)
+            match = re.fullmatch(r"/api/policies/([0-9]+)", self._path())
             if not match:
                 self._send(404, {"error": "找不到课程规则。"})
                 return
@@ -414,24 +390,6 @@ def existing_server(info_path: Path):
         return None
     origin = f"http://127.0.0.1:{info['port']}"
     try:
-        companion = read_json(info_path.with_name("power-companion.json"), {})
-        if (
-            companion.get("source_port") == info["port"]
-            and type(companion.get("port")) is int
-            and 0 < companion["port"] < 65536
-            and isinstance(companion.get("token"), str)
-        ):
-            companion_origin = f"http://127.0.0.1:{companion['port']}"
-            probe = urllib.request.Request(
-                companion_origin + "/api/health",
-                headers={"Authorization": "Bearer " + companion["token"]},
-            )
-            try:
-                with urllib.request.urlopen(probe, timeout=2) as response:
-                    if json.load(response).get("power_companion"):
-                        return companion_origin + "/#" + companion["token"]
-            except (OSError, ValueError):
-                pass
         request = urllib.request.Request(
             origin + "/api/health", headers={"Authorization": "Bearer " + info["token"]}
         )
@@ -482,13 +440,7 @@ def main():
     try:
         serve(Settings.load(args.config), open_browser=not args.no_browser, port=args.port)
     except WorkflowError as exc:
-        # pythonw has no console; report a concrete startup failure in a native dialog.
-        if __import__("os").name == "nt":
-            import ctypes
-
-            ctypes.windll.user32.MessageBoxW(None, str(exc), "Classroom 作业助手", 0x10)
-        else:
-            raise SystemExit(str(exc)) from None
+        raise SystemExit(str(exc)) from None
 
 
 if __name__ == "__main__":

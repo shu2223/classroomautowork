@@ -1,7 +1,7 @@
 """Document extraction with page/paragraph locators and retained PDF page images.
 
 Documents are data: no macros, embedded programs, external links or XML entities are executed.
-Scanned pages are retained and flagged for Codex's visual inspection; text is never invented.
+Scanned pages are retained and flagged for visual inspection; text is never invented.
 """
 
 import importlib.metadata

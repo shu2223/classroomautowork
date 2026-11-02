@@ -91,7 +91,7 @@ def test_fill_review_recovers_all_labels_and_keeps_model_artifacts_immutable(
     (package / "draft.md").write_text(DRAFT, encoding="utf-8")
     atomic_json(package / "document-answers.json", {"answers": cached_answers})
     atomic_json(
-        package / "codex-generation.json",
+        package / "generation.json",
         {
             "document_answers_sha256": sha256_file(package / "document-answers.json"),
             "source_files_sha256": {

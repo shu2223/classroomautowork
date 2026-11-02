@@ -17,7 +17,6 @@ from classroomautowork.errors import ConfigurationError, PermissionDenied
 from classroomautowork.google_read import GoogleReader, retry_read
 from classroomautowork.local import require_private_path
 from classroomautowork.pending import cutoff_end, discover_pending
-from classroomautowork.verify import verify_connection
 
 
 def test_classroom_detail_link_decodes_actual_shape():
@@ -40,15 +39,6 @@ def test_private_paths_reject_git_and_symlink_target(tmp_path):
     with pytest.raises(ConfigurationError):
         require_private_path(repo / "ignored" / "credentials.json")
     assert require_private_path(tmp_path / "outside") == tmp_path / "outside"
-
-
-def test_missing_real_client_cannot_verify(tmp_path):
-    settings = Settings("unit-test@example.invalid", tmp_path / "absent.json", tmp_path / "private")
-    with pytest.raises(ConfigurationError):
-        verify_connection(settings)
-    receipt = json.loads((settings.data_dir / "connection-receipt.json").read_text())
-    assert receipt["status"] == "failed"
-    assert "verified_at" not in receipt
 
 
 def test_untrusted_oauth_endpoint_is_rejected_before_network(tmp_path):

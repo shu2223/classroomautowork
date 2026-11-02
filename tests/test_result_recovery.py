@@ -26,7 +26,7 @@ def failed_report(root):
         "document_answers": [],
         "form_answers": [],
     }
-    atomic_json(package / "codex-result.json", result)
+    atomic_json(package / "model-result.json", result)
     generation = {
         "status": "failed",
         "turn_status": "completed",
@@ -35,20 +35,20 @@ def failed_report(root):
         "thread_id": "original-offline-thread",
         "turn_id": "original-offline-turn",
         "error": "Offline source identifier failure",
-        "result_file": "codex-result.json",
-        "result_sha256": sha256_file(package / "codex-result.json"),
+        "result_file": "model-result.json",
+        "result_sha256": sha256_file(package / "model-result.json"),
         "source_files_sha256": {
             name: sha256_file(package / name)
             for name in ("manifest.json", "requirements.json", "evidence.json")
         },
     }
-    atomic_json(package / "codex-generation.json", generation)
+    atomic_json(package / "generation.json", generation)
     return package, generation, result, source
 
 
 def test_retry_recovers_completed_report_without_download_or_new_ai(tmp_path, monkeypatch):
     package, generation, result, source = failed_report(tmp_path)
-    raw = (package / "codex-result.json").read_bytes()
+    raw = (package / "model-result.json").read_bytes()
     jobs = FrontendJobs(unit_settings(tmp_path))
     identifier = "a" * 32
     jobs._jobs[identifier] = {
@@ -73,7 +73,7 @@ def test_retry_recovers_completed_report_without_download_or_new_ai(tmp_path, mo
     assert item["generation"]["turn_id"] == generation["turn_id"]
     assert item["answer_document"]["pending_requirements"] == ["Unit requirement"]
     assert (package / "answer.docx").is_file()
-    assert (package / "codex-result.json").read_bytes() == raw
+    assert (package / "model-result.json").read_bytes() == raw
     review = json.loads((package / "review.json").read_text(encoding="utf-8"))
     assert review["requirement_checks"][0]["requirement_source_id"] == source
     assert result["review"]["requirement_checks"][0]["requirement_source_id"] != source
@@ -94,10 +94,10 @@ def test_recovery_rejects_tampered_inputs_outputs_and_unfinished_turns(tmp_path,
     if change == "source":
         (package / "requirements.json").write_text("{}", encoding="utf-8")
     elif change == "result":
-        (package / "codex-result.json").write_text("{}", encoding="utf-8")
+        (package / "model-result.json").write_text("{}", encoding="utf-8")
     else:
         generation["turn_status"] = "interrupted"
-        atomic_json(package / "codex-generation.json", generation)
+        atomic_json(package / "generation.json", generation)
     assert drafting.recover_completed_result(package, model="offline-model", effort="high") is None
     assert not (package / "review-receipt.json").exists()
     assert not (package / "answer.docx").exists()

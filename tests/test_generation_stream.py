@@ -1,71 +1,25 @@
 import json
+import sys
 
 import pytest
 from test_frontend import offline_rpc
 from test_workflow import prepared_fixture
 
-from classroomautowork import drafting, generation_stream
+from classroomautowork import claude_agent, drafting
 from classroomautowork.errors import WorkflowError
-from classroomautowork.generation_stream import GenerationStream
 
 
-def test_silent_turn_and_endless_deltas_have_independent_deadlines():
-    now = [0]
-    stream = GenerationStream(clock=lambda: now[0])
-    now[0] = 901
-    with pytest.raises(WorkflowError, match="15 分钟"):
-        stream.remaining()
-    assert stream.remaining(approval_wait=100) == 99
-    stream = GenerationStream(clock=lambda: now[0])
-    stream.start_item({"type": "agentMessage", "id": "answer", "phase": "final_answer"})
-    stream.append({"itemId": "answer", "delta": "Actual incomplete answer"})
-    now[0] += 301
-    stream.append({"itemId": "answer", "delta": " still streaming"})
-    with pytest.raises(WorkflowError, match="5 分钟"):
-        stream.remaining()
-    assert stream.metadata()["validated"] is False
-
-
-def test_commentary_does_not_start_final_output_deadline_and_buffers_are_bounded(monkeypatch):
-    now = [0]
-    stream = GenerationStream(clock=lambda: now[0])
-    stream.start_item({"type": "agentMessage", "phase": "commentary"})
-    stream.append({"delta": "Actual progress"})
-    now[0] = 400
-    assert stream.remaining() == 500
-    assert stream.metadata()["output_started_at"] is None
-    monkeypatch.setattr(generation_stream, "OUTPUT_CHARACTERS", 25)
-    stream.start_item({"type": "agentMessage", "id": "answer", "phase": "final_answer"})
-    with pytest.raises(WorkflowError, match="字符"):
-        stream.append({"itemId": "answer", "delta": "x" * 50})
-    assert len(stream.text) == 25
-
-
-def test_overlong_real_protocol_stream_is_private_partial_not_validated_result(
-    tmp_path, monkeypatch
-):
+def test_overlong_result_is_kept_private_and_not_validated(tmp_path, monkeypatch):
     package, _, _, review = prepared_fixture(tmp_path)
     offline_rpc(tmp_path, monkeypatch, package, review)
-    script = tmp_path / "offline_rpc.py"
-    script.write_text(
-        script.read_text(encoding="utf-8").replace(
-            " if m=='turn/start':\n",
-            " if m=='turn/start':\n"
-            "  send({'method':'item/started','params':{'threadId':'unit-thread','item':{'type':'agentMessage','id':'stream','phase':'final_answer'}}})\n"
-            "  send({'method':'item/agentMessage/delta','params':{'threadId':'unit-thread','itemId':'stream','delta':'incomplete'*10}})\n",
-        ),
-        encoding="utf-8",
-    )
-    monkeypatch.setattr(generation_stream, "OUTPUT_CHARACTERS", 40)
+    monkeypatch.setattr(drafting, "OUTPUT_CHARACTERS", 40)
     with pytest.raises(WorkflowError, match="字符"):
         drafting.generate_review(package, ai_confirmed=True, model="unit-model", effort="high")
-    partial = list(package.parent.glob("*/codex-output.partial.txt"))
-    assert len(partial) == 1 and len(partial[0].read_text(encoding="utf-8")) == 40
-    variant = partial[0].parent
-    record = json.loads((variant / "codex-generation.json").read_text(encoding="utf-8"))
-    assert record["status"] == "failed" and record.get("turn_status") != "completed"
-    assert record["output_stream"]["validated"] is False
-    assert not (variant / "review-receipt.json").exists()
+    records = list(package.parent.glob("*/generation.json"))
+    assert len(records) == 1
+    record = json.loads(records[0].read_text(encoding="utf-8"))
+    assert record["status"] == "failed"
+    assert not (records[0].parent / "review-receipt.json").exists()
 
 
 def test_compact_input_preserves_actual_required_sources_and_local_full_index(tmp_path):
@@ -80,26 +34,58 @@ def test_compact_input_preserves_actual_required_sources_and_local_full_index(tm
     assert len(inputs[0]["text"]) < 25_000
     assert set(manifest["requirement_source_ids"]) <= set(receipt["source_ids"])
     assert receipt["prompt_characters"] == len(inputs[0]["text"])
-    assert receipt["evidence_character_budget"] == 60_000
+    assert receipt["evidence_character_budget"] == drafting.EVIDENCE_CHARACTERS
     assert "unused-id" not in inputs[0]["text"]
     assert (package / "evidence.json").is_file()
 
 
-def test_silent_protocol_turn_times_out_without_claiming_success(tmp_path, monkeypatch):
+def test_silent_turn_times_out_without_claiming_success(tmp_path, monkeypatch):
     package, _, _, review = prepared_fixture(tmp_path)
     offline_rpc(tmp_path, monkeypatch, package, review)
-    script = tmp_path / "offline_rpc.py"
-    script.write_text(
-        script.read_text(encoding="utf-8").replace(
-            " if m=='turn/start':\n", " if m=='turn/start':\n  import time; time.sleep(5)\n"
-        ),
-        encoding="utf-8",
-    )
-    monkeypatch.setattr(generation_stream, "TURN_SECONDS", 0.05)
-    with pytest.raises(WorkflowError, match="异常等待"):
+    script = tmp_path / "silent.py"
+    script.write_text("import sys,time\nsys.stdin.readline()\ntime.sleep(5)\n", encoding="utf-8")
+    monkeypatch.setattr(claude_agent, "claude_command", lambda: [sys.executable, str(script)])
+    monkeypatch.setattr(claude_agent, "IDLE_SECONDS", 0.05)
+    with pytest.raises(WorkflowError, match="没有任何输出"):
         drafting.generate_review(package, ai_confirmed=True, model="unit-model", effort="high")
-    records = list(package.parent.glob("*/codex-generation.json"))
+    records = list(package.parent.glob("*/generation.json"))
     assert len(records) == 1
     generation = json.loads(records[0].read_text(encoding="utf-8"))
     assert generation["status"] == "failed" and generation.get("turn_status") != "completed"
     assert not (records[0].parent / "review-receipt.json").exists()
+
+
+@pytest.mark.parametrize(
+    "events, message",
+    [
+        ([{"type": "system", "subtype": "init", "model": "other-model", "tools": []}], "不一致"),
+        (
+            [{"type": "system", "subtype": "init", "model": "unit-model", "tools": ["Bash"]}],
+            "额外工具",
+        ),
+        (
+            [
+                {"type": "rate_limit_event", "rate_limit_info": {"status": "rejected"}},
+                {"type": "result", "subtype": "error_during_execution", "is_error": True},
+            ],
+            "用量已达上限",
+        ),
+        ([{"type": "result", "subtype": "success", "is_error": False}], "结构化结果"),
+    ],
+)
+def test_unexpected_cli_events_never_count_as_an_answer(tmp_path, events, message):
+    script = tmp_path / "events.py"
+    script.write_text(
+        "import json,sys\nsys.stdin.readline()\n"
+        f"for event in {events!r}: print(json.dumps(event), flush=True)\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(WorkflowError, match=message):
+        claude_agent.run_turn(
+            [{"type": "text", "text": "unit"}],
+            {"type": "object"},
+            model="unit-model",
+            effort=None,
+            cwd=tmp_path,
+            command=[sys.executable, str(script)],
+        )
