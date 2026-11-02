@@ -10,8 +10,6 @@ import re
 from dataclasses import asdict
 from pathlib import Path
 
-import pypdfium2 as pdfium
-
 from .config import Settings
 from .errors import ConfigurationError, PermissionDenied, RunCancelled, WorkflowError
 from .external_sources import external_chunks, source_urls
@@ -20,6 +18,7 @@ from .form_read import PARSER_VERSION, form_chunks, form_references, read_form
 from .google_read import drive_attachments
 from .kb_client import KnowledgeClient
 from .local import atomic_json, utc_now
+from .pages import LONG_EDGE, RENDER_VERSION, SLIDE_TYPES, page_images, renderable
 from .pending import PENDING_STATES, discover_pending
 from .policy import CoursePolicy
 from .progress import report
@@ -27,9 +26,6 @@ from .search import retrieve
 from .store import Store, artifact, fingerprint
 from .student import StudentProfile
 from .supplements import load_supplement
-
-MAX_PAGE_IMAGES = 12
-PAGE_IMAGE_SCALE = 110 / 72
 
 
 def stable_source(value):
@@ -92,48 +88,62 @@ def document_chunks(reader, doc_id, *, source_kind, title, url):
     ]
 
 
-def attach_page_images(reader, settings, store, doc_id, chunks):
-    """Scanned worksheets need their pixels: OCR text can locate a question but not quote it."""
-    numbers = {}
-    for chunk in chunks:
-        match = re.match(r"第(\d+)页", chunk["locator"])
-        if match:
-            numbers.setdefault(int(match[1]), chunk)
-    if not numbers:
-        return chunks
+def attach_page_images(reader, settings, store, document, chunks, *, every_page):
+    """Pictures, charts and scans reach the model as page images; extracted text misses them.
+
+    Returns the chunks with `image_path` set on each rendered page, plus a warning or None.
+    A page with no extracted text at all gets a chunk of its own so its image has a home.
+    """
+    name = document.get("source") or ""
+    if not renderable(name) or not chunks:
+        return chunks, None
 
     def render(key):
-        destination = settings.data_dir / "processed" / key[:24]
-        destination.mkdir(parents=True, exist_ok=True)
-        try:
-            with pdfium.PdfDocument(reader.document_source(doc_id)) as document:
-                pages = {}
-                for number in sorted(numbers)[:MAX_PAGE_IMAGES]:
-                    if number > len(document):
-                        continue
-                    image = destination / f"page-{number:04d}.png"
-                    page = document[number - 1]
-                    try:
-                        bitmap = page.render(scale=PAGE_IMAGE_SCALE)
-                        try:
-                            bitmap.to_pil().save(image)
-                        finally:
-                            bitmap.close()
-                    finally:
-                        page.close()
-                    pages[str(number)] = str(image)
-        except pdfium.PdfiumError:
-            return {"pages": {}, "artifacts": []}
+        rendered = page_images(
+            reader.document_source(document["id"]),
+            name,
+            settings.data_dir / "processed" / key[:24],
+            settings.data_dir / "office",
+            every_page=every_page,
+        )
         return {
-            "pages": pages,
-            "artifacts": [artifact(Path(path)) for path in pages.values()],
+            "pages": {str(number): str(path) for number, path in rendered.items()},
+            "artifacts": [artifact(path) for path in rendered.values()],
         }
 
-    identity = [doc_id, fingerprint([c["text"] for c in chunks]), PAGE_IMAGE_SCALE]
-    rendered = store.memo("kb-pages", identity, render)["pages"]
-    for number, path in rendered.items():
-        numbers[int(number)]["image_path"] = path
-    return chunks
+    identity = [
+        document["id"],
+        document.get("source_bytes"),
+        document.get("source_mtime"),
+        fingerprint([c["text"] for c in chunks]),
+        every_page,
+        RENDER_VERSION,
+        LONG_EDGE,
+    ]
+    try:
+        rendered = store.memo("kb-pages", identity, render)["pages"]
+    except WorkflowError as exc:
+        return chunks, str(exc)
+    unit = "张" if Path(name).suffix.lower() in SLIDE_TYPES else "页"
+    first = {}
+    for chunk in chunks:
+        match = re.match(r"第(\d+)[页张]", chunk["locator"])
+        if match:
+            first.setdefault(int(match[1]), chunk)
+    template = chunks[0]
+    for number, path in sorted(rendered.items(), key=lambda item: int(item[0])):
+        if int(number) in first:
+            first[int(number)]["image_path"] = path
+        else:
+            chunks.append(
+                {
+                    **{k: template[k] for k in ("source_kind", "title", "url")},
+                    "locator": f"第{number}{unit} · 页面图片",
+                    "text": "（这一页没有可提取的文字，内容见页面图片。）",
+                    "image_path": path,
+                }
+            )
+    return chunks, None
 
 
 def sync_course(
@@ -263,6 +273,7 @@ def sync_course(
             }
         )
     linked_docs = set()
+    course_documents = {d["id"]: d for d in reader.documents(course_id)}
     for number, (file_id, reference) in enumerate(attachments.items(), 1):
         name = str(reference.get("title") or "课程附件")[:200]
         report(
@@ -294,10 +305,7 @@ def sync_course(
                 }
             )
             continue
-        document = next(
-            (d for d in reader.documents(course_id) if d["id"] == found["doc"]),
-            {"kind": "document"},
-        )
+        document = course_documents.get(found["doc"], {"id": found["doc"], "kind": "document"})
         chunks = document_chunks(
             reader,
             found["doc"],
@@ -305,15 +313,24 @@ def sync_course(
             title=name,
             url=reference.get("alternateLink"),
         )
-        if any(
-            origin.get("assignment_id") in selected for origin in origins.get(file_id, [])
-        ) and str(document.get("source", "")).lower().endswith(".pdf"):
-            chunks = attach_page_images(reader, settings, store, found["doc"], chunks)
+        # Every page of the assignment's own files; elsewhere only picture-heavy pages.
+        chunks, problem = attach_page_images(
+            reader,
+            settings,
+            store,
+            document,
+            chunks,
+            every_page=any(
+                origin.get("assignment_id") in selected for origin in origins.get(file_id, [])
+            ),
+        )
+        if problem:
+            warnings.append({"source": "file:" + file_id, "title": name, "error": problem})
         source_id = "file:" + file_id
         store.replace_chunks(course_id, source_id, fingerprint(chunks), chunks)
         readable.add(source_id)
     # Lecture videos and notes in the knowledge base usually belong to no Classroom attachment.
-    for document in reader.documents(course_id):
+    for document in course_documents.values():
         if document["kind"] == "post" or document["id"] in linked_docs:
             continue
         if document["status"] != "ready":
@@ -332,6 +349,13 @@ def sync_course(
             title=document["title"],
             url=document.get("url"),
         )
+        chunks, problem = attach_page_images(
+            reader, settings, store, document, chunks, every_page=False
+        )
+        if problem:
+            warnings.append(
+                {"source": "kb:" + document["id"], "title": document["title"], "error": problem}
+            )
         source_id = "kb:" + document["id"]
         store.replace_chunks(course_id, source_id, fingerprint(chunks), chunks)
         readable.add(source_id)
