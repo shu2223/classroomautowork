@@ -248,3 +248,84 @@ def test_template_export_is_ready_for_review_without_claiming_personal_confirmat
         ]
         == "needs_user"
     )
+
+
+def test_model_markdown_becomes_a_clean_japanese_report(tmp_path):
+    package = verified_package(tmp_path)
+    draft = (
+        "# 第二回課題　調査と考察\n\n"
+        "学科：ファッション社会　クラス：D　学籍番号：00XX000　氏名：TEST\n\n"
+        "## 1．調査した事実\n\n"
+        "### (1) VUCA\n"
+        "**用語の意味**\n"
+        "VUCAは**変動性**などの頭文字である。`Volatility` と [資料](https://example.com) 参照。\n\n"
+        "- 一つ目の*要点*\n- 二つ目の要点\n\n"
+        "1. 計画\n2) 実行\n\n"
+        "> 引用された一文\n\n"
+        "---\n\n"
+        "**結論**：短くまとめる。"
+    )
+    blocks = answer_blocks(draft)
+    kinds = [(b["kind"], b.get("level")) for b in blocks]
+    assert kinds[:6] == [
+        ("heading", 1),
+        ("paragraph", 0),
+        ("heading", 2),
+        ("heading", 3),
+        ("heading", 4),
+        ("paragraph", 0),
+    ]
+    assert blocks[5]["runs"][1] == {"text": "変動性", "bold": True}
+    assert blocks[6]["kind"] == "list" and not blocks[6]["ordered"]
+    assert [item["number"] for item in blocks[7]["items"]] == [1, 2]
+    (package / "draft.md").write_text(draft, encoding="utf-8")
+    receipt_path = package / "review-receipt.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["draft_sha256"] = sha256_file(package / "draft.md")
+    atomic_json(receipt_path, receipt)
+    create_answer_document(package)
+    document = Document(package / "answer.docx")
+    section = document.sections[0]
+    assert (round(section.page_width.cm, 1), round(section.page_height.cm, 1)) == (21.0, 29.7)
+    paragraphs = document.paragraphs
+    text = "\n".join(p.text for p in paragraphs)
+    page = (package / "answer.html").read_text(encoding="utf-8")
+    for marker in ("**", "##", "`", "](", "> ", "---"):
+        assert marker not in text and marker not in page.split("</style>")[1]
+    styles = {p.text: p.style.name for p in paragraphs}
+    assert styles["1．調査した事実"] == "Heading 1"
+    assert styles["(1) VUCA"] == "Heading 2"
+    assert styles["用語の意味"] == "Heading 3"
+    assert styles["一つ目の要点"] == "List Bullet"
+    assert "1. 計画" in text and "2. 実行" in text
+    body = next(p for p in paragraphs if p.text.startswith("VUCAは"))
+    assert [r.text for r in body.runs if r.bold] == ["変動性"]
+    assert body.paragraph_format.first_line_indent is not None
+    identity = next(p for p in paragraphs if p.text.startswith("学科"))
+    assert identity.alignment == 2  # right
+    fonts = document.styles["Heading 1"].element.rPr.rFonts
+    assert not [k for k in fonts.attrib if k.lower().endswith("theme")]
+    assert "<strong>変動性</strong>" in page and "<ul><li>" in page
+
+
+def test_stray_markdown_and_html_never_reach_the_report():
+    from classroomautowork.answer_document import plain_answer_text
+
+    draft = (
+        "##見出し\n本文<br>二行目、<b>強調</b>と<u>下線</u>と~~削除~~[^1]。\n\n"
+        "小見出し\n---\n\n- 項目\n  - 入れ子\n\n[^1]: 注の本文"
+    )
+    blocks = answer_blocks(draft)
+    assert [(b["kind"], b.get("level")) for b in blocks] == [
+        ("heading", 2),
+        ("paragraph", 0),
+        ("heading", 3),
+        ("list", None),
+        ("paragraph", 0),
+    ]
+    assert blocks[1]["text"] == "本文\n二行目、強調と下線と削除。"
+    assert [r["text"] for r in blocks[1]["runs"] if r["bold"]] == ["強調"]
+    assert [item["text"] for item in blocks[3]["items"]] == ["項目", "入れ子"]
+    for value in ("TEST NAME", "00XX000", "　一字下げの回答。", "1. 計画\n2. 実行", "A*B*C ※注"):
+        assert plain_answer_text(value) == value
+    assert plain_answer_text("> **答**：`x`\n\n\n\n- 一\n---") == "答：x\n\n一"

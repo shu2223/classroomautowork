@@ -159,7 +159,8 @@ tr:last-child td { border-bottom: 0; }
 .actions { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
 .note-box { display: grid; gap: 4px; padding: 8px 10px; border-radius: 7px; background: var(--warning-wash); color: var(--warning-ink); font-size: 12px; }
 .panel-content { border-top: 1px solid var(--hairline); padding-top: 10px; font-size: 13px; overflow-wrap: anywhere; }
-.panel-content .answer p { margin: 0 0 8px; line-height: 1.7; }
+.panel-content .answer p { margin: 0 0 8px; line-height: 1.7; white-space: pre-line; }
+.panel-content .answer ul, .panel-content .answer ol { margin: 0 0 8px; padding-left: 1.6em; line-height: 1.7; }
 .panel-content .answer h1, .panel-content .answer h2, .panel-content .answer h3 { font-size: 14px; margin: 12px 0 6px; }
 .panel-content .answer table td { border: 1px solid var(--hairline); padding: 4px 6px; }
 .source { padding: 8px 0; border-top: 1px solid var(--hairline); display: grid; gap: 4px; }

@@ -114,6 +114,7 @@ function durationLabel(ms) {
 // End pure presentation.
 
 function node(tag, text, className) { const el = document.createElement(tag); if (text !== undefined && text !== null) el.textContent = text; if (className) el.className = className; return el; }
+function inlineRuns(tag, block) { const el = node(tag); for (const run of block.runs || [{text: block.text}]) el.append(run.bold ? node("strong", run.text) : document.createTextNode(run.text || "")); return el; }
 function button(text, className, handler) { const b = node("button", text, className); b.type = "button"; b.addEventListener("click", handler); return b; }
 function safeLink(url, text, className) {
   try {
@@ -466,7 +467,8 @@ function renderPanelTab() {
     const box = node("div", undefined, "answer");
     if (data.answer_document?.blocks?.length) for (const block of data.answer_document.blocks) {
       if (block.kind === "table") { const table = node("table"); for (const values of block.rows) { const tr = node("tr"); for (const value of values) tr.append(node("td", value)); table.append(tr); } box.append(table); }
-      else box.append(node(block.kind === "heading" ? `h${Math.min(block.level || 2, 3)}` : "p", block.text));
+      else if (block.kind === "list") { const list = node(block.ordered ? "ol" : "ul"); for (const item of block.items || []) { const li = inlineRuns("li", item); if (item.number != null) li.value = item.number; list.append(li); } box.append(list); }
+      else box.append(block.kind === "heading" ? node(`h${Math.min(block.level || 2, 3)}`, block.text) : inlineRuns("p", block));
     }
     else if (data.text["draft.md"]) box.append(node("pre", data.text["draft.md"]));
     else box.append(node("p", g?.status === "not_invoked" ? "这次没有调用 AI，只整理了题目和资料。" : "还没有通过核验的答案。", "muted"));

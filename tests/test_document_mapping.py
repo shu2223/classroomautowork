@@ -63,3 +63,23 @@ def test_missing_mapping_gets_one_same_model_repair_and_retains_usable_candidate
     assert all(x["model"] == "chosen-model" for x in calls)
     assert receipt["draft_sha256"] == "candidate-hash"
     assert receipt["generation"]["document_mapping_complete"] is repaired
+
+
+def test_markdown_in_native_document_answers_is_saved_as_plain_text(tmp_path):
+    package, generation, result = candidate_result(tmp_path)
+    form = inspect_form(native_document())
+    field = form["fields"][0]
+    result["document_answers"] = [
+        {
+            "document_id": form["document_id"],
+            "field_id": field["id"],
+            "context_sha256": field["context_sha256"],
+            "text": "## 回答\n**結論**：*重要*な点は`A`である。\n- 一つ目",
+        }
+    ]
+    receipt = drafting.accept_model_result(package, generation, result, json.dumps(result), [form])
+    saved = json.loads((package / "document-answers.json").read_text(encoding="utf-8"))
+    assert saved["answers"][0]["text"] == "回答\n結論：重要な点はAである。\n一つ目"
+    assert receipt["generation"]["plain_text_fields"] == [field["id"]]
+    raw = json.loads((package / "model-result.json").read_text(encoding="utf-8"))
+    assert raw["document_answers"][0]["text"].startswith("## 回答\n**結論**")

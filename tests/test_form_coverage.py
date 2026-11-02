@@ -358,3 +358,38 @@ def test_user_answer_resolves_missing_native_mapping_without_regeneration(tmp_pa
     assert resolved["form_mapping_complete"]
     assert not resolved["forms"][0]["remaining_answer_fields"]
     assert resolved["forms"][0]["prefilled_fields"] == 2
+
+
+def test_prompt_sets_report_style_and_a_word_safe_draft_format(tmp_path):
+    package, _, _ = candidate_result(tmp_path)
+    manifest = json.loads((package / "manifest.json").read_text(encoding="utf-8"))
+    skill = tmp_path / "skill"
+    (skill / "references").mkdir(parents=True)
+    (skill / "SKILL.md").write_text("Offline skill", encoding="utf-8")
+    (skill / "references/review-format.md").write_text("Offline format", encoding="utf-8")
+    prompt = drafting.build_input(package, skill, manifest)[0][0]["text"]
+    assert "文末统一为だ・である调" in prompt and "お客さん写作客或顧客" in prompt
+    assert "不使用**粗体**" in prompt and "'#### '" in prompt
+    assert "form_answers.values 是直接填入原栏的纯文本" in prompt
+
+
+def test_markdown_in_free_text_form_answers_is_prefilled_as_plain_text(tmp_path):
+    package, generation, result, form = form_candidate(tmp_path)
+    free = next(
+        field["entry_id"]
+        for question in form["questions"]
+        for field in question["fields"]
+        if not field["choices"]
+    )
+    choice = next(
+        field for question in form["questions"] for field in question["fields"] if field["choices"]
+    )
+    result["form_answers"] = [
+        answer(form, free, ["**UNIT**"]),
+        answer(form, choice["entry_id"], [choice["choices"][0]]),
+    ]
+    receipt = drafting.accept_model_result(package, generation, result, json.dumps(result))
+    saved = json.loads((package / "form-answers.json").read_text(encoding="utf-8"))
+    values = {x["entry_id"]: x["values"] for x in saved["answers"]}
+    assert values[free] == ["UNIT"] and values[choice["entry_id"]] == [choice["choices"][0]]
+    assert receipt["generation"]["plain_text_fields"] == [free]

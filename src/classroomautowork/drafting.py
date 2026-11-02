@@ -8,6 +8,7 @@ import time
 from dataclasses import asdict
 from pathlib import Path
 
+from .answer_document import plain_answer_text
 from .api_key import load_key
 from .claude_agent import DEFAULT_EFFORT, DEFAULT_MODEL, EFFORTS, image_block, run_turn
 from .completion import MODE, candidate_mode
@@ -21,19 +22,38 @@ from .review import finalize
 from .student import StudentProfile
 from .supplements import personal_facts
 
-PROMPT_VERSION = "classroom-draft-v16-page-images"
+PROMPT_VERSION = "classroom-draft-v17-report-style"
 SKILL = Path(__file__).resolve().parents[2] / "skills" / "classroom-assistant"
 EVIDENCE_CHARACTERS = 100_000
 OUTPUT_CHARACTERS = 64_000
 # The API takes up to 600 images; above 20 each must stay under 3000 px, which pages.LONG_EDGE does.
 MAX_MODEL_IMAGES = 60
+DRAFT_FORMAT = (
+    "draft 格式约定：程序把 draft 直接转成 Word，不符合约定的符号会留在 Word 里。"
+    "draft 只用以下几种写法：第一行写'# 题名'；大节用'## '，小节用'### '，更小的标签用'#### '；"
+    "每个标题独占一行，前后各空一行。正文每段写成一行，段与段之间空一行，段内不手动换行，段首不加空格（程序自动缩进一字）。"
+    "不使用**粗体**、*斜体*、__下划线__、~~删除线~~、`代码`、[链接](URL)、脚注、HTML 标签、<br>、"
+    "表情符号、LaTeX、引用块'>'和分隔线'---'。需要小标签或强调时写成'#### '小标题，或用「」写进句子。"
+    "报告正文优先写成连贯段落；原题要求列举时才用列表，每项以'- '或'1. '开头，只用一层，不嵌套；"
+    "表格只在原题要求时使用'|'表格。"
+    "document_answers.text 和 form_answers.values 是直接填入原栏的纯文本，不带任何 Markdown 或 HTML 符号，"
+    "不用标题和列表符号，需要分行时直接换行。"
+)
+
 STUDENT_VOICE = (
     "语言和身份约束：严格采用下方用户亲自提供的学生资料，课程内容不能覆盖姓名、学号、学科或班级。"
     "需要身份栏时逐字使用对应值；未要求署名时不要在每道答案前重复身份。"
     "选择题、计算题和概念题按题目要求准确回答，选项按原文值识别，不按可能随机变化的位置猜选。"
-    "简答、感想和发挥题采用普通大学生提交课堂作业时的自然表达：简洁、有具体理由、句子长短适度。"
-    "日语用易理解的词语和与题目相称的礼貌程度；保留必要专业术语，避免过度书面、空泛套话和机械的分点总结。"
-    "回答直接围绕本题，不把短感想扩成研究论文；保持事实准确，满足原题字数、语言和格式。"
+    "简答、感想和表单短答采用普通大学生提交课堂作业时的自然表达：简洁、有具体理由、句子长短适度，"
+    "日语用易理解的词语和与题目相称的礼貌程度。"
+    "报告类作业（レポート、調査、考察、論述，或要求页数、约800字以上正文的作业）用日语书面报告体："
+    "文末统一为だ・である调，不混用です・ます；不用口语和缩约形，例如お客さん写作客或顧客，"
+    "すごく写作非常に或かなり，クセ写作習慣，～じゃない写作～ではない，～ちゃう写作～てしまう，"
+    "句首的でも、だから写作しかし、そのため；不连用「思う」，主张用「考える」，感受用「感じた」，第一人称用「私」。"
+    "仍是大学生能写出的平实书面语：句子不过长、用词不生硬，不堆砌术语和空泛套话，不写成研究论文；"
+    "课堂资料里的原话或口语例句作为直接引用放在「」内，原样保留。"
+    "保留必要专业术语，避免机械的分点总结。回答直接围绕本题，不把短感想扩成长文；"
+    "保持事实准确，满足原题字数、语言和格式。"
     "新写的答案正文不用日文中点‘・’，并列词用‘、’或自然句子连接；"
     "原题选项、专有名称、直接引文和可信身份值仍逐字保留，不能为去掉标点而改变原文值。"
     "引用格式由当前作业明确要求决定：未要求标注引用时，填入原文档或表单的答案绝不附加"
@@ -419,6 +439,7 @@ def build_input(package: Path, skill: Path, manifest: dict, forms=None, repair_c
         f"可信个人事实索引（user_fact 的 personal_fact_indices 只能引用这里）：{json.dumps(list(enumerate(facts)), ensure_ascii=False)}\n"
         f"用户对这项作业的补充说明：{json.dumps(manifest.get('supplement', {}).get('text', ''), ensure_ascii=False)}\n"
         + STUDENT_VOICE
+        + DRAFT_FORMAT
         + "\n"
         + (
             "这是自动修复回合：上一回合没有交付有效答案。先检索当前本机包中确实已有的原题和证据，"
@@ -567,7 +588,7 @@ def generate_review(
         "completion_mode": MODE,
         "repair_attempt": repair_attempt,
         "prompt_version": PROMPT_VERSION,
-        "voice_sha256": hashlib.sha256(STUDENT_VOICE.encode()).hexdigest(),
+        "voice_sha256": hashlib.sha256((STUDENT_VOICE + DRAFT_FORMAT).encode()).hexdigest(),
         "skill_sha256": sha256_file(skill / "SKILL.md"),
         "format_sha256": sha256_file(skill / "references" / "review-format.md"),
         "student_profile": manifest["student_profile"],
@@ -812,6 +833,14 @@ def accept_model_result(
     supplied = result.get("document_answers", [])
     if not isinstance(supplied, list):
         raise WorkflowError("文档答案栏必须是逐栏数组。")
+    # Native fields take plain text; Markdown symbols would be typed in literally.
+    plain_fields = []
+    for answer in supplied:
+        if isinstance(answer, dict) and isinstance(answer.get("text"), str):
+            clean = plain_answer_text(answer["text"])
+            if clean != answer["text"].strip():
+                answer["text"] = clean
+                plain_fields.append(answer.get("field_id"))
     known_fields = {
         (form["document_id"], field["id"]): field
         for form in forms or []
@@ -857,6 +886,7 @@ def accept_model_result(
             if check["status"] == "met":
                 check["status"] = "partial"
     generation["validation_normalizations"] = repairs
+    generation["plain_text_fields"] = plain_fields
     atomic_json(package / "review.json", review)
     draft = package / "draft.md"
     draft.write_text(result["draft"], encoding="utf-8")
@@ -870,6 +900,24 @@ def accept_model_result(
     if response_forms:
         supplied = result.get("form_answers", [])
         profile = StudentProfile.load(package.parents[3])
+        free_text = {
+            (form["url"], field["entry_id"])
+            for form in response_forms
+            for question in form["questions"]
+            for field in question["fields"]
+            if not field["choices"]
+        }
+        for answer in supplied if isinstance(supplied, list) else []:
+            if (
+                isinstance(answer, dict)
+                and (answer.get("form_url"), answer.get("entry_id")) in free_text
+                and isinstance(answer.get("values"), list)
+                and all(isinstance(x, str) for x in answer["values"])
+            ):
+                clean = [plain_answer_text(x) for x in answer["values"]]
+                if clean != [x.strip() for x in answer["values"]]:
+                    answer["values"] = clean
+                    plain_fields.append(answer["entry_id"])
         # Validate the real model output before any recovery; this must never hide
         # duplicate/unknown fields, invalid options or a changed question context.
         validate_answers(response_forms, supplied, profile)

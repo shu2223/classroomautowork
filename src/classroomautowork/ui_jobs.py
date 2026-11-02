@@ -538,6 +538,15 @@ class FrontendJobs:
                     if valid_answer_document(package):
                         recovered = True
                         continue
+                    # A newer export format only re-renders the verified draft; no AI call.
+                    try:
+                        document = create_answer_document(package)
+                    except WorkflowError:
+                        pass
+                    else:
+                        self._item(job_id, item, answer_document=document)
+                        recovered = True
+                        continue
                 if item.get("status") != "failed" or not item.get("package"):
                     continue
                 package = self.package_path(job_id, item_key(item))
