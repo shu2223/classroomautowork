@@ -973,10 +973,16 @@ class FrontendJobs:
                 materials = sum(x["status"] == "materials_ready" for x in job["items"])
                 local_ready = sum(x["status"] == "ready" for x in job["items"])
                 failed = sum(x["status"] == "failed" for x in job["items"])
-                self._log(
-                    job_id,
-                    f"处理结束：{ready} 项原文档已填入，{form_opened} 项已打开自动预填原表单，{local_ready} 项本机答案，{materials} 项资料包，{needs} 项填写提示，{failed} 项失败；打开答案审阅，待确认项一并核对，提交由你操作",
-                )
+                counts = [
+                    (local_ready, "项答案可审阅"),
+                    (form_opened, "项预填表单已准备"),
+                    (ready, "项已填入原文档"),
+                    (needs, "项待补充"),
+                    (materials, "项只整理了资料"),
+                    (failed, "项失败"),
+                ]
+                summary = "，".join(f"{count} {label}" for count, label in counts if count)
+                self._log(job_id, f"处理结束：{summary or '没有可处理的作业'}。提交由你操作。")
             with self._lock:
                 job["status"] = status
         except RunCancelled as exc:

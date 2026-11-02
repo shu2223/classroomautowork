@@ -1,57 +1,152 @@
 <!doctype html>
 <html lang="zh-CN">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Classroom · 作业助手</title><link rel="stylesheet" href="style.css"><script src="app.js" defer></script></head>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>作业助手</title>
+<link rel="stylesheet" href="style.css">
+<script src="app.js" defer></script>
+</head>
 <body>
-<svg class="sprite" aria-hidden="true"><defs>
-<symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 7v5h-5M4 17v-5h5M5.2 7a8 8 0 0 1 13-2L20 8M4 16l1.8 3a8 8 0 0 0 13-2"/></symbol>
-<symbol id="i-book" viewBox="0 0 24 24"><path d="M5 3h14v18H5a2 2 0 0 1 0-4h14M5 3a2 2 0 0 0-2 2v14M8 7h7M8 11h5"/></symbol>
-<symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></symbol>
-<symbol id="i-spark" viewBox="0 0 24 24"><path d="m12 3 2.8 6.2L21 12l-6.2 2.8L12 21l-2.8-6.2L3 12l6.2-2.8L12 3Z"/></symbol>
-<symbol id="i-search" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></symbol>
-<symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></symbol>
-<symbol id="i-arrow" viewBox="0 0 24 24"><path d="M5 12h14m-5-5 5 5-5 5"/></symbol>
-<symbol id="i-settings" viewBox="0 0 24 24"><path d="M4 7h16M4 17h16"/><circle cx="9" cy="7" r="3"/><circle cx="15" cy="17" r="3"/></symbol>
-<symbol id="i-close" viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></symbol>
-</defs></svg>
-<div class="shell">
-<header class="workspace-header">
-  <div class="brand"><span class="brand-mark"><svg class="icon"><use href="#i-book"/></svg></span><div>Classroom<span>本机作业助手</span></div></div>
-  <nav class="workspace-nav" aria-label="工作台"><button id="navPending" class="nav-item active">待完成 <span id="navCount" class="nav-count">—</span></button><button id="navResults" class="nav-item">待审阅 <span id="readyCount" class="nav-count">0</span></button></nav>
-  <div class="workspace-tools"><button id="navHistory" class="text-button">处理记录</button><button id="openSettings" class="button secondary small-button"><svg class="icon"><use href="#i-settings"/></svg>设置</button></div>
-</header>
-<main>
-<div id="notice" class="notice" hidden></div>
-<section id="shutdownControl" class="shutdown-control" aria-label="自动关机" hidden>
-  <label class="shutdown-switch"><input id="shutdownEnabled" type="checkbox" role="switch" aria-describedby="shutdownNote" disabled><span class="switch-track" aria-hidden="true"></span><span>完成后自动关机</span></label>
-  <p id="shutdownNote" class="shutdown-note" role="status">本次任务全部成功后倒计时 60 秒，可随时取消。</p>
-  <button id="shutdownCancel" class="button secondary small-button" hidden>取消自动关机</button>
-</section>
-<section id="pendingView">
-  <div class="page-heading"><div><h1>一键完成待办作业</h1><p>读取课堂资料、生成答案、自动填写。完成后打开结果检查，再由你提交。</p></div><button id="refreshButton" class="button secondary"><svg class="icon"><use href="#i-refresh"/></svg><span>刷新作业</span></button></div>
-  <section id="jobPanel" class="job-panel" hidden aria-live="polite"></section>
-  <section class="assignment-section">
-    <div class="section-title"><div><h2>待完成 <span id="visibleCount" class="count-pill">0</span></h2><span id="refreshTime" class="muted small">正在读取本机列表…</span></div><button id="clearFilters" class="text-button small" hidden>重置筛选</button></div>
-    <div class="filters"><label class="date-filter"><span>截止至</span><input id="dateFilter" type="date" aria-label="包含当天的截止日期筛选"></label><select id="courseFilter" aria-label="课程筛选"><option value="">全部课程</option></select><label class="search-box"><svg class="icon"><use href="#i-search"/></svg><input id="searchInput" type="search" placeholder="搜索作业" aria-label="搜索作业或课程"></label><button id="hideOverdue" class="filter-toggle" aria-pressed="false">隐藏已逾期</button><label class="checkbox-label no-due"><input id="includeNoDue" type="checkbox" checked>无截止日期</label></div>
-    <div class="list-toolbar"><label class="checkbox-label"><input id="selectAll" type="checkbox">自己选择</label><span id="listHint" class="muted small">不勾选时，处理当前列表；已有答案自动跳过。</span></div>
-    <div id="assignmentList" class="assignment-list"><div class="empty-state"><h3>正在读取作业列表</h3><p>本机记录会先显示，刷新可同步课堂最新状态。</p></div></div>
+<main class="page">
+  <header class="top">
+    <div>
+      <p class="small"><a class="back" id="homeLink" href="/">← 主页</a></p>
+      <h1>作业助手</h1>
+      <p class="muted small" id="subtitle">正在读取…</p>
+    </div>
+    <div class="toolbar">
+      <select id="modelSelect" aria-label="作答模型"><option>读取中…</option></select>
+      <select id="effortSelect" aria-label="推理强度"></select>
+      <button id="refreshButton" class="btn" type="button">刷新</button>
+      <button id="generateButton" class="btn primary" type="button">完成所选</button>
+      <button id="openSettings" class="btn icon" type="button" aria-label="设置" title="设置"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 17h16"/><circle cx="9" cy="7" r="2.5"/><circle cx="15" cy="17" r="2.5"/></svg></button>
+    </div>
+  </header>
+
+  <ul id="issues" class="issues" hidden></ul>
+
+  <section id="jobCard" class="card job" aria-live="polite" hidden></section>
+
+  <div id="workspace" class="workspace">
+    <section class="card" aria-labelledby="listTitle">
+      <h2 id="listTitle" class="sr-only">待办作业</h2>
+      <div class="card-head">
+        <div id="filters" class="filters" role="group" aria-label="按状态筛选"></div>
+        <div class="list-tools">
+          <select id="courseFilter" aria-label="按课程筛选"></select>
+          <input id="searchInput" type="search" placeholder="搜索作业或课程" aria-label="搜索作业或课程">
+        </div>
+      </div>
+      <div class="scroll-x">
+        <table class="assignments">
+          <colgroup><col class="check"><col class="due"><col><col class="state"></colgroup>
+          <thead><tr><th><input id="selectAll" type="checkbox" aria-label="全选当前列表"></th><th class="due">截止</th><th>作业</th><th>状态</th></tr></thead>
+          <tbody id="assignmentList"></tbody>
+        </table>
+      </div>
+      <div class="list-foot small muted">
+        <span id="listHint"></span>
+        <button id="clearSelection" class="link small" type="button" hidden>清除勾选</button>
+      </div>
+      <details id="discoveryDetails" class="small" hidden>
+        <summary id="discoverySummary"></summary>
+        <div id="discoveryContent"></div>
+      </details>
+    </section>
+
+    <aside id="panel" class="card panel" aria-labelledby="panelTitle" hidden>
+      <div class="panel-head">
+        <div>
+          <h2 id="panelTitle"></h2>
+          <p id="panelMeta" class="muted small"></p>
+        </div>
+        <button id="closePanel" class="btn icon" type="button" aria-label="关闭答案面板"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button>
+      </div>
+      <div id="panelActions" class="actions"></div>
+      <div id="panelNotes"></div>
+      <div id="panelTabs" class="filters" role="tablist" aria-label="答案内容"></div>
+      <div id="panelContent" class="panel-content" role="tabpanel"></div>
+    </aside>
+  </div>
+
+  <section class="card" aria-labelledby="historyTitle">
+    <details id="historyDetails">
+      <summary><h2 id="historyTitle" class="inline-heading">最近处理</h2> <span id="historyCount" class="muted small"></span></summary>
+      <ol id="historyList" class="history"></ol>
+    </details>
   </section>
-  <details id="discoveryDetails" class="discovery-details" hidden><summary id="discoverySummary"></summary><div id="discoveryContent"></div></details>
-</section>
-<section id="resultsView" hidden><div class="page-heading"><div><h1>答案在这里。</h1><p>直接打开已填文档、原表单或 Word，检查后手动提交。</p></div></div><div id="resultsList" class="assignment-section"></div></section>
-<section id="historyView" hidden><div class="page-heading"><div><h1>处理记录</h1><p>模型会话、缓存和详细日志都保存在这里。</p></div></div><div id="historyList" class="history-list"></div></section>
-<footer class="selection-bar"><div class="selection-summary"><span id="selectedCount" class="selected-number">0</span><div><strong id="selectionLabel">项将自动完成</strong><button id="clearSelection" class="text-button small" hidden>改为当前列表</button><span id="selectionHint" class="muted small">按截止时间优先处理</span></div></div><div class="selection-actions"><button id="modelShortcut" class="text-button model-shortcut">读取模型…</button><button id="generateButton" class="button primary" disabled><svg class="icon"><use href="#i-spark"/></svg><span>一键完成</span><svg class="icon"><use href="#i-arrow"/></svg></button></div></footer>
 </main>
-</div>
-<dialog id="settingsDialog" class="policy-dialog settings-dialog" aria-labelledby="settingsTitle"><div class="dialog-heading"><div><h2 id="settingsTitle">处理设置</h2><p class="muted small">选择会保留，下次直接开始。</p></div><button class="icon-button close-dialog" aria-label="关闭设置"><svg class="icon"><use href="#i-close"/></svg></button></div><div class="policy-fields">
-<section class="ai-choice"><label class="checkbox-label"><input id="aiConfirmed" type="checkbox">使用 AI 完成作业</label><span id="aiChoiceNote" class="muted small"></span></section>
-<section class="model-settings"><div><strong>作答模型</strong><span id="modelStatus" class="muted small">正在读取本机模型…</span></div><label>模型<select id="modelSelect" aria-label="做作业使用的 Claude 模型" disabled><option>读取中…</option></select></label><label>推理强度<select id="effortSelect" aria-label="Claude 推理强度" disabled></select></label><button id="reloadModels" class="text-button small">重新读取模型</button></section>
-<section class="permission-setting api-key-setting"><strong>Claude API 密钥</strong><p id="apiKeyStatus" class="muted small" role="status">正在读取…</p><form id="apiKeyForm" class="api-key-form"><input id="apiKeyInput" type="password" autocomplete="off" spellcheck="false" placeholder="sk-ant-…" aria-label="新的 Claude API 密钥" required><button class="button secondary small-button" type="submit">保存</button><button id="apiKeyClear" type="button" class="text-button small">删除</button></form><p class="muted small">按 API 用量计费。保存前会向 Anthropic 验证；保存后不再显示完整密钥。</p></section>
-<label class="checkbox-label media-option" hidden><input id="processMedia" type="checkbox" checked></label>
-<section class="permission-setting" hidden><strong>自动填写个人文档</strong><p id="documentPermissionNote" class="muted small"></p><button id="authorizeDocuments" class="button secondary small-button">启用自动填入</button></section>
-<div class="account-setting"><span id="accountEmail" class="muted small"></span><button id="quitButton" class="text-button small" hidden>退出助手</button></div>
-</div><div class="dialog-footer"><span class="muted small">设置自动保存 · 提交始终由你完成</span><button class="button primary close-dialog">完成</button></div></dialog>
+
+<dialog id="settingsDialog" aria-labelledby="settingsTitle">
+  <div class="dialog-body">
+    <div class="dialog-head"><h2 id="settingsTitle">设置</h2><button class="btn icon close-dialog" type="button" aria-label="关闭"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button></div>
+    <label class="inline"><input id="aiConfirmed" type="checkbox"> 使用 AI 作答</label>
+    <p class="muted small">关闭后只整理题目和资料，不调用 Claude。</p>
+    <div class="setting">
+      <strong>Claude API 密钥</strong>
+      <p id="apiKeyStatus" class="muted small" role="status">正在读取…</p>
+      <form id="apiKeyForm" class="inline">
+        <input id="apiKeyInput" type="password" autocomplete="off" spellcheck="false" placeholder="sk-ant-…" aria-label="新的 Claude API 密钥" required>
+        <button class="btn small" type="submit">保存</button>
+        <button id="apiKeyClear" class="link small" type="button">删除</button>
+      </form>
+      <p class="muted small">按 API 用量计费。保存前会向 Anthropic 验证；保存后不再显示完整密钥。</p>
+    </div>
+  </div>
+</dialog>
+
+<dialog id="policyDialog" aria-labelledby="policyTitle">
+  <form id="policyForm" class="dialog-body">
+    <div class="dialog-head"><div><h2 id="policyTitle">课程规则</h2><p class="muted small">只保存在小主机上，作答时传给模型。</p></div><button class="btn icon close-dialog" type="button" aria-label="关闭"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button></div>
+    <label class="field"><span>教师的 AI 规定</span>
+      <select id="policyUse"><option value="unknown">未知</option><option value="allowed">允许</option><option value="limited">有限度允许</option><option value="forbidden">禁止（仅记录，不阻止生成）</option></select></label>
+    <label class="field"><span>规定原文与来源</span><textarea id="policyEvidence" rows="3"></textarea></label>
+    <label class="field"><span>允许的用途（有限度允许时必填）</span><textarea id="policyLimits" rows="2"></textarea></label>
+    <label class="field"><span>需要附上的 AI 使用说明</span><textarea id="policyDisclosure" rows="2"></textarea></label>
+    <label class="field"><span>你的真实个人事实（每行一项，这门课所有作业都会用到）</span><textarea id="personalFacts" rows="3"></textarea></label>
+    <p id="policyError" class="error" hidden></p>
+    <div class="dialog-foot"><button class="btn primary" type="submit">保存</button></div>
+  </form>
+</dialog>
+
+<dialog id="supplementDialog" aria-labelledby="supplementTitle">
+  <form id="supplementForm" class="dialog-body">
+    <div class="dialog-head"><div><h2 id="supplementTitle"></h2><p class="muted small">补充说明只用于这项作业。</p></div><button class="btn icon close-dialog" type="button" aria-label="关闭"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button></div>
+    <section id="answerInputsSection" hidden>
+      <strong>需要你填写的栏位</strong>
+      <p id="answerInputNote" class="muted small"></p>
+      <div id="answerInputs"></div>
+    </section>
+    <details id="extraSupplement" open>
+      <summary>补充说明与个人事实</summary>
+      <div class="dialog-body nested">
+        <label class="field"><span>对这项作业的补充说明</span><textarea id="supplementText" rows="4" placeholder="例如：第 2 题按课堂上讲的例子来写"></textarea></label>
+        <label class="field"><span>真实个人事实（每行一项）</span><textarea id="supplementFacts" rows="3" placeholder="例如：实际观看内容、调查记录"></textarea></label>
+      </div>
+    </details>
+    <div id="supplementQuestions" class="small"></div>
+    <details id="browserQuestionSection" class="small">
+      <summary>导入需要登录的表单题目</summary>
+      <div class="dialog-body nested">
+        <p class="muted">需要学校登录的表单无法匿名读取题目。可在已登录的浏览器里取得题目数据后在这里导入；不会复制密码、cookies 或点击提交。</p>
+        <div id="restrictedFormLinks" class="actions"></div>
+        <label class="field"><span>原表单链接</span><input id="captureUrl" type="url"></label>
+        <label class="field"><span>题目数据</span><textarea id="captureScript" rows="3"></textarea></label>
+        <div><button id="importQuestions" class="btn small" type="button">导入题目</button></div>
+      </div>
+    </details>
+    <label id="supplementAiRow" class="inline small"><input id="supplementAi" type="checkbox"> 使用 AI 重新作答</label>
+    <p id="supplementModel" class="muted small"></p>
+    <p id="supplementError" class="error" hidden></p>
+    <div class="dialog-foot">
+      <button id="saveSupplement" class="btn" type="button">只保存</button>
+      <button id="continueSupplement" class="btn primary" type="submit">保存并重做</button>
+    </div>
+  </form>
+</dialog>
+
 <div id="toast" class="toast" role="status" hidden></div>
-<dialog id="reviewDialog" class="review-dialog" aria-labelledby="reviewTitle"><div class="dialog-heading"><div><span id="reviewCourse" class="eyebrow"></span><h2 id="reviewTitle"></h2><span id="reviewStatus" class="muted small"></span></div><button class="icon-button close-dialog" aria-label="关闭审核预览"><svg class="icon"><use href="#i-close"/></svg></button></div><details class="details-options"><summary>题目、来源与处理详情</summary><div class="review-tabs" role="tablist"><button data-tab="assignment" class="active" role="tab">原要求</button><button data-tab="draft" role="tab">初稿</button><button data-tab="checklist" role="tab">检查表</button><button data-tab="questions" role="tab">待确认</button><button data-tab="evidence" role="tab">来源证据</button><button data-tab="warnings" role="tab">资料缺口</button><button data-tab="generation" role="tab">AI 记录</button></div></details><div id="reviewContent" class="review-content"></div><div class="dialog-footer"><span class="muted small">供你审阅 · 提交由你手动完成</span><button id="supplementButton" class="button secondary">调整答案或说明（可选）</button><button id="downloadAnswerButton" class="button primary" hidden>下载 Word 答案</button><button id="courseSettingsButton" class="text-button small">课程设置</button><button id="downloadButton" class="text-button small">下载辅助证据（可选）</button><button id="fillDocumentButton" class="button secondary" hidden>填入已有初稿</button><span id="originalDocumentAction"></span></div></dialog>
-<dialog id="policyDialog" class="policy-dialog" aria-labelledby="policyTitle"><form id="policyForm"><div class="dialog-heading"><div><span class="eyebrow">COURSE RULES</span><h2 id="policyTitle">课程 AI 规则</h2></div><button type="button" class="icon-button close-dialog" aria-label="关闭课程规则"><svg class="icon"><use href="#i-close"/></svg></button></div><div class="policy-fields"><p class="form-note">AI 使用确认只需勾选主界面选项。课程 AI 规定仅保留说明，不阻止勾选后的生成；个人事实仅按你提供的内容使用。</p><details><summary>教师具体规定（可选）</summary><label>AI 使用规定<select id="policyUse"><option value="unknown">尚未确认</option><option value="forbidden">禁止生成答案</option><option value="limited">有限度允许</option><option value="allowed">允许使用</option></select></label><label>规定原文与来源<textarea id="policyEvidence" rows="4" placeholder="填写真实规定，并注明课程文件、页码或公告来源"></textarea></label><label>允许的用途与限制<textarea id="policyLimits" rows="2" placeholder="例如：只允许讨论思路，不能生成完整答案"></textarea></label><label>课程要求的 AI 使用说明<textarea id="policyDisclosure" rows="2" placeholder="如没有明确要求可留空"></textarea></label></details><label>你提供的真实个人事实<span class="muted small">每行一项。没有记录时留空，不替你编造经历。</span><textarea id="personalFacts" rows="3" placeholder="例如：你实际观看、出席或调查的记录"></textarea></label><details class="processing-settings"><summary>附件处理上限</summary><p class="muted small">较大录像可适当调高上限；处理会占用更多时间和磁盘。</p><label>单个附件上限（MiB）<input id="attachmentBudget" type="number" min="0.00000095367431640625" max="19073.486328125" step="any" required></label><label>单份 PDF 页数上限<input id="pdfBudget" type="number" min="1" max="5000" step="1" required></label></details><div id="policyError" class="form-error" hidden></div></div><div class="dialog-footer"><span class="muted small">保存在本机私人课程配置</span><button class="button primary" type="submit">保存课程规则</button></div></form></dialog>
-<dialog id="supplementDialog" class="policy-dialog" aria-labelledby="supplementTitle"><form id="supplementForm"><div class="dialog-heading"><div><span class="eyebrow">可选：调整这项作业</span><h2 id="supplementTitle">调整答案或说明（可选）</h2></div><button type="button" class="icon-button close-dialog" aria-label="关闭补充"><svg class="icon"><use href="#i-close"/></svg></button></div><div class="policy-fields"><section id="answerInputsSection" class="answer-inputs" hidden><h3>审阅时可核对的原题信息</h3><p id="answerInputNote" class="small muted"></p><div id="answerInputs"></div></section><details id="extraSupplement"><summary>补充其他说明或资料</summary><div id="supplementQuestions" class="form-note"></div><label>补充说明<textarea id="supplementText" rows="6" maxlength="60000" placeholder="填写缺少的内容、网站链接或你对这项作业的要求"></textarea></label><label>你的真实个人记录<span class="muted small">每行一项，仅用于这项作业。AI 的候选回答不属于你的经历。</span><textarea id="supplementFacts" rows="3" placeholder="例如：实际观看内容、调查记录或需要采用的真实情况"></textarea></label><button type="button" id="receiveFollowup" class="button secondary" hidden>接收 Claude 对话补充</button><p id="followupNote" class="small muted" hidden>已在这项作业的 Claude 会话里补充过？点击读取已完成的回复，随后继续核验与作答。</p><details id="browserQuestionSection"><summary>学校登录表单题目读取</summary><div id="restrictedFormLinks"></div><p class="small muted">需要学校登录的表单无法匿名读取题目。可在已登录的浏览器里取得题目数据后在下方导入；程序不会复制密码、cookies 或点击提交。</p><label>原表单链接<input id="captureUrl" type="url" placeholder="Google Forms 原链接"></label><label>浏览器读到的原题目数据<textarea id="captureScript" rows="3" placeholder="仅 FB_PUBLIC_LOAD_DATA_ 题目数据，由 Claude 从登录页面读取"></textarea></label><button type="button" id="importQuestions" class="button secondary">导入已读取题目</button></details></details><label id="supplementAiRow" class="checkbox-label"><input id="supplementAi" type="checkbox">此次继续使用 AI 作答</label><p id="supplementModel" class="small muted"></p><div id="supplementError" class="form-error" hidden></div></div><div class="dialog-footer"><button type="button" id="saveSupplement" class="button secondary">保存补充</button><button type="submit" id="continueSupplement" class="button primary">保存并继续处理</button></div></form></dialog>
-</body></html>
+</body>
+</html>
