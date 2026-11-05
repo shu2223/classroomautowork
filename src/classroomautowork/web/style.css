@@ -1807,6 +1807,8 @@ a.ys-row:active, button.ys-row:active, .ys-row--link:active { background: var(--
 .toolbar { gap: var(--ys-space-2); }
 .run-options { display: flex; align-items: center; gap: var(--ys-space-2); min-width: 0; }
 .run-options > .ys-select { min-width: 0; }
+/* the effort select keeps its words whole (强度 默认 / 很高); a long model id gives way and ends in an ellipsis */
+.run-options > .effort-select { flex: none; }
 .primary-dock { display: flex; }
 .ys-page-meta > .fact-row { row-gap: 2px; }
 .ys-page-status { font-variant-numeric: tabular-nums; }
@@ -2371,6 +2373,43 @@ label.group-row { cursor: pointer; }
 .key-form { flex-wrap: wrap; gap: var(--ys-space-2); padding-top: var(--ys-space-3); padding-bottom: var(--ys-space-3); }
 .key-form > .ys-input { flex: 1 1 12em; }
 
+/* the model provider: one segmented control across its row; the chosen provider's settings follow it */
+.provider-row { padding: var(--ys-space-2); }
+.provider-row > .ys-seg { flex: 1 1 auto; width: auto; }
+.provider-notice { margin-top: var(--ys-space-3); }
+/* the OpenAI-compatible endpoint: what is saved, then one field per row, label over input over help */
+.status-row { flex-direction: column; align-items: flex-start; justify-content: center; gap: 2px; }
+.status-row > .fact-row { max-width: 100%; row-gap: 2px; }
+.status-sub { color: var(--ys-muted); font-size: var(--ys-fs-ui-sub); line-height: var(--ys-lh-ui); }
+.status-sub.warn { color: var(--ys-warn); }
+label.field-row { cursor: default; }
+.field-row {
+  display: grid;
+  gap: 6px;
+  align-items: start;
+  padding-top: var(--ys-space-3);
+  padding-bottom: var(--ys-space-3);
+}
+.field-label { font-size: var(--ys-fs-footnote); font-weight: var(--ys-fw-semibold); line-height: 1.4; }
+/* with nothing saved the status row is hidden, and the first field draws no hairline over itself */
+.openai-form > [hidden] + .group-row::before { display: none; }
+.form-actions { flex-wrap: wrap; gap: var(--ys-space-2); padding-top: var(--ys-space-3); padding-bottom: var(--ys-space-3); }
+.openai-error { margin: 0 var(--ys-space-3) var(--ys-space-3) var(--ys-space-4); }
+/* the model field offers the endpoint's ids as it is typed in; Chrome's datalist triangle (which came and went with the
+   text after the last comma) is not drawn, as the system draws no native control marks */
+.model-input::-webkit-calendar-picker-indicator { display: none !important; }
+
+/* an error names the problem and the fix; the remote service's own message stays underneath, small and quiet */
+.error-detail {
+  display: block;
+  margin-top: 2px;
+  color: var(--ys-muted);
+  font-size: var(--ys-fs-ui-sub);
+  font-weight: var(--ys-fw-regular);
+  line-height: var(--ys-lh-ui);
+  overflow-wrap: anywhere;
+}
+
 /* an on/off setting: a switch (the track carries 3:1 in both states) */
 .switch {
   position: relative;
@@ -2459,6 +2498,11 @@ label.group-row { cursor: pointer; }
 
 .ys-toast { text-wrap: pretty; }
 .ys-toast > span { min-width: 0; }
+/* a toast with the server's own words under its line (toast() with a two-line message) */
+.ys-toast.has-detail { align-items: flex-start; border-radius: 14px; }
+.ys-toast.has-detail > .ys-icon { flex-shrink: 0; margin-top: calc((1.45em - 16px) / 2); }
+.toast-body { display: flex; flex-direction: column; min-width: 0; }
+.ys-toast .error-detail { color: inherit; opacity: .72; }
 /* the toast as a popover above an open dialog (app.js placeToast): drop the browser's popover box */
 .ys-toast[popover] { top: auto; right: auto; margin: 0; border: 0; overflow: visible; }
 
@@ -2528,8 +2572,7 @@ label.group-row { cursor: pointer; }
   }
   .toolbar { display: contents; }
   .run-options { grid-area: options; margin-top: var(--ys-space-3); }
-  .run-options > .model-select { flex: 1 1 auto; }
-  .run-options > .effort-select { flex: 0 1 auto; }
+  .run-options > .model-select { flex: 1 1 0; }
   .run-options select { width: 100%; }
   .refresh-button { grid-area: refresh; }
   .settings-button { grid-area: settings; margin-right: -10px; }

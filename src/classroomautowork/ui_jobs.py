@@ -35,6 +35,14 @@ from .local import atomic_json, require_private_path, sha256_file, utc_now
 from .pending import discover_pending
 from .policy import CoursePolicy, confirmed_gate
 from .progress import ProgressUpdate
+from .providers import (
+    active_provider,
+    openai_catalog,
+    save_openai,
+    save_provider,
+    settings_view,
+)
+from .providers import status as provider_status
 from .student import StudentProfile
 from .supplements import load_supplement, normalized, save_supplement
 from .user_answers import load_user_answers, save_user_answers
@@ -76,6 +84,17 @@ POLICY_FIELDS = {
 
 def item_key(item: dict) -> str:
     return item["course_id"] + ":" + item["assignment_id"]
+
+
+def job_provider(job: dict):
+    """The provider a job answered with; AI jobs from before providers existed used Claude.
+
+    A fill job answers nothing itself (it applies an answer to the form or document), so it has
+    none: when its retry has to answer again, the new job takes the active provider, as the main
+    button would."""
+    if job.get("kind") == "fill":
+        return job.get("provider")
+    return job.get("provider") or ("anthropic" if job.get("ai_confirmed") else None)
 
 
 def read_json(path: Path, default=None):
@@ -242,7 +261,9 @@ class FrontendJobs:
                         "jobs": [self._snapshot(x) for x in jobs],
                         "result_jobs": result_jobs,
                         "active_job_id": self._active,
+                        # Kept for pages that predate the provider block, which carries it too.
                         "api_key": key_status(self.settings.data_dir),
+                        "provider": provider_status(self.settings.data_dir),
                         "submission": "manual_only",
                     }
                 )
@@ -312,11 +333,56 @@ class FrontendJobs:
             raise WorkflowError("密钥设置只接受 key。")
         return save_key(self.settings.data_dir, values["key"])
 
-    def models(self):
-        with self._models_lock:
-            return model_catalog()
+    def set_provider(self, values):
+        return save_provider(self.settings.data_dir, values)
 
-    def _start(self, kind, items, defer_media=False, model=None, effort=None, ai_confirmed=False):
+    def set_openai(self, values):
+        return save_openai(self.settings.data_dir, values)
+
+    def openai_settings(self):
+        return settings_view(self.settings.data_dir)
+
+    def models(self):
+        """The model list of the active provider, for the toolbar."""
+        with self._models_lock:
+            return self._catalog(active_provider(self.settings.data_dir))
+
+    def _catalog(self, provider):
+        # Claude's display names come with either list: past jobs and records keep naming their
+        # Claude model "Claude Sonnet 5.5", not its id, while the endpoint is the active one.
+        names = {x["model"]: x["displayName"] for x in model_catalog()["models"]}
+        if provider == "openai":
+            return {**openai_catalog(self.settings.data_dir), "claude_names": names}
+        return {**model_catalog(), "provider": "anthropic", "claude_names": names}
+
+    def _start_catalog(self, provider):
+        """The list a new job's model is checked against. ui/models.json, which nothing in the
+        app writes, can stand in for the Claude list (the tests use it) when it is a usable one;
+        it never stands in for the OpenAI-compatible list, which always comes from the saved
+        settings."""
+        if provider == "openai":
+            return self._catalog("openai")
+        cached = read_json(self.root / "models.json")
+        if (
+            isinstance(cached, dict)
+            and isinstance(cached.get("models"), list)
+            and cached["models"]
+            and cached.get("default_model")
+            and cached.get("provider", "anthropic") == "anthropic"
+        ):
+            return cached
+        return self._catalog("anthropic")
+
+    def _start(
+        self,
+        kind,
+        items,
+        defer_media=False,
+        model=None,
+        effort=None,
+        ai_confirmed=False,
+        provider=None,
+    ):
         with self._lock:
             if self._active:
                 raise WorkflowError("已有任务在运行，请等它结束或暂停后再操作。")
@@ -330,6 +396,8 @@ class FrontendJobs:
                 "defer_media": defer_media,
                 "model": model,
                 "effort": effort,
+                # Which service answers: fixed when the job starts, whatever the settings say later.
+                "provider": provider,
                 "ai_confirmed": ai_confirmed,
                 "approval": None,
                 "events": [],
@@ -372,6 +440,7 @@ class FrontendJobs:
                 model=source.get("model"),
                 effort=source.get("effort"),
                 ai_confirmed=True,
+                provider=job_provider(source),
             )
         return self._start("fill", [{**item, "package": str(package)}], ai_confirmed=True)
 
@@ -408,7 +477,9 @@ class FrontendJobs:
         model=None,
         effort=None,
         ai_confirmed=False,
+        provider=None,
     ):
+        """provider None means the active one; a retry passes the provider its job used."""
         if not isinstance(selected, list) or not 1 <= len(selected) <= 200:
             raise ConfigurationError("请勾选 1–200 项作业。")
         if not isinstance(defer_media, bool):
@@ -448,11 +519,33 @@ class FrontendJobs:
         reusable = [latest.get(item_key(item), {}) for item in items]
         if all(self._can_retry_fill(item) for item in reusable):
             return self._start("fill", reusable, ai_confirmed=True)
-        catalog = read_json(self.root / "models.json") or self.models()
+        # A provider passed in is the one a retried job used: the job keeps it, so the advice
+        # when it cannot be used names that job, not the toolbar.
+        pinned = provider is not None
+        provider = provider or active_provider(self.settings.data_dir)
+        if provider not in {"anthropic", "openai"}:
+            raise ConfigurationError("模型接口无效。")
+        try:
+            catalog = self._start_catalog(provider)
+        except ConfigurationError:
+            if not pinned or provider != "openai":
+                raise
+            raise ConfigurationError(
+                "这个任务用的是 OpenAI 兼容接口，它的设置已删除或损坏，不能按原样重试。"
+                "请在设置里重新填写这个接口后再重试；或在列表里重新勾选这些作业，"
+                "点“完成”用当前的模型接口作答。"
+            ) from None
         model = model or catalog["default_model"]
         entry = next((x for x in catalog["models"] if x["model"] == model), None)
         if not entry:
-            raise ConfigurationError("所选模型不在可用模型列表中，请重新读取模型列表。")
+            raise ConfigurationError(
+                f"这个任务用的模型“{model}”已不在 OpenAI 兼容接口的设置里。请在设置里加回这个模型"
+                "后再重试；或在列表里重新勾选这些作业，用当前的模型作答。"
+                if pinned and provider == "openai"
+                else "所选模型不在 OpenAI 兼容接口设置的模型里，请重新选择，或在设置里添加这个模型。"
+                if provider == "openai"
+                else "所选模型不在可用模型列表中，请重新读取模型列表。"
+            )
         allowed = {x["reasoningEffort"] for x in entry.get("supportedReasoningEfforts", [])}
         if effort is None:
             effort = (
@@ -462,7 +555,9 @@ class FrontendJobs:
             )
         if effort is not None and effort not in allowed:
             raise ConfigurationError("所选模型不支持这个推理强度。")
-        return self._start("review", items, defer_media, model, effort, ai_confirmed)
+        return self._start(
+            "review", items, defer_media, model, effort, ai_confirmed, provider=provider
+        )
 
     @staticmethod
     def _can_retry_fill(item):
@@ -519,6 +614,7 @@ class FrontendJobs:
             model=job.get("model"),
             effort=job.get("effort"),
             ai_confirmed=job.get("ai_confirmed", False),
+            provider=job_provider(job),
         )
 
     def _recover_local_answers(self, job_id):
@@ -861,14 +957,17 @@ class FrontendJobs:
                         **{k: result[k] for k in ("package", "error") if k in result},
                     )
 
+                provider = job_provider(job) or "anthropic"
                 for result in self._prepared_packages(job_id, job, assignment_event):
                     self._log(
                         job_id,
                         "真实题目与课堂资料已准备"
                         + (
-                            "，正在交给所选 Claude 模型"
-                            if job.get("ai_confirmed")
-                            else "；本次只整理资料"
+                            "；本次只整理资料"
+                            if not job.get("ai_confirmed")
+                            else "，正在交给 OpenAI 兼容接口的所选模型"
+                            if provider == "openai"
+                            else "，正在交给所选 Claude 模型"
                         ),
                     )
                     self._item(job_id, result, status="drafting")
@@ -890,6 +989,7 @@ class FrontendJobs:
                             progress=lambda msg: self._log(job_id, msg),
                             model=job.get("model"),
                             effort=job.get("effort"),
+                            provider=provider,
                             ai_confirmed=job.get("ai_confirmed", False),
                             forms=forms,
                             on_generation=lambda value, item=result: self._item(

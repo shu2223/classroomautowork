@@ -571,3 +571,260 @@ def test_public_writes_need_the_public_origin(local_server):
         public(local_server, path, method="POST", body={"x": 1}, origin="https://yishuapp.com")[0]
         == 400
     )  # Reached the handler, which rejects unexpected parameters.
+
+
+# ---------------------------------------------------------------- model providers in jobs and on the page
+
+
+def configure_openai(jobs, models="served-a, served-b"):
+    from classroomautowork import providers
+
+    providers.save_openai(
+        jobs.settings.data_dir,
+        {
+            "base_url": "https://api.example.com/v1",
+            "api_key": "sk-unit-" + "p" * 30,
+            "models": models,
+        },
+        verify=lambda *_: {"listed": True, "ids": ["served-a"], "status": 200},
+    )
+    return providers
+
+
+def test_the_model_catalog_follows_the_active_provider(tmp_path):
+    jobs = FrontendJobs(unit_settings(tmp_path))
+    claude = jobs.models()
+    assert claude["provider"] == "anthropic"
+    assert claude["default_model"] == claude_agent.DEFAULT_MODEL
+    providers = configure_openai(jobs)
+    assert jobs.models()["provider"] == "anthropic"  # saved, not switched
+    providers.save_provider(tmp_path, {"provider": "openai"})
+    catalog = jobs.models()
+    assert catalog["provider"] == "openai" and catalog["default_model"] == "served-a"
+    assert [x["model"] for x in catalog["models"]] == ["served-a", "served-b"]
+    assert (
+        catalog["default_effort"] is None and catalog["source"] == "OpenAI 兼容接口 api.example.com"
+    )
+    assert all(x["defaultReasoningEffort"] is None for x in catalog["models"])
+    assert [x["reasoningEffort"] for x in catalog["models"][0]["supportedReasoningEfforts"]] == [
+        "low",
+        "medium",
+        "high",
+    ]
+    # A Claude list cached in ui/models.json never stands in for the endpoint's, nor the reverse.
+    atomic_json(
+        jobs.root / "models.json",
+        {"default_model": "cached", "default_effort": None, "models": [{"model": "cached"}]},
+    )
+    assert jobs._start_catalog("openai")["default_model"] == "served-a"
+    assert jobs._start_catalog("anthropic")["default_model"] == "cached"
+    atomic_json(jobs.root / "models.json", {**catalog, "provider": "openai"})
+    assert jobs._start_catalog("anthropic")["default_model"] == claude_agent.DEFAULT_MODEL
+
+
+def test_a_job_keeps_the_provider_it_started_with(tmp_path, monkeypatch):
+    jobs = FrontendJobs(unit_settings(tmp_path))
+    seed_pending(jobs)
+    monkeypatch.setattr(jobs, "_run", lambda _: None)
+    selection = [{"course_id": "1", "assignment_id": "2"}]
+    providers = configure_openai(jobs)
+    providers.save_provider(tmp_path, {"provider": "openai"})
+    for model, effort, words in [
+        ("claude-sonnet-5-5", None, "OpenAI 兼容接口设置的模型"),
+        ("served-a", "xhigh", "推理强度"),
+    ]:
+        with pytest.raises(WorkflowError, match=words):
+            jobs.start_selected(selection, ai_confirmed=True, model=model, effort=effort)
+    job = jobs.start_selected(selection, ai_confirmed=True)
+    assert (job["provider"], job["model"], job["effort"]) == ("openai", "served-a", None)
+    jobs._active = None
+    job = jobs.start_selected(selection, ai_confirmed=True, model="served-b", effort="high")
+    assert (job["provider"], job["model"], job["effort"]) == ("openai", "served-b", "high")
+    jobs._jobs[job["id"]]["status"] = "failed"
+    jobs._active = None
+    # Switching back to Claude does not change what a retry of that job uses.
+    providers.save_provider(tmp_path, {"provider": "anthropic"})
+    repeated = jobs.retry(job["id"])
+    assert (repeated["provider"], repeated["model"], repeated["effort"]) == (
+        "openai",
+        "served-b",
+        "high",
+    )
+    jobs._active = None
+    claude = jobs.start_selected(selection, ai_confirmed=True)
+    assert (claude["provider"], claude["model"]) == ("anthropic", claude_agent.DEFAULT_MODEL)
+    jobs._active = None
+    # Jobs from before providers existed were Claude's, and a materials-only job has none.
+    legacy = {**jobs._jobs[claude["id"]], "id": "e" * 32, "status": "failed"}
+    legacy.pop("provider")
+    jobs._jobs[legacy["id"]] = legacy
+    assert jobs.retry(legacy["id"])["provider"] == "anthropic"
+    jobs._active = None
+    assert jobs.start_selected(selection, ai_confirmed=False)["provider"] is None
+    jobs._active = None
+
+
+def test_the_worker_hands_the_job_provider_to_the_answer(tmp_path, monkeypatch):
+    jobs = FrontendJobs(unit_settings(tmp_path))
+    seed_pending(jobs)
+    providers = configure_openai(jobs)
+    providers.save_provider(tmp_path, {"provider": "openai"})
+    seen = []
+
+    def prepare(settings, *, targets, on_assignment, **_):
+        result = {"course_id": "1", "assignment_id": "2", "package": str(tmp_path / "p")}
+        on_assignment(result, {**result, "status": "prepared"})
+        return {"packages": [result], "cache": {}}
+
+    def generate(package, **options):
+        seen.append(options)
+        return {"package": str(package), "status": "materials_ready"}
+
+    monkeypatch.setattr(ui_jobs, "prepare", prepare)
+    monkeypatch.setattr(ui_jobs, "generate_answer", generate)
+    monkeypatch.setattr(ui_jobs, "prepare_response_forms", lambda _: [])
+    job = jobs.start_selected([{"course_id": "1", "assignment_id": "2"}], ai_confirmed=True)
+    assert jobs.wait_idle()
+    assert seen[0]["provider"] == "openai" and seen[0]["model"] == "served-a"
+    events = [x["message"] for x in jobs.job(job["id"])["events"]]
+    assert any("正在交给 OpenAI 兼容接口的所选模型" in x for x in events)
+
+
+def test_the_page_has_the_provider_controls_and_no_inline_styles():
+    page = (Path(ui_jobs.__file__).parent / "web" / "index.html").read_text(encoding="utf-8")
+    script = (Path(ui_jobs.__file__).parent / "web" / "app.js").read_text(encoding="utf-8")
+    for name in (
+        "providerSeg",
+        "providerNotice",
+        "providerNoticeText",
+        "anthropicSettings",
+        "openaiSettings",
+        "openaiForm",
+        "openaiStatus",
+        "openaiBaseUrl",
+        "openaiKey",
+        "openaiModels",
+        "openaiModelList",
+        "openaiSave",
+        "openaiClear",
+        "openaiError",
+        "apiKeyStatus",
+        "apiKeyForm",
+        "apiKeyInput",
+        "apiKeyClear",
+        "aiConfirmed",
+    ):
+        assert f'id="{name}"' in page and f'$("{name}")' in script
+    assert 'data-provider="anthropic"' in page and 'data-provider="openai"' in page
+    assert 'placeholder="https://api.example.com/v1"' in page and 'list="openaiModelList"' in page
+    assert "style=" not in page and "<style" not in page and "<script>" not in page
+    key_input = page.split('<input id="openaiKey"', 1)[1].split(">", 1)[0]
+    # new-password: a browser or password manager does not fill a saved site password in, which
+    # would then go out as a Bearer token to whatever address is entered.
+    assert 'type="password"' in key_input and 'autocomplete="new-password"' in key_input
+    assert "data-1p-ignore" in key_input and 'data-lpignore="true"' in key_input
+
+
+# ---------------------------------------------------------------- after review (2026-11-05)
+
+
+def finished_fill_job(jobs, tmp_path):
+    """A fill job as 保存并带入表单 or fill_existing makes it: no model, no provider."""
+    fill = {
+        "id": "f" * 32,
+        "kind": "fill",
+        "status": "completed_with_issues",
+        "created_at": "2026-11-05T00:00:00+00:00",
+        "items": [
+            {
+                "course_id": "1",
+                "assignment_id": "2",
+                "title": "Unit requirement",
+                "status": "needs_form",
+                "package": str(tmp_path / "pkg"),
+            }
+        ],
+        "defer_media": False,
+        "model": None,
+        "effort": None,
+        "provider": None,
+        "ai_confirmed": True,
+        "events": [],
+    }
+    jobs._jobs[fill["id"]] = fill
+    return fill
+
+
+@pytest.mark.parametrize("active", ["openai", "anthropic"])
+def test_a_fill_job_that_must_answer_again_uses_the_active_provider(tmp_path, monkeypatch, active):
+    jobs = FrontendJobs(unit_settings(tmp_path))
+    seed_pending(jobs)
+    monkeypatch.setattr(jobs, "_run", lambda _: None)
+    providers = configure_openai(jobs)
+    providers.save_provider(tmp_path, {"provider": active})
+    fill = finished_fill_job(jobs, tmp_path)
+    assert ui_jobs.job_provider(fill) is None
+    # Its form mapping is incomplete, so the retry has to answer again.
+    monkeypatch.setattr(ui_jobs, "form_generation_incomplete", lambda item: True)
+    monkeypatch.setattr(jobs, "_recover_local_answers", lambda _id: False)
+    job = jobs.retry(fill["id"])
+    default = "served-a" if active == "openai" else claude_agent.DEFAULT_MODEL
+    assert (job["kind"], job["provider"], job["model"]) == ("review", active, default)
+    assert job["effort"] == (None if active == "openai" else claude_agent.DEFAULT_EFFORT)
+
+
+@pytest.mark.parametrize("cached", [{}, [], {"models": []}, {"models": [{"model": "m"}]}, "x"])
+def test_an_unusable_cached_model_list_falls_back_to_the_built_in_one(
+    tmp_path, monkeypatch, cached
+):
+    jobs = FrontendJobs(unit_settings(tmp_path))
+    seed_pending(jobs)
+    monkeypatch.setattr(jobs, "_run", lambda _: None)
+    atomic_json(jobs.root / "models.json", cached)
+    job = jobs.start_selected([{"course_id": "1", "assignment_id": "2"}], ai_confirmed=True)
+    assert (job["provider"], job["model"]) == ("anthropic", claude_agent.DEFAULT_MODEL)
+
+
+def test_a_retry_pinned_to_a_gone_endpoint_says_what_to_do(tmp_path, monkeypatch):
+    jobs = FrontendJobs(unit_settings(tmp_path))
+    seed_pending(jobs)
+    monkeypatch.setattr(jobs, "_run", lambda _: None)
+    selection = [{"course_id": "1", "assignment_id": "2"}]
+    with pytest.raises(WorkflowError, match="设置已删除或损坏.*重新勾选这些作业"):
+        jobs.start_selected(selection, ai_confirmed=True, provider="openai")
+    providers = configure_openai(jobs, models="served-a")
+    with pytest.raises(WorkflowError, match="“served-b”已不在 OpenAI 兼容接口的设置里"):
+        jobs.start_selected(selection, ai_confirmed=True, provider="openai", model="served-b")
+    # The toolbar's own choice (no pinned provider) keeps the plain advice.
+    providers.save_provider(tmp_path, {"provider": "openai"})
+    with pytest.raises(WorkflowError, match="请重新选择"):
+        jobs.start_selected(selection, ai_confirmed=True, model="served-b")
+
+
+def test_both_model_lists_carry_the_claude_display_names(tmp_path):
+    jobs = FrontendJobs(unit_settings(tmp_path))
+    names = dict(claude_agent.MODELS)
+    assert jobs.models()["claude_names"] == names
+    providers = configure_openai(jobs)
+    providers.save_provider(tmp_path, {"provider": "openai"})
+    catalog = jobs.models()
+    assert catalog["provider"] == "openai" and catalog["claude_names"] == names
+
+
+def test_the_settings_dialog_says_what_is_sent_and_when_the_key_may_stay_empty():
+    page = (Path(ui_jobs.__file__).parent / "web" / "index.html").read_text(encoding="utf-8")
+    script = (Path(ui_jobs.__file__).parent / "web" / "app.js").read_text(encoding="utf-8")
+    # The reuse rule is shown only once a key is saved, and in its real terms.
+    reuse = page.split('<span id="openaiKeyReuse"', 1)[1].split(">", 1)[0]
+    assert " hidden" in reuse and "协议、主机和端口不变时可以留空" in page
+    assert '$("openaiKeyReuse").hidden = !status?.configured' in script
+    # The foot note names the private data that reaches a third-party endpoint.
+    foot = page.split('<section id="openaiSettings"', 1)[1].split("</section>", 1)[0]
+    assert "学生资料（姓名、学号等）" in foot and "补充说明" in foot and "个人事实" in foot
+    # The model field draws no native datalist triangle.
+    css = (Path(ui_jobs.__file__).parent / "web" / "style.css").read_text(encoding="utf-8")
+    assert 'id="openaiModels" class="ys-input model-input"' in page
+    assert ".model-input::-webkit-calendar-picker-indicator { display: none" in css
+    # On the phone the effort select keeps its words and a long model id gives way.
+    assert ".run-options > .effort-select { flex: none; }" in css
+    assert ".run-options > .model-select { flex: 1 1 0; }" in css

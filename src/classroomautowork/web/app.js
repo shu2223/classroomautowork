@@ -15,6 +15,8 @@ const submissionLabels = {RETURNED: "已退回", SUBMISSION_STATE_UNSPECIFIED: "
 const questionTypes = {short_text: "简答题", paragraph: "段落", single_choice: "单选题", checkbox: "复选框", dropdown: "下拉列表", scale: "线性量表",
   grid: "网格题", date: "日期", time: "时间", file_upload: "文件上传", image: "图片"};
 const efforts = {low: "低", medium: "中", high: "高", xhigh: "很高", max: "最高"};
+// How an OpenAI-compatible server was asked for its answer (generation.json structured_output_mode).
+const OUTPUT_MODES = {json_schema: "JSON Schema（严格）", json_object: "JSON 对象（接口不支持 JSON Schema）", none: "只靠提示词（接口不支持 JSON 格式）"};
 const FILTERS = [["all", "全部"], ["week", "7 天内"], ["nodue", "无截止"], ["review", "待审阅"], ["overdue", "已逾期"]];
 const STALE_MS = 3 * 60 * 1000;
 
@@ -24,7 +26,10 @@ else token = sessionStorage.getItem("classroom-access") || "";
 
 const state = {pending: null, jobs: [], resultJobs: [], active: null, focus: null, dismissed: localStorage.getItem("classroom-dismissed") || "",
   selected: new Set(), filter: localStorage.getItem("classroom-filter") || "all", busy: false, models: null, apiKey: null, timezone: "Asia/Tokyo",
-  panel: null, supplement: null, images: [], error: null};
+  panel: null, supplement: null, images: [], error: null,
+  // provider: {active, anthropic, openai} from the server; providerView: the provider the settings dialog shows, when it is
+  // not (yet) the active one; openaiSuggestions: the model ids the endpoint listed when it was saved.
+  provider: null, providerView: null, openaiSuggestions: []};
 // True until the first answer from the server: the list shows placeholder rows rather than "nothing yet".
 let booting = !!(token || BASE);
 
@@ -120,6 +125,56 @@ function durationLabel(ms) {
 }
 // End pure presentation.
 
+// Provider presentation; exercised by tests/provider_view.js.
+// The provider a job answered with: recorded since providers exist; earlier AI review jobs were Claude's. A fill job
+// answers nothing itself, so it has none.
+function jobProvider(job) { return job?.provider || (job?.ai_confirmed && job.kind !== "fill" ? "anthropic" : null); }
+// The provider of a generation record (generation.json names the endpoint "openai_compatible").
+function recordProvider(g) { return g?.provider === "openai_compatible" ? "openai" : "anthropic"; }
+// A model as the page names it: an endpoint's model by its own id; a Claude model by its display name, whichever provider
+// the toolbar lists now (the catalog carries Claude's names in claude_names).
+function modelLabel(id, provider, catalog) {
+  if (!id || provider === "openai") return id;
+  const own = (catalog?.provider || "anthropic") === "anthropic" ? catalog?.models?.find(x => x.model === id) : null;
+  return own?.displayName || catalog?.claude_names?.[id] || id;
+}
+// The job card's answering step names the service: the job's own; for a job that answers nothing, the active one.
+function stepNames(job, active) { return ["读资料", (jobProvider(job) || active) === "openai" ? "模型作答" : "Claude 作答", "核验", "生成答案"]; }
+// What 补充后重做 sends. The toolbar's choice when the toolbar lists the active provider's models (默认 is "" and sends no
+// effort); without that list, the source job's own model and effort, only if that job used the active provider; else
+// nothing, so the server takes the active provider's defaults.
+function redoChoice(toolbar, job, active) {
+  if (toolbar.provider === active) return {model: toolbar.model || null, effort: toolbar.effort || null};
+  return jobProvider(job) === active ? {model: job?.model || null, effort: job?.effort || null} : {model: null, effort: null};
+}
+// The line above 保存并重做: the model the redo uses, and the provider too when the answer came from the other one.
+function redoLine(name, active, from) {
+  if (!from || from === active) return `重做会使用 ${name}。`;
+  return `重做会改用${active === "openai" ? " OpenAI 兼容接口的 " : " Claude API 的 "}${name}。`;
+}
+// Why page images were left out of an endpoint's request (generation.json degradations).
+function imagesDroppedWhy(g) { return (g?.degradations || []).includes("images_size") ? "请求超出了接口的上限" : "接口不接受图片"; }
+// The answer panel's note when the endpoint never saw some page images: those pages rest on their extracted text alone.
+function imagesNote(g) {
+  const count = g?.images_dropped;
+  if (!Number.isFinite(count) || count <= 0) return null;
+  return `${count} 张页面图片没有发给模型（${imagesDroppedWhy(g)}），这些页只按提取的文字作答；图表、截图和扫描内容请对照原资料核对。`;
+}
+// The 记录 tab's 模型 row: the model the server reported, and beside it the chosen one when the server named another.
+function recordModels(g, label) {
+  const shown = label(g.model || g.requested_model);
+  return recordProvider(g) === "openai" && g.model && g.requested_model && g.model !== g.requested_model ? [shown, "所选 " + g.requested_model] : [shown];
+}
+// What 保存并验证 found, for its toast.
+function savedMessage(check, switched) {
+  const then = switched ? "，作答改用这个接口" : "";
+  if (!check?.models_listed) return `已保存${then}。这个接口没有提供模型列表，密钥和模型要到作答时才能确认。`;
+  const unlisted = check.unlisted_models?.length ? `接口的模型列表里没有 ${check.unlisted_models.join("、")}；列表常常不全，已照样保存。` : "";
+  if (check.key_checked === false) return `已保存${then}。这个接口不用密钥也能读取模型列表，密钥要到作答时才能确认。${unlisted}`;
+  return `已验证并保存${then}` + (unlisted ? "。" + unlisted : "");
+}
+// End provider presentation.
+
 function node(tag, text, className) { const el = document.createElement(tag); if (text !== undefined && text !== null) el.textContent = text; if (className) el.className = className; return el; }
 function inlineRuns(tag, block) { const el = node(tag); for (const run of block.runs || [{text: block.text}]) el.append(run.bold ? node("strong", run.text) : document.createTextNode(run.text || "")); return el; }
 function button(text, className, handler) { const b = node("button", text, className); b.type = "button"; b.addEventListener("click", handler); return b; }
@@ -211,13 +266,16 @@ function keepFocus(region, render) {
 }
 
 let toastTimer = null;
-// tone: "ok" (a check) or "bad" (an error mark); none for plain notices.
+// tone: "ok" (a check) or "bad" (an error mark); none for plain notices. An error's second line (the server's own
+// words, see errorParts) goes under it as a quiet detail and keeps the toast up longer, so there is time to read it.
 function toast(message, tone) {
-  const el = $("toast");
-  el.className = "ys-toast toast" + (tone === "bad" ? " ys-toast--bad" : "");
-  el.replaceChildren(...(tone ? [ysIcon(tone === "bad" ? "error" : "check")] : []), node("span", message));
+  const el = $("toast"), [main, detail] = errorParts(message);
+  el.className = "ys-toast toast" + (tone === "bad" ? " ys-toast--bad" : "") + (detail ? " has-detail" : "");
+  const body = node("span", detail ? undefined : main, detail ? "toast-body" : undefined);
+  if (detail) body.append(node("span", main), detailLine(detail));
+  el.replaceChildren(...(tone ? [ysIcon(tone === "bad" ? "error" : "check")] : []), body);
   el.hidden = false; placeToast(el);
-  clearTimeout(toastTimer); toastTimer = setTimeout(() => { el.hidden = true; placeToast(el); }, 5000);
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => { el.hidden = true; placeToast(el); }, detail ? 9000 : 5000);
 }
 // An open dialog sits in the browser's top layer: a toast left outside it is covered. While a dialog is open the toast
 // lives inside it, shown as a popover on top, and goes back to the page when the dialog closes.
@@ -243,6 +301,14 @@ function friendlyError(message) {
     "A known AI policy requires the user's source evidence.": "选择允许或禁止时，请填写规定原文与来源。",
     "Limited AI use requires explicit limits.": "选择有限度允许时，请填写允许的具体用途。"})[message] || message;
 }
+// The server's errors name the problem and the fix on their first line; a second line, when there is one, is the remote
+// service's own message (already trimmed and without any key), shown underneath as a quiet detail.
+function errorParts(message) {
+  const text = String(message ?? ""), at = text.indexOf("\n");
+  return at < 0 ? [friendlyError(text), ""] : [friendlyError(text.slice(0, at)), text.slice(at + 1).trim()];
+}
+function detailLine(text) { const el = node("span", text, "error-detail"); if (!/[぀-ヿ㐀-鿿]/.test(text)) el.lang = "en"; return el; }
+function errorNodes(message) { const [main, detail] = errorParts(message); return detail ? [main, detailLine(detail)] : [main]; }
 async function api(path, method = "GET", body) {
   const options = {method, cache: "no-store", credentials: BASE ? "same-origin" : "omit", headers: token ? {Authorization: "Bearer " + token} : {}};
   if (body !== undefined) { options.headers["Content-Type"] = "application/json"; options.body = JSON.stringify(body); }
@@ -283,7 +349,8 @@ async function loadState() {
   const data = await api("/api/bootstrap");
   booting = false;
   state.error = null; state.pending = data.pending; state.jobs = data.jobs; state.resultJobs = data.result_jobs || [];
-  state.active = data.active_job_id; state.timezone = data.timezone || "Asia/Tokyo"; state.apiKey = data.api_key || null;
+  state.active = data.active_job_id; state.timezone = data.timezone || "Asia/Tokyo";
+  state.provider = data.provider || null; state.apiKey = data.provider?.anthropic || data.api_key || null;
   if (state.pending) { const keys = new Set(state.pending.assignments.map(keyOf)); state.selected = new Set([...state.selected].filter(x => keys.has(x))); }
   if (!state.focus) state.focus = state.jobs.find(x => x.kind !== "refresh")?.id || null;
   renderAll();
@@ -296,7 +363,7 @@ function updateJob(job) {
 
 // ---- rendering -----------------------------------------------------------
 
-function renderAll() { renderHeader(); renderIssues(); renderFilters(); renderList(); renderJob(); renderHistory(); renderButtons(); renderApiKey(); }
+function renderAll() { renderHeader(); renderIssues(); renderFilters(); renderList(); renderJob(); renderHistory(); renderButtons(); renderApiKey(); renderProvider(); }
 
 function renderHeader() {
   const pending = state.pending, source = pending?.source || {}, latest = latestItems();
@@ -318,8 +385,11 @@ function renderIssues() {
     found.push([tone, li]);
   };
   if (!token && !BASE) add("critical", "缺少访问凭证。请从 yishuapp.com/classroom/ 打开，或用 SSH 隧道加上 server.json 里的令牌。");
-  if (state.error) add("critical", state.error);
-  if (aiEnabled() && state.apiKey && !state.apiKey.configured) add("warning", "还没有设置 Claude API 密钥，作答前需要先填写。", button("去设置", "ys-btn ys-btn--sm issue-action link small", () => $("settingsDialog").showModal()));
+  if (state.error) add("critical", errorNodes(state.error));
+  const settingsLink = () => button("去设置", "ys-btn ys-btn--sm issue-action link small", openSettings);
+  if (aiEnabled() && activeProvider() === "anthropic" && state.apiKey && !state.apiKey.configured) add("warning", "还没有设置 Claude API 密钥，作答前需要先填写。", settingsLink());
+  if (aiEnabled() && activeProvider() === "openai" && state.provider && !state.provider.openai?.configured)
+    add("warning", "OpenAI 兼容接口还没有设置好，作答前请在设置里填写，或改用 Claude API。", settingsLink());
   const failed = state.pending?.inaccessible_courses || [];
   if (failed.length) add("critical", `${failed.length} 门课程读取失败，待办列表可能不完整。`);
   const unmapped = state.pending?.source?.unmapped_courses || [];
@@ -426,7 +496,8 @@ function renderList() {
       const mobileDue = node("div", undefined, "meta mobile-due" + (due.overdue ? " bad" : ""));
       mobileDue.append(item.due_local ? factRow([dateLabel(item.due_local), {text: due.text, cls: dueTone}]) : "无截止");
       mobileDue.hidden = window.innerWidth > 640; titleCell.append(mobileDue);
-      if (record?.item?.error && !delivered(record.item)) titleCell.append(node("div", friendlyError(record.item.error), "note " + (status.tone === "bad" ? "bad" : "warn")));
+      // Only the main line here: on a phone the server's words would crowd every failed row; the panel shows them.
+      if (record?.item?.error && !delivered(record.item)) titleCell.append(node("div", errorParts(record.item.error)[0], "note " + (status.tone === "bad" ? "bad" : "warn")));
       const stateCell = node("td", undefined, "state-cell"); stateCell.append(statusMark(status));
       tr.append(checkCell, dueCell, titleCell, stateCell);
       // The whole row answers a tap: the checkbox's cell ticks the box, the rest opens the answer when there is one.
@@ -458,7 +529,6 @@ function renderButtons() {
 // The job card: rebuilt when what it says changes; between those, each second only its clock and bar move, so the
 // sweep never restarts, a focused button keeps focus and the live region is not re-announced.
 let jobView = null;
-const STEP_NAMES = ["读资料", "Claude 作答", "核验", "生成答案"];
 function progressBar(percent, label, tone, halted) {
   const bar = node("div", undefined, "ys-progress meter" + (percent === null ? " ys-meter--indeterminate indeterminate" : "") + (tone ? " ys-meter--" + tone : "") + (halted ? " is-halted" : ""));
   bar.setAttribute("role", "progressbar"); bar.setAttribute("aria-label", label);
@@ -469,9 +539,9 @@ function progressBar(percent, label, tone, halted) {
 }
 function setPercent(bar, fill, percent) { fill.style.width = percent.toFixed(1) + "%"; bar.setAttribute("aria-valuenow", String(Math.round(percent))); }
 // halted: the worker is gone, so the step it was on is marked stopped rather than running.
-function stepList(current, halted) {
+function stepList(current, halted, job) {
   const list = node("ol", undefined, "ys-steps steps");
-  STEP_NAMES.forEach((label, i) => {
+  stepNames(job, activeProvider()).forEach((label, i) => {
     const done = i < current, now = i === current, stopped = now && halted;
     const li = node("li", undefined, "ys-step step" + (done ? " ys-step--done done" : stopped ? " ys-step--failed" : now ? " ys-step--current current" : ""));
     if (now) li.setAttribute("aria-current", "step");
@@ -532,11 +602,11 @@ function renderJob() {
   if (s.active) {
     view.meter = progressBar(s.percent, "处理进度", s.warning ? (dead ? "bad" : "warn") : null, dead);
     view.fill = view.meter.firstChild;
-    parts.push(view.meter, stepList(s.step, dead));
+    parts.push(view.meter, stepList(s.step, dead, job));
   }
   if (message) {
     if (s.warning) { const line = node("p", undefined, "job-warning small warn" + (dead ? " bad" : "")); line.append(ysIcon(dead ? "error" : "warning"), node("span", friendlyError(message))); parts.push(line); }
-    else parts.push(node("p", friendlyError(message), "job-message small muted"));
+    else { const line = node("p", undefined, "job-message small muted"); line.append(...errorNodes(message)); parts.push(line); }
   }
   keepFocus(card, () => card.replaceChildren(...parts));
   jobView = view;
@@ -561,8 +631,8 @@ function renderHistory() {
       details.dataset.job = job.id; details.open = open.has(job.id);
       summary.dataset.focus = "history-" + job.id;
       const time = node("time", dateLabel(job.created_at, true)); time.dateTime = job.created_at || "";
-      summary.append(time, factRow([kindLabels[job.kind] || job.kind, job.items?.length ? `${job.items.length} 项` : null, job.model ? modelName(job.model) : null,
-        job.message ? {text: friendlyError(job.message), wrap: true} : null], "history-text"), jobStateMark(job.status), ysIcon("chevron-right"));
+      summary.append(time, factRow([kindLabels[job.kind] || job.kind, job.items?.length ? `${job.items.length} 项` : null, job.model ? modelLabel(job.model, jobProvider(job), state.models) : null,
+        job.message ? {text: errorParts(job.message)[0], wrap: true} : null], "history-text"), jobStateMark(job.status), ysIcon("chevron-right"));
       details.append(summary);
       const events = node("ol", undefined, "events");
       for (const event of (job.events || []).slice(-40)) { const row = node("li"), at = node("time", dateLabel(event.at, true)); at.dateTime = event.at || ""; row.append(at, node("span", event.message)); events.append(row); }
@@ -576,6 +646,125 @@ function renderApiKey() {
   const status = state.apiKey, el = $("apiKeyStatus");
   el.replaceChildren(!status ? "正在读取…" : status.configured ? factRow(["已设置", `末尾 ${status.last4}`, status.updated_at ? "更新于 " + dateLabel(status.updated_at, true) : null]) : "尚未设置。没有密钥时不会调用 Claude。");
   $("apiKeyClear").hidden = !status?.configured;
+}
+// The model provider: the active one answers new jobs; the settings dialog can show the other one before it is saved.
+function activeProvider() { return state.provider?.active || "anthropic"; }
+function setText(el, text) { if (el.textContent !== text) el.textContent = text; }
+function renderProvider() {
+  const active = activeProvider(), view = state.providerView || active;
+  for (const b of $("providerSeg").children) b.setAttribute("aria-pressed", String(b.dataset.provider === view));
+  $("anthropicSettings").hidden = view !== "anthropic"; $("openaiSettings").hidden = view !== "openai";
+  // OpenAI is chosen but not saved yet: Claude still answers until 保存并验证 succeeds. (A saved one is being switched to.)
+  const pending = view === "openai" && active !== "openai" && !state.provider?.openai?.configured;
+  $("providerNotice").hidden = !pending; $("providerNote").hidden = pending;
+  if (pending) setText($("providerNoticeText"), "OpenAI 兼容接口还没有保存，作答仍使用 Claude API。填好下面的接口地址、密钥和模型，点“保存并验证”后会切换过去。");
+  renderOpenaiStatus();
+}
+function renderOpenaiStatus() {
+  const status = state.provider?.openai, el = $("openaiStatus"), shown = !!(status?.configured || status?.damaged);
+  // A damaged file is said so and can be deleted; with nothing saved there is nothing to show or delete.
+  el.hidden = !shown; $("openaiClear").hidden = !shown;
+  // The saved key can be kept only when something is saved.
+  $("openaiKeyReuse").hidden = !status?.configured;
+  setText($("openaiModelsHint"), state.openaiSuggestions.length ? `输入时会提示接口列出的 ${state.openaiSuggestions.length} 个模型。` : "");
+  if (!shown) { el.replaceChildren(); delete el.dataset.key; return; }
+  const lines = [];
+  if (!status.configured) lines.push(node("span", "保存的设置已损坏，读不出来。请重新填写并保存，或删除。", "status-sub warn"));
+  else {
+    lines.push(factRow([status.host, {text: status.models.join("、"), wrap: true}, status.last4 ? `密钥 …${status.last4}` : "已保存密钥",
+      status.updated_at ? "更新于 " + dateLabel(status.updated_at, true) : null]));
+    if (!status.models_listed) lines.push(node("span", "这个接口没有提供模型列表：密钥和模型要到作答时才能确认。", "status-sub"));
+    else if (status.key_checked === false) lines.push(node("span", "这个接口不用密钥也能读取模型列表：密钥要到作答时才能确认。", "status-sub"));
+    if (status.models_listed && status.unlisted_models?.length) lines.push(node("span", `接口的模型列表里没有 ${status.unlisted_models.join("、")}；列表常常不全，已照样保存。`, "status-sub"));
+    if (status.plain_http) lines.push(node("span", "这个地址用 http，密钥会以明文发送；能用 https 时请改用 https。", "status-sub warn"));
+  }
+  const key = JSON.stringify([status, state.timezone]);
+  if (el.dataset.key !== key) { el.dataset.key = key; el.replaceChildren(...lines); }
+}
+// The form shows the saved address and models when the dialog opens and after a save, never while it is being edited.
+function fillOpenaiForm() {
+  const status = state.provider?.openai;
+  $("openaiBaseUrl").value = status?.base_url || ""; $("openaiKey").value = ""; $("openaiModels").value = status?.models?.join(", ") || "";
+  showOpenaiError(null); renderModelSuggestions();
+}
+function showOpenaiError(message) {
+  const el = $("openaiError");
+  el.replaceChildren(...(message ? errorNodes(message) : [])); el.hidden = !message;
+  // The field the problem is in is marked; any edit clears the mark.
+  const field = !message ? null
+    : /^(请填写接口地址|接口地址|连不上|这个地址返回的不是模型列表|验证时接口返回错误)/.test(message) ? "openaiBaseUrl"
+    : /^(请至少填写一个模型|最多填写|模型名称)/.test(message) ? "openaiModels"
+    : /^(请填写接口的密钥|换了接口地址|密钥|接口拒绝了这个密钥)/.test(message) ? "openaiKey" : null;
+  for (const id of ["openaiBaseUrl", "openaiKey", "openaiModels"]) { if (id === field) $(id).setAttribute("aria-invalid", "true"); else $(id).removeAttribute("aria-invalid"); }
+  if (message) el.parentElement.scrollIntoView({block: "nearest"});
+}
+// Suggestions for the model field: the endpoint's own ids, completing the name after the last comma, so picking one
+// keeps the names already typed.
+function renderModelSuggestions() {
+  const value = $("openaiModels").value, cut = Math.max(...[",", "，", "、"].map(x => value.lastIndexOf(x)));
+  const head = cut >= 0 ? value.slice(0, cut + 1).replace(/\s*$/, " ") : "", last = value.slice(cut + 1).trim().toLowerCase();
+  const chosen = new Set(head.split(/[,，、]/).map(x => x.trim()).filter(Boolean));
+  const options = state.openaiSuggestions.filter(id => !chosen.has(id) && (!last || id.toLowerCase().includes(last))).slice(0, 60);
+  $("openaiModelList").replaceChildren(...options.map(id => { const option = node("option"); option.value = head + id; return option; }));
+}
+function applySettings(view) {
+  state.provider = {active: view.active, anthropic: view.anthropic, openai: view.openai}; state.apiKey = view.anthropic;
+  if (Array.isArray(view.suggestions)) state.openaiSuggestions = view.suggestions;
+}
+function openSettings() {
+  state.providerView = null; fillOpenaiForm(); renderProvider();
+  $("settingsDialog").showModal();
+  if (state.provider?.openai?.configured)
+    api("/api/settings/openai").then(view => { applySettings(view); renderProvider(); renderModelSuggestions(); }).catch(() => {});
+}
+async function chooseProvider(provider) {
+  if (provider === (state.providerView || activeProvider()) || $("providerSeg").getAttribute("aria-busy")) return;
+  state.providerView = provider === activeProvider() ? null : provider; renderProvider();
+  // Choosing OpenAI before it is saved only shows its form: the switch happens once 保存并验证 succeeds.
+  if (provider === activeProvider() || (provider === "openai" && !state.provider?.openai?.configured)) return;
+  await switchProvider(provider);
+}
+// The server's view of the provider settings, re-read after a refusal: another tab may have changed them meanwhile.
+function reloadSettings() { return api("/api/settings/openai").then(view => { applySettings(view); renderProvider(); renderIssues(); renderButtons(); }).catch(() => {}); }
+async function switchProvider(provider) {
+  setBusy($("providerSeg"), true);
+  try {
+    applySettings(await api("/api/settings/provider", "PUT", {provider})); state.providerView = null;
+    toast(provider === "openai" ? `作答改用 OpenAI 兼容接口（${state.provider.openai.host}）` : "作答改用 Claude API", "ok");
+    await loadModels();
+  } catch (error) { state.providerView = null; toast(error.message, "bad"); await reloadSettings(); }
+  finally { setBusy($("providerSeg"), false); renderProvider(); renderIssues(); renderButtons(); }
+}
+// While one settings request runs, the other button waits: a 删除 during 保存并验证 would be undone by the save.
+function settingsBusy(busy) { $("openaiSave").disabled = busy; $("openaiClear").disabled = busy; }
+async function saveOpenai() {
+  const save = $("openaiSave"), body = {base_url: $("openaiBaseUrl").value.trim(), models: $("openaiModels").value};
+  const key = $("openaiKey").value.trim(); if (key) body.api_key = key;
+  settingsBusy(true); setBusy(save, true); save.textContent = "正在验证…"; showOpenaiError(null);
+  try {
+    const view = await api("/api/settings/openai", "PUT", body); applySettings(view);
+    let switched = false;
+    if (state.providerView === "openai" && activeProvider() !== "openai") {
+      applySettings(await api("/api/settings/provider", "PUT", {provider: "openai"})); switched = true;
+    }
+    state.providerView = null; fillOpenaiForm();
+    if (activeProvider() === "openai") await loadModels();
+    toast(savedMessage(view.check, switched), "ok");
+  } catch (error) { showOpenaiError(error.message); }
+  finally {
+    settingsBusy(false); setBusy(save, false); save.textContent = "保存并验证"; renderProvider(); renderIssues(); renderButtons();
+    // The button was disabled while it worked, which dropped keyboard focus to the page: it goes back to the button.
+    if ($("settingsDialog").open && (!document.activeElement || document.activeElement === document.body)) save.focus({preventScroll: true});
+  }
+}
+async function clearOpenai() {
+  if (!confirm("删除已保存的 OpenAI 兼容接口设置？删除后作答改用 Claude API。")) return;
+  settingsBusy(true);
+  try {
+    applySettings(await api("/api/settings/openai", "PUT", {clear: true})); state.providerView = null; state.openaiSuggestions = [];
+    fillOpenaiForm(); await loadModels(); toast("已删除 OpenAI 兼容接口的设置，作答改用 Claude API", "ok");
+  } catch (error) { toast(error.message, "bad"); }
+  finally { settingsBusy(false); renderProvider(); renderIssues(); renderButtons(); }
 }
 
 // ---- jobs ----------------------------------------------------------------
@@ -616,7 +805,8 @@ function jobAction(id, verb) { return action(`/api/jobs/${id}/${verb}`, {}); }
 function startSelected() {
   const items = targets();
   if (!items.length) return;
-  if (aiEnabled() && state.apiKey && !state.apiKey.configured) { toast("请先在设置里填写 Claude API 密钥。"); $("settingsDialog").showModal(); return; }
+  if (aiEnabled() && activeProvider() === "anthropic" && state.apiKey && !state.apiKey.configured) { toast("请先在设置里填写 Claude API 密钥。"); openSettings(); return; }
+  if (aiEnabled() && activeProvider() === "openai" && state.provider && !state.provider.openai?.configured) { toast("请先在设置里填写 OpenAI 兼容接口。"); openSettings(); return; }
   const body = {selected: items.map(({course_id, assignment_id}) => ({course_id, assignment_id})), ai_confirmed: aiEnabled()};
   if (aiEnabled()) Object.assign(body, {model: $("modelSelect").value, effort: $("effortSelect").value || null});
   state.selected.clear();
@@ -625,28 +815,38 @@ function startSelected() {
 
 // ---- models and settings -------------------------------------------------
 
+// The toolbar lists the active provider's models. Each provider remembers its own choice.
+const choiceKeys = () => state.models?.provider === "openai" ? ["classroom-openai-model", "classroom-openai-effort"] : ["classroom-model", "classroom-effort"];
 async function loadModels() {
+  const select = $("modelSelect");
   try {
     const catalog = await api("/api/models"); state.models = catalog;
-    const select = $("modelSelect"); select.replaceChildren();
+    select.replaceChildren();
     for (const model of catalog.models) { const option = node("option", model.displayName || model.model); option.value = model.model; select.append(option); }
-    const saved = localStorage.getItem("classroom-model");
+    const [modelKey, effortKey] = choiceKeys(), saved = localStorage.getItem(modelKey);
     select.value = catalog.models.some(x => x.model === saved) ? saved : catalog.default_model;
-    renderEfforts(localStorage.getItem("classroom-effort"));
-  } catch (error) { toast(error.message, "bad"); }
+    renderEfforts(localStorage.getItem(effortKey));
+  } catch (error) {
+    state.models = null; select.replaceChildren(node("option", "没有模型")); $("effortSelect").replaceChildren(node("option", "—"));
+    toast(error.message, "bad");
+  }
   renderButtons();
 }
+// An OpenAI-compatible server gets no reasoning_effort unless one is chosen: 默认 sends nothing.
 function renderEfforts(preferred) {
   const model = state.models?.models.find(x => x.model === $("modelSelect").value), select = $("effortSelect"); select.replaceChildren();
+  if (state.models?.provider === "openai") { const option = node("option", "强度 默认"); option.value = ""; select.append(option); }
   for (const {reasoningEffort} of model?.supportedReasoningEfforts || []) { const option = node("option", "强度 " + (efforts[reasoningEffort] || reasoningEffort)); option.value = reasoningEffort; select.append(option); }
   const values = [...select.options].map(x => x.value);
   select.value = values.includes(preferred) ? preferred : values.includes(model?.defaultReasoningEffort) ? model.defaultReasoningEffort : values[0] || "";
 }
-function modelName(id) { return state.models?.models.find(x => x.model === id)?.displayName || id; }
-function saveModelChoice() { localStorage.setItem("classroom-model", $("modelSelect").value); localStorage.setItem("classroom-effort", $("effortSelect").value); }
+function saveModelChoice() { const [modelKey, effortKey] = choiceKeys(); localStorage.setItem(modelKey, $("modelSelect").value); localStorage.setItem(effortKey, $("effortSelect").value); }
 async function saveApiKey(key) {
   const buttons = $("apiKeyForm").querySelectorAll("button"); buttons.forEach(x => { x.disabled = true; });
-  try { state.apiKey = await api("/api/settings/api-key", "PUT", {key}); $("apiKeyInput").value = ""; renderApiKey(); renderIssues(); toast(key ? "API 密钥已验证并保存" : "API 密钥已删除", "ok"); }
+  try {
+    state.apiKey = await api("/api/settings/api-key", "PUT", {key}); if (state.provider) state.provider.anthropic = state.apiKey;
+    $("apiKeyInput").value = ""; renderApiKey(); renderIssues(); toast(key ? "API 密钥已验证并保存" : "API 密钥已删除", "ok");
+  }
   catch (error) { toast(error.message, "bad"); }
   finally { buttons.forEach(x => { x.disabled = false; }); }
 }
@@ -661,7 +861,7 @@ function panelLoading() {
   for (let i = 0; i < 4; i++) box.append(node("span", undefined, "ys-skeleton-bar"));
   return box;
 }
-function panelError(message) { const p = node("p", undefined, "panel-error bad"); p.append(ysIcon("error"), node("span", message)); return p; }
+function panelError(message) { const p = node("p", undefined, "panel-error bad"), words = node("span"); words.append(...errorNodes(message)); p.append(ysIcon("error"), words); return p; }
 async function openPanel(jobId, key, tab = "answer") {
   const record = latestItems().get(key), job = state.jobs.find(x => x.id === jobId) || record?.job;
   const item = job?.items.find(x => keyOf(x) === key) || record?.item;
@@ -672,7 +872,10 @@ async function openPanel(jobId, key, tab = "answer") {
   withLang($("panelTitle"), item.title).textContent = item.title || key; $("panelMeta").textContent = "正在读取…";
   $("panelActions").replaceChildren(); $("panelNotes").replaceChildren(); $("panelTabs").replaceChildren(); $("panelContent").replaceChildren(panelLoading());
   if (panelCovers() && !reopening) { $("panel").scrollTop = 0; $("panelTitle").focus({preventScroll: true}); }
-  if (!item.package) { $("panelMeta").textContent = item.course_name || ""; $("panelContent").replaceChildren(node("p", friendlyError(item.error || "这项作业还没有资料包。"), "content-empty warn")); return; }
+  if (!item.package) {
+    const empty = node("p", undefined, "content-empty warn"); empty.append(...errorNodes(item.error || "这项作业还没有资料包。"));
+    $("panelMeta").textContent = item.course_name || ""; $("panelContent").replaceChildren(empty); return;
+  }
   setBusy($("panel"), true);
   try {
     const data = await api(`/api/jobs/${jobId}/items/${key}`);
@@ -690,7 +893,8 @@ function renderPanel() {
   const {data, jobId, key, item} = state.panel, g = data.generation, manifest = data.manifest, assignment = manifest.assignment;
   withLang($("panelTitle"), assignment.title || item.title).textContent = assignment.title || item.title || key;
   const meta = [manifest.course_name ? {text: manifest.course_name, lang: ja(manifest.course_name), wrap: true} : null];
-  if (g?.status === "completed") meta.push(modelName(g.model), `${efforts[g.reasoning_effort] || g.reasoning_effort || "默认"}强度`, Number.isFinite(g.cost_usd) ? `约 ${g.cost_usd.toFixed(3)} 美元` : null);
+  if (g?.status === "completed") meta.push(modelLabel(g.model, recordProvider(g), state.models), g.provider === "openai_compatible" ? "OpenAI 兼容接口" : null,
+    `${efforts[g.reasoning_effort] || g.reasoning_effort || "默认"}强度`, Number.isFinite(g.cost_usd) ? `约 ${g.cost_usd.toFixed(3)} 美元` : null);
   meta.push(data.text["draft.md"] ? "未提交" : g?.status === "not_invoked" ? "只整理了资料" : "还没有答案");
   $("panelMeta").replaceChildren(factRow(meta));
 
@@ -718,11 +922,13 @@ function renderPanel() {
   // The note counts what the 待核对 tab counts: the questions, and any 资料缺口 listed under them.
   const questions = data.review?.questions || [], gaps = (manifest.warnings || []).length;
   if (questions.length) lines.push(["warn", `${questions.length} 条需要你核对${gaps ? `、${gaps} 处资料缺口` : ""}，见“待核对”。`]);
-  if (g?.error && g.status !== "completed") lines.push(["bad", friendlyError(g.error)]);
+  const unseen = g?.status === "completed" ? imagesNote(g) : null;
+  if (unseen) lines.push(["warn", unseen]);
+  if (g?.error && g.status !== "completed") lines.push(["bad", errorNodes(g.error)]);
   if (lines.length) {
     const worst = ["bad", "warn", "info"].find(tone => lines.some(([t]) => t === tone));
     const box = node("div", undefined, `note-box ys-alert ys-alert--${worst}`), body = node("div", undefined, "ys-alert-body note-lines");
-    for (const [, line] of lines) body.append(node("p", line));
+    for (const [, line] of lines) { const p = node("p"); p.append(...[line].flat()); body.append(p); }
     box.append(ysIcon(worst === "bad" ? "error" : worst === "warn" ? "warning" : "info"), body);
     notes.append(box);
   }
@@ -914,11 +1120,19 @@ function renderPanelTab() {
     // A record left at "running" by a run that is over (the job ended or was interrupted) was interrupted.
     const live = activeStates.has(state.jobs.find(x => x.id === jobId)?.status) && state.panel.item?.status !== "interrupted";
     const status = g.status === "completed" ? "已完成并通过核验" : g.status === "running" && !live ? labels.interrupted : labels[g.status] || g.status;
-    const rows = [["状态", status], ["模型", modelName(g.model || g.requested_model)], ["推理强度", efforts[g.reasoning_effort] || g.reasoning_effort || "默认"],
-      ["计费", g.api_key_source === "ANTHROPIC_API_KEY" ? "Claude API 密钥" : g.api_key_source || "—"], ["费用", Number.isFinite(g.cost_usd) ? `${g.cost_usd.toFixed(4)} 美元` : "—"],
+    // An OpenAI-compatible record names its host, the reply format the server took and what it could not take.
+    const openai = g.provider === "openai_compatible", relaxed = new Set(g.degradations || []);
+    const images = openai && Number.isFinite(g.images_sent) ? g.images_sent : g.input?.images?.length || 0;
+    const models = factRow(recordModels(g, id => modelLabel(id, recordProvider(g), state.models)).map((text, i) => ({text, cls: i ? "ys-muted" : null, wrap: text.length > 28})));
+    const rows = [["状态", status], ["模型", models],
+      ["推理强度", (efforts[g.reasoning_effort] || g.reasoning_effort || "默认") + (relaxed.has("reasoning_effort") ? "（接口不支持，未发送）" : "")],
+      ["计费", openai ? `OpenAI 兼容接口（${g.host || "—"}）` : g.api_key_source === "ANTHROPIC_API_KEY" ? "Claude API 密钥" : g.api_key_source || "—"],
+      ["费用", Number.isFinite(g.cost_usd) ? `${g.cost_usd.toFixed(4)} 美元` : "—"],
+      ...(openai ? [["结构化输出", OUTPUT_MODES[g.structured_output_mode] || "—"]] : []),
       ["用时", Number.isFinite(g.duration_ms) ? durationLabel(g.duration_ms) : "—"], ["输入 / 输出", usage.input_tokens !== undefined ? `${usage.input_tokens + (usage.cache_read_input_tokens || 0) + (usage.cache_creation_input_tokens || 0)} / ${usage.output_tokens} tokens` : "—"],
-      ["送入资料", `${g.input?.source_ids?.length || 0} 段文字 · ${g.input?.images?.length || 0} 张页图`], ["开始", dateLabel(g.started_at, true)], ["结束", g.finished_at ? dateLabel(g.finished_at, true) : "—"]];
-    for (const [label, value] of rows) dl.append(node("dt", label), node("dd", value));
+      ["送入资料", `${g.input?.source_ids?.length || 0} 段文字 · ${images} 张页图` + (g.images_dropped ? `（${g.images_dropped} 张没有发送：${imagesDroppedWhy(g)}）` : "")],
+      ["开始", dateLabel(g.started_at, true)], ["结束", g.finished_at ? dateLabel(g.finished_at, true) : "—"]];
+    for (const [label, value] of rows) { const dd = node("dd", typeof value === "string" ? value : undefined); if (typeof value !== "string") dd.append(value); dl.append(node("dt", label), dd); }
     content.append(dl);
     if (g.error) { const p = panelError(friendlyError(g.error)); p.classList.add("record-error"); content.append(p); }
     if (data.text["summary.md"]) content.append(node("h3", "模型说明"), node("pre", data.text["summary.md"], "content-text"));
@@ -998,15 +1212,19 @@ function updateSupplementActions() {
   $("saveSupplement").textContent = answersOnly ? "只保存回答" : "只保存";
   $("continueSupplement").textContent = answersOnly ? "保存并带入表单" : "保存并重做";
   $("supplementAiRow").hidden = !!answersOnly;
-  const s = state.supplement;
-  $("supplementModel").textContent = answersOnly ? "只合并你的回答，不重新调用 AI。" : `重做会使用 ${s.model ? modelName(s.model) : "所选模型"}。`;
+  const s = state.supplement, active = activeProvider();
+  const name = s.model ? modelLabel(s.model, active, state.models) : state.models?.provider === active ? modelLabel(state.models.default_model, active, state.models) : "默认模型";
+  $("supplementModel").textContent = answersOnly ? "只合并你的回答，不重新调用 AI。" : redoLine(name, active, s.from);
 }
 async function openSupplement(jobId, key) {
   try {
     const job = state.jobs.find(x => x.id === jobId) || await api(`/api/jobs/${jobId}`), item = job.items.find(x => keyOf(x) === key);
     const data = state.panel?.key === key && state.panel.data ? state.panel.data : item.package ? await api(`/api/jobs/${jobId}/items/${key}`) : null;
     const supplement = data?.supplement || await api(`/api/jobs/${jobId}/items/${key}/supplement`);
-    state.supplement = {jobId, key, model: $("modelSelect").value || job.model || null, effort: $("effortSelect").value || job.effort || null, editors: [], savedText: supplement.text || "", savedFacts: supplement.personal_facts || []};
+    // 强度 默认 sends no effort: a Claude job's effort never rides along onto the endpoint (redoChoice).
+    const toolbar = {provider: state.models?.provider, model: $("modelSelect").value, effort: $("effortSelect").value};
+    const from = data?.generation && data.generation.status !== "not_invoked" ? recordProvider(data.generation) : jobProvider(job);
+    state.supplement = {jobId, key, ...redoChoice(toolbar, job, activeProvider()), from, editors: [], savedText: supplement.text || "", savedFacts: supplement.personal_facts || []};
     withLang($("supplementTitle"), item.title).textContent = item.title || key;
     $("supplementText").value = supplement.text || ""; $("supplementFacts").value = (supplement.personal_facts || []).join("\n");
     renderAnswerInputs(data); updateSupplementActions();
@@ -1050,7 +1268,7 @@ async function saveSupplement(continueRun) {
 
 $("refreshButton").addEventListener("click", () => action("/api/refresh", {}));
 $("generateButton").addEventListener("click", startSelected);
-$("openSettings").addEventListener("click", () => $("settingsDialog").showModal());
+$("openSettings").addEventListener("click", openSettings);
 $("closePanel").addEventListener("click", closePanel);
 document.addEventListener("keydown", event => { if (event.key === "Escape" && state.panel && !document.querySelector("dialog[open]")) closePanel(); });
 for (const close of document.querySelectorAll(".close-dialog")) close.addEventListener("click", () => close.closest("dialog").close());
@@ -1064,6 +1282,11 @@ $("selectAll").addEventListener("change", () => { const latest = latestItems(); 
 $("clearSelection").addEventListener("click", () => { state.selected.clear(); renderList(); renderButtons(); });
 $("apiKeyForm").addEventListener("submit", event => { event.preventDefault(); saveApiKey($("apiKeyInput").value.trim()); });
 $("apiKeyClear").addEventListener("click", () => { if (confirm("删除已保存的 Claude API 密钥？删除后无法作答，直到重新填写。")) saveApiKey(""); });
+$("providerSeg").addEventListener("click", event => { const b = event.target.closest("button[data-provider]"); if (b) chooseProvider(b.dataset.provider); });
+$("openaiForm").addEventListener("submit", event => { event.preventDefault(); saveOpenai(); });
+$("openaiClear").addEventListener("click", clearOpenai);
+for (const id of ["openaiBaseUrl", "openaiKey", "openaiModels"]) $(id).addEventListener("input", () => $(id).removeAttribute("aria-invalid"));
+for (const type of ["input", "focus"]) $("openaiModels").addEventListener(type, renderModelSuggestions);
 $("policyForm").addEventListener("submit", async event => {
   event.preventDefault(); const submit = event.submitter; submit.disabled = true;
   try {

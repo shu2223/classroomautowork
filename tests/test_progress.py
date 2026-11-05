@@ -25,7 +25,7 @@ def test_structured_progress_preserves_start_time_but_tracks_real_new_activity(t
     assert "progress" not in jobs.job(identifier)
 
 
-@pytest.mark.parametrize("script", ["progress_view.js"])
+@pytest.mark.parametrize("script", ["progress_view.js", "provider_view.js"])
 def test_browser_progress_states_are_truthful(script):
     node = shutil.which("node")
     if not node:

@@ -1,4 +1,5 @@
-"""Local review production. Only an explicit UI action starts Claude; no Classroom writes."""
+"""Local review production. Only an explicit UI action starts a model turn (the Claude API or the
+OpenAI-compatible endpoint the job was started with); no Classroom writes."""
 
 import copy
 import hashlib
@@ -8,21 +9,33 @@ import time
 from dataclasses import asdict
 from pathlib import Path
 
+from . import openai_compat
 from .answer_document import plain_answer_text
 from .api_key import load_key
 from .claude_agent import DEFAULT_EFFORT, DEFAULT_MODEL, EFFORTS, image_block, run_turn
 from .completion import MODE, candidate_mode
 from .document_fill import missing_answer_fields
-from .errors import ConfigurationError, NeedsInput, PermissionDenied, RunCancelled, WorkflowError
+from .errors import (
+    ConfigurationError,
+    NeedsInput,
+    PermissionDenied,
+    RequestFailed,
+    RunCancelled,
+    WorkflowError,
+)
 from .form_fill import form_answer_coverage, prepare_response_forms, validate_answers
 from .local import atomic_json, require_private_path, sha256_file, utc_now
 from .policy import confirmed_gate
 from .progress import report
+from .providers import MODEL_NAME as OPENAI_MODEL
+from .providers import turn_config
 from .review import finalize
 from .student import StudentProfile
 from .supplements import personal_facts
 
 PROMPT_VERSION = "classroom-draft-v17-report-style"
+# generation.json names the provider "openai_compatible"; jobs and settings say "openai".
+OPENAI_RECORD = "openai_compatible"
 SKILL = Path(__file__).resolve().parents[2] / "skills" / "classroom-assistant"
 EVIDENCE_CHARACTERS = 100_000
 OUTPUT_CHARACTERS = 64_000
@@ -113,7 +126,26 @@ def blocked_review(package: Path, *, materials_only=False) -> dict:
     return finalize(package, path)
 
 
-def reusable_review(package: Path, *, model=None, effort=None) -> dict | None:
+def record_provider(generation: dict) -> str:
+    """The provider a generation record came from; records before providers were Claude's."""
+    return "openai" if generation.get("provider") == OPENAI_RECORD else "anthropic"
+
+
+def requested_model(generation: dict):
+    """The model a turn asked for. A Claude turn always reports the same one; an
+    OpenAI-compatible server may report a dated variant of it."""
+    return generation.get("requested_model") or generation.get("model")
+
+
+def same_provider(generation: dict, provider, host) -> bool:
+    if provider is None:
+        return True
+    if record_provider(generation) != provider:
+        return False
+    return provider != "openai" or generation.get("host") == host
+
+
+def reusable_review(package: Path, *, model=None, effort=None, provider=None, host=None):
     """Only reuse a complete review whose files, evidence and current rules still validate."""
     path = package / "review-receipt.json"
     if not path.is_file():
@@ -123,8 +155,9 @@ def reusable_review(package: Path, *, model=None, effort=None) -> dict | None:
         generation = json.loads((package / "generation.json").read_text(encoding="utf-8"))
         if (
             generation.get("status") != "completed"
-            or (model and generation.get("model") != model)
+            or (model and requested_model(generation) != model)
             or (effort and generation.get("reasoning_effort") != effort)
+            or not same_provider(generation, provider, host)
         ):
             return None
         for name in ("form_answers", "document_answers"):
@@ -257,7 +290,9 @@ def output_schema(requirement_source_ids=None):
     )
 
 
-def equivalent_review(package: Path, manifest: dict, *, model, effort) -> dict | None:
+def equivalent_review(
+    package: Path, manifest: dict, *, model, effort, provider="anthropic", host=None
+) -> dict | None:
     """Reuse actual AI output only when the new readable inputs are exactly equivalent."""
 
     def profile(path, name):
@@ -283,8 +318,9 @@ def equivalent_review(package: Path, manifest: dict, *, model, effort) -> dict |
             generation = json.loads((candidate / "generation.json").read_text(encoding="utf-8"))
             if (
                 generation.get("status") != "completed"
-                or generation.get("model") != model
+                or requested_model(generation) != model
                 or generation.get("reasoning_effort") != effort
+                or not same_provider(generation, provider, host)
                 or old.get("policy") != manifest["policy"]
                 or old.get("assignment") != manifest["assignment"]
                 or old.get("warnings") != manifest.get("warnings")
@@ -299,7 +335,9 @@ def equivalent_review(package: Path, manifest: dict, *, model, effort) -> dict |
                 profile(candidate, "requirements.json"),
             ) != wanted:
                 continue
-            result = reusable_review(candidate, model=model, effort=effort)
+            result = reusable_review(
+                candidate, model=model, effort=effort, provider=provider, host=host
+            )
             if result:
                 return result
         except (OSError, KeyError, ValueError, WorkflowError):
@@ -374,8 +412,23 @@ def choose_images(package: Path, ordered: list[dict], manifest: dict, recommende
     return chosen, candidates[MAX_MODEL_IMAGES:]
 
 
-def build_input(package: Path, skill: Path, manifest: dict, forms=None, repair_context=None):
-    """Send actual requirement/lecture text and page pixels, with a persisted input manifest."""
+def answering_line(model, host) -> str:
+    """The prompt line an OpenAI-compatible turn gets: the skill speaks of the chosen Claude model,
+    and an AI-use statement in the answer must name the model that really wrote it."""
+    return (
+        f"本次作答的模型是 {model}，经 OpenAI 兼容接口（{host}）调用，不是 Claude；"
+        "下方 Skill 里说的“所选 Claude 模型”就是指它。需要写 AI 使用说明"
+        "（suggested_disclosure，或原题要求注明所用的工具）时，写这个模型的名称，不要写 Claude。\n"
+    )
+
+
+def build_input(
+    package: Path, skill: Path, manifest: dict, forms=None, repair_context=None, answering=None
+):
+    """Send actual requirement/lecture text and page pixels, with a persisted input manifest.
+
+    answering is the line naming the model of an OpenAI-compatible turn; a Claude turn has none,
+    so its prompt is byte for byte what it always was."""
     evidence = json.loads((package / "evidence.json").read_text(encoding="utf-8"))["sources"]
     required = set(manifest["requirement_source_ids"])
     recommended = set(manifest.get("recommended_evidence_ids", [])) - required
@@ -434,7 +487,8 @@ def build_input(package: Path, skill: Path, manifest: dict, forms=None, repair_c
     ]
     prompt = (
         "你在本机 Classroom 作业助手中处理用户明确勾选的一个作业。仅生成本机结果，用户审阅后手动提交。\n"
-        f"本次模式：{policy_mode}。\n"
+        + (answering or "")
+        + f"本次模式：{policy_mode}。\n"
         f"用户明确提供的可信身份（私人配置）：{json.dumps(manifest.get('student_profile', {}), ensure_ascii=False)}\n"
         f"可信个人事实索引（user_fact 的 personal_fact_indices 只能引用这里）：{json.dumps(list(enumerate(facts)), ensure_ascii=False)}\n"
         f"用户对这项作业的补充说明：{json.dumps(manifest.get('supplement', {}).get('text', ''), ensure_ascii=False)}\n"
@@ -547,6 +601,7 @@ def generate_review(
     ai_confirmed=False,
     model=None,
     effort=None,
+    provider="anthropic",
     cancelled=lambda: False,
     progress=lambda _: None,
     on_generation=lambda _: None,
@@ -572,12 +627,27 @@ def generate_review(
         atomic_json(generation_path, generation)
         on_generation(generation)
         return blocked_review(package, materials_only=True)
-    if model is None:
-        model, effort = DEFAULT_MODEL, DEFAULT_EFFORT
-    if not isinstance(model, str) or not re.fullmatch(r"[A-Za-z0-9._-]{1,100}", model):
-        raise WorkflowError("请选择实际 Claude 模型。")
-    if effort is not None and effort not in EFFORTS:
-        raise WorkflowError("推理强度无效。")
+    # The provider is the one the job started with; its settings are read now, so a key or
+    # address changed since then is the one used. The key stays in this frame only.
+    endpoint = None
+    if provider == "openai":
+        endpoint = turn_config(package.parents[3])
+        if model is None:
+            model, effort = endpoint["models"][0], None
+        if not isinstance(model, str) or not OPENAI_MODEL.fullmatch(model):
+            raise WorkflowError("请选择 OpenAI 兼容接口的模型。")
+        if effort is not None and effort not in openai_compat.EFFORTS:
+            raise WorkflowError("推理强度无效。")
+    elif provider == "anthropic":
+        if model is None:
+            model, effort = DEFAULT_MODEL, DEFAULT_EFFORT
+        if not isinstance(model, str) or not re.fullmatch(r"[A-Za-z0-9._-]{1,100}", model):
+            raise WorkflowError("请选择实际 Claude 模型。")
+        if effort is not None and effort not in EFFORTS:
+            raise WorkflowError("推理强度无效。")
+    else:
+        raise WorkflowError("模型接口无效。")
+    host = endpoint["host"] if endpoint else None
     manifest["ai_confirmation"] = ai_confirmed
     manifest["policy"] = confirmed_gate(manifest["policy"], ai_confirmed)
     manifest["student_profile"] = asdict(StudentProfile.load(package.parents[3]))
@@ -613,18 +683,23 @@ def generate_review(
             for key in ("document_mapping_complete", "form_mapping_complete")
         )
 
-    same_content = equivalent_review(package, manifest, model=model, effort=effort)
+    same_content = equivalent_review(
+        package, manifest, model=model, effort=effort, provider=provider, host=host
+    )
     if reusable_for_attempt(same_content):
         progress("已核对实际文本、页图和文件校验值未变，复用原模型初稿；没有重新生成")
         on_generation(same_content["generation"])
         return {**same_content, "reused": True}
+    # Claude's identity is unchanged, so earlier Claude results stay reusable; an endpoint's
+    # answers are kept apart per address.
+    turn = ["claude-cli-v1"] if not endpoint else ["openai-compatible-v1", endpoint["base_url"]]
     identity = hashlib.sha256(
         json.dumps(
             [
                 manifest["fingerprint"],
                 model,
                 effort,
-                "claude-cli-v1",
+                *turn,
                 ai_confirmed,
                 manifest["generation_context"],
             ],
@@ -652,17 +727,26 @@ def generate_review(
                 raise WorkflowError("自动修复的已核验答案上下文发生变化，未覆盖已有结果。")
         else:
             atomic_json(repair_path, repair_context)
-    reused = reusable_review(package, model=model, effort=effort)
+    reused = reusable_review(package, model=model, effort=effort, provider=provider, host=host)
     if reusable_for_attempt(reused):
         progress("已复用同模型、同资料、同规则下通过核对的 AI 结果")
         on_generation(reused["generation"])
         return {**reused, "reused": True}
-    recovered = recover_completed_result(package, model=model, effort=effort, forms=forms)
+    recovered = recover_completed_result(
+        package, model=model, effort=effort, forms=forms, provider=provider, host=host
+    )
     if reusable_for_attempt(recovered):
         progress("已重新核验上次实际完成的答案，没有重新调用 AI")
         on_generation(recovered["generation"])
         return {**recovered, "reused": True}
-    inputs, input_record = build_input(package, skill, manifest, forms, repair_context)
+    inputs, input_record = build_input(
+        package,
+        skill,
+        manifest,
+        forms,
+        repair_context,
+        answering=answering_line(model, host) if endpoint else None,
+    )
     immutable = {
         name: sha256_file(package / name)
         for name in ("manifest.json", "requirements.json", "evidence.json")
@@ -685,6 +769,9 @@ def generate_review(
         "ai_confirmed": ai_confirmed,
         "package": str(package),
     }
+    if endpoint:
+        # The host names the endpoint in the record; its key never enters it.
+        generation.update(provider=OPENAI_RECORD, host=host)
 
     def save():
         atomic_json(generation_path, generation)
@@ -706,19 +793,46 @@ def generate_review(
             last_save = time.monotonic()
 
     try:
-        generation.update(status="running", model=model, provider="anthropic")
-        save()
-        report(progress, f"已启动 Claude（{model}），正在阅读题目和课堂资料", "ai")
-        outcome = run_turn(
-            inputs,
-            output_schema(manifest["requirement_source_ids"]),
-            model=model,
-            effort=effort,
-            cwd=package,
-            cancelled=cancelled,
-            on_activity=activity,
-            api_key=load_key(package.parents[3]),
-        )
+        if endpoint:
+            generation.update(status="running", model=model)
+            save()
+            report(
+                progress,
+                f"已向 OpenAI 兼容接口（{host}）发起请求（{model}），正在等待模型阅读题目和课堂资料",
+                "ai",
+            )
+            outcome = openai_compat.run_turn(
+                inputs,
+                output_schema(manifest["requirement_source_ids"]),
+                model=model,
+                effort=effort,
+                config=endpoint,
+                cancelled=cancelled,
+                on_activity=activity,
+            )
+            details = outcome["provider"]
+            generation.update(
+                structured_output_mode=details["structured_output_mode"],
+                images_sent=details["images_sent"],
+                images_dropped=details["images_dropped"],
+                degradations=details["degradations"],
+                streamed=details["streamed"],
+                finish_reason=details["finish_reason"],
+            )
+        else:
+            generation.update(status="running", model=model, provider="anthropic")
+            save()
+            report(progress, f"已启动 Claude（{model}），正在阅读题目和课堂资料", "ai")
+            outcome = run_turn(
+                inputs,
+                output_schema(manifest["requirement_source_ids"]),
+                model=model,
+                effort=effort,
+                cwd=package,
+                cancelled=cancelled,
+                on_activity=activity,
+                api_key=load_key(package.parents[3]),
+            )
         generation.update(
             thread_id=outcome["session_id"],
             api_key_source=outcome["api_key_source"],
@@ -743,7 +857,7 @@ def generate_review(
         raise
 
 
-def recover_completed_result(package: Path, *, model, effort, forms=None):
+def recover_completed_result(package: Path, *, model, effort, forms=None, provider=None, host=None):
     """Retry local validation only when the same completed turn and bytes survive."""
     try:
         generation = json.loads((package / "generation.json").read_text(encoding="utf-8"))
@@ -751,8 +865,9 @@ def recover_completed_result(package: Path, *, model, effort, forms=None):
         if (
             generation.get("status") != "failed"
             or generation.get("turn_status") != "completed"
-            or generation.get("model") != model
+            or requested_model(generation) != model
             or generation.get("reasoning_effort") != effort
+            or not same_provider(generation, provider, host)
             or generation.get("result_file") != "model-result.json"
             or sha256_file(result_path) != generation.get("result_sha256")
             or not generation.get("source_files_sha256")
@@ -994,7 +1109,9 @@ def generate_answer(package, **options):
                 failure = WorkflowError("原文档或表单仍有题目没有逐栏答案，正在补全映射。")
             else:
                 failure = WorkflowError("AI 未生成实际答案，已保留真实资料分析。")
-        except (RunCancelled, PermissionDenied, ConfigurationError):
+        except (RunCancelled, PermissionDenied, ConfigurationError, RequestFailed):
+            # A refused or failed request (a limit, the quota, the size, the server, the network)
+            # would fail again at once; only an answer that came back incomplete is repaired.
             raise
         except WorkflowError as exc:
             failure = exc

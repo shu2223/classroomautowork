@@ -166,6 +166,8 @@ class LocalHandler(BaseHTTPRequestHandler):
                 result = jobs.bootstrap()
             elif path == "/api/models":
                 result = jobs.models()
+            elif path == "/api/settings/openai":
+                result = jobs.openai_settings()
             elif match := re.fullmatch(r"/api/jobs/([a-f0-9]{32})", path):
                 result = jobs.job(match[1])
             elif match := re.fullmatch(r"/api/policies/([0-9]+)", path):
@@ -367,8 +369,14 @@ class LocalHandler(BaseHTTPRequestHandler):
         if not self._guard(mutation=True):
             return
         try:
-            if self._path() == "/api/settings/api-key":
-                self._send(200, self.server.jobs.set_api_key(self._body()))
+            # Settings take the same guard as every write; none of them answers with a key.
+            settings = {
+                "/api/settings/api-key": self.server.jobs.set_api_key,
+                "/api/settings/provider": self.server.jobs.set_provider,
+                "/api/settings/openai": self.server.jobs.set_openai,
+            }.get(self._path())
+            if settings:
+                self._send(200, settings(self._body()))
                 return
             match = re.fullmatch(r"/api/policies/([0-9]+)", self._path())
             if not match:

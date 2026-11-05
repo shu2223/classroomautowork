@@ -23,6 +23,18 @@ SUFFIXES = {".py", ".md", ".toml", ".yml", ".yaml", ".ps1", ".cmd", ".vbs", ".ht
 SECRET = re.compile(
     r"GOCSPX-[A-Za-z0-9_-]{10,}|AIza[0-9A-Za-z_-]{30,}|ya29\.[A-Za-z0-9_-]{20,}|-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY|[0-9]{5,}-[A-Za-z0-9_-]+\.apps\.googleusercontent\.com"
 )
+# API keys of the Claude API and of OpenAI-style endpoints (sk-…, sk-proj-…, sk-ant-…, DeepSeek's
+# sk-<32 hex>). The tests' placeholders repeat one letter many times; a real key never does.
+API_KEY = re.compile(r"(?<![A-Za-z0-9_-])sk-[A-Za-z0-9_-]{32,}")
+PLACEHOLDER_RUN = re.compile(r"(.)\1{5,}")
+
+
+def credential(content) -> bool:
+    """A credential in a published file: a known token shape, or an API key that is not a
+    placeholder made of one repeated letter."""
+    if SECRET.search(content):
+        return True
+    return any(not PLACEHOLDER_RUN.search(match[0]) for match in API_KEY.finditer(content))
 
 
 def git(*args):
@@ -58,7 +70,7 @@ def main():
             violations.append(name + ": unexpected publication file")
             continue
         content = git("show", ":" + name).decode("utf-8-sig")
-        if SECRET.search(content) or any(
+        if credential(content) or any(
             value and len(value) >= 8 and value in content for value in sensitive
         ):
             violations.append(name + ": credential/private identifier detected")
