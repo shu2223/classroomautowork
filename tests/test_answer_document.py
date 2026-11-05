@@ -254,7 +254,7 @@ def test_model_markdown_becomes_a_clean_japanese_report(tmp_path):
     package = verified_package(tmp_path)
     draft = (
         "# 第二回課題　調査と考察\n\n"
-        "学科：ファッション社会　クラス：D　学籍番号：00XX000　氏名：TEST\n\n"
+        "学科：テスト学科　クラス：D　学籍番号：00XX000　氏名：TEST\n\n"
         "## 1．調査した事実\n\n"
         "### (1) VUCA\n"
         "**用語の意味**\n"
