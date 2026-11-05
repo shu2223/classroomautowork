@@ -2,151 +2,177 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="robots" content="noindex">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#F2F3F5" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0E0F12" media="(prefers-color-scheme: dark)">
 <title>作业助手</title>
 <link rel="stylesheet" href="style.css">
 <script src="app.js" defer></script>
 </head>
 <body>
-<main class="page">
-  <header class="top">
-    <div>
-      <p class="small"><a class="back" id="homeLink" href="/">← 主页</a></p>
-      <h1>作业助手</h1>
-      <p class="muted small" id="subtitle">正在读取…</p>
+<header class="ys-topbar top">
+  <div class="ys-topbar-inner">
+    <a class="ys-back" id="homeLink" href="/"><svg class="ys-icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15.5 4 7.5 12l8 8"/></svg>主页</a>
+    <h1 class="ys-page-title">作业助手</h1>
+    <span id="issueCount" class="ys-page-status ys-pill ys-pill--lg" role="status" hidden></span>
+    <p class="ys-page-meta" id="subtitle">正在读取…</p>
+    <div class="ys-header-actions toolbar">
+      <div class="run-options">
+        <span class="ys-select model-select"><select id="modelSelect" aria-label="作答模型"><option>读取中…</option></select><svg class="ys-icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5.5 9.5 12 16l6.5-6.5"/></svg></span>
+        <span class="ys-select effort-select"><select id="effortSelect" aria-label="推理强度"><option value="">读取中…</option></select><svg class="ys-icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5.5 9.5 12 16l6.5-6.5"/></svg></span>
+      </div>
+      <button id="refreshButton" class="ys-btn btn refresh-button" type="button"><svg class="ys-icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18.14 16.3A7.5 7.5 0 1 1 17.3 6.7L20 9.4M20 4.8V9.4H15.4"/></svg>刷新</button>
+      <div class="primary-dock"><button id="generateButton" class="ys-btn ys-btn--primary btn primary" type="button">完成所选</button></div>
+      <button id="openSettings" class="ys-btn ys-btn--icon btn icon settings-button" type="button" aria-label="设置" title="设置"><svg class="ys-icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 7h2.5M11.5 7H20M4 17h8.5M17.5 17H20M9 4.5a2.5 2.5 0 1 0 0 5 2.5 2.5 0 0 0 0-5zM15 14.5a2.5 2.5 0 1 0 0 5 2.5 2.5 0 0 0 0-5z"/></svg></button>
     </div>
-    <div class="toolbar">
-      <select id="modelSelect" aria-label="作答模型"><option>读取中…</option></select>
-      <select id="effortSelect" aria-label="推理强度"></select>
-      <button id="refreshButton" class="btn" type="button">刷新</button>
-      <button id="generateButton" class="btn primary" type="button">完成所选</button>
-      <button id="openSettings" class="btn icon" type="button" aria-label="设置" title="设置"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 17h16"/><circle cx="9" cy="7" r="2.5"/><circle cx="15" cy="17" r="2.5"/></svg></button>
-    </div>
-  </header>
+  </div>
+</header>
 
-  <ul id="issues" class="issues" hidden></ul>
+<main class="ys-page page" id="main">
+  <section id="issuesBanner" class="ys-alert ys-alert--warn issues-banner" aria-label="需要注意的问题" hidden>
+    <svg class="ys-icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.27 4.5a2 2 0 0 1 3.46 0l7.36 12.75a2 2 0 0 1-1.73 3H4.64a2 2 0 0 1-1.73-3zM12 9.5v4M12 16.75h.01"/></svg>
+    <div class="ys-alert-body"><ul id="issues" class="issues" hidden></ul></div>
+  </section>
 
-  <section id="jobCard" class="card job" aria-live="polite" hidden></section>
+  <section id="jobCard" class="ys-card card job" aria-labelledby="jobTitle" aria-live="polite" aria-relevant="additions" hidden></section>
 
   <div id="workspace" class="workspace">
-    <section class="card" aria-labelledby="listTitle">
-      <h2 id="listTitle" class="sr-only">待办作业</h2>
-      <div class="card-head">
-        <div id="filters" class="filters" role="group" aria-label="按状态筛选"></div>
+    <section class="ys-card card list-card" aria-labelledby="listTitle">
+      <h2 id="listTitle" class="ys-sr-only">待办作业</h2>
+      <div class="list-head">
+        <div class="seg-scroller"><div id="filters" class="ys-seg filters" role="group" aria-label="按状态筛选"></div></div>
         <div class="list-tools">
-          <select id="courseFilter" aria-label="按课程筛选"></select>
-          <input id="searchInput" type="search" placeholder="搜索作业或课程" aria-label="搜索作业或课程">
+          <span class="ys-select course-select"><select id="courseFilter" aria-label="按课程筛选"></select><svg class="ys-icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5.5 9.5 12 16l6.5-6.5"/></svg></span>
+          <label class="ys-search list-search"><svg class="ys-icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.5 4.5a6 6 0 1 0 0 12 6 6 0 0 0 0-12zM15 15l4.5 4.5"/></svg><input id="searchInput" class="ys-input" type="search" placeholder="搜索作业或课程" aria-label="搜索作业或课程"></label>
         </div>
       </div>
-      <div class="scroll-x">
-        <table class="assignments">
+      <div class="ys-table-wrap list-table">
+        <table class="ys-table assignments">
           <colgroup><col class="check"><col class="due"><col><col class="state"></colgroup>
-          <thead><tr><th><input id="selectAll" type="checkbox" aria-label="全选当前列表"></th><th class="due">截止</th><th>作业</th><th>状态</th></tr></thead>
+          <thead><tr><th class="check"><input id="selectAll" class="ys-check" type="checkbox" aria-label="全选当前列表"></th><th class="due" scope="col">截止</th><th class="title-head" scope="col">作业</th><th class="state" scope="col">状态</th></tr></thead>
           <tbody id="assignmentList"></tbody>
         </table>
       </div>
-      <div class="list-foot small muted">
-        <span id="listHint"></span>
-        <button id="clearSelection" class="link small" type="button" hidden>清除勾选</button>
+      <div class="list-foot">
+        <span id="listHint" class="list-hint"></span>
+        <button id="clearSelection" class="ys-link link small" type="button" hidden>清除勾选</button>
       </div>
-      <details id="discoveryDetails" class="small" hidden>
+      <details id="discoveryDetails" class="ys-disclosure discovery" hidden>
         <summary id="discoverySummary"></summary>
-        <div id="discoveryContent"></div>
+        <div id="discoveryContent" class="ys-disclosure-body discovery-list"></div>
       </details>
     </section>
 
-    <aside id="panel" class="card panel" aria-labelledby="panelTitle" hidden>
-      <div class="panel-head">
-        <div>
-          <h2 id="panelTitle"></h2>
-          <p id="panelMeta" class="muted small"></p>
-        </div>
-        <button id="closePanel" class="btn icon" type="button" aria-label="关闭答案面板"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button>
+    <aside id="panel" class="ys-card card panel" aria-labelledby="panelTitle" hidden>
+      <div class="panel-bar">
+        <button id="closePanel" class="ys-btn ys-btn--icon ys-btn--quiet btn icon" type="button" aria-label="关闭答案面板" title="关闭"><svg class="ys-icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6.5 6.5l11 11M17.5 6.5l-11 11"/></svg></button>
       </div>
-      <div id="panelActions" class="actions"></div>
-      <div id="panelNotes"></div>
-      <div id="panelTabs" class="filters" role="tablist" aria-label="答案内容"></div>
-      <div id="panelContent" class="panel-content" role="tabpanel"></div>
+      <div class="panel-head">
+        <h2 id="panelTitle" class="panel-title" tabindex="-1"></h2>
+        <p id="panelMeta" class="panel-meta"></p>
+      </div>
+      <div id="panelActions" class="panel-actions actions"></div>
+      <div id="panelNotes" class="panel-notes"></div>
+      <div class="panel-tabs"><div id="panelTabs" class="ys-seg ys-seg--fill filters" role="tablist" aria-label="答案内容"></div></div>
+      <div id="panelContent" class="panel-content" role="tabpanel" aria-label="答案内容"></div>
     </aside>
   </div>
 
-  <section class="card" aria-labelledby="historyTitle">
-    <details id="historyDetails">
-      <summary><h2 id="historyTitle" class="inline-heading">最近处理</h2> <span id="historyCount" class="muted small"></span></summary>
-      <ol id="historyList" class="history"></ol>
+  <section class="ys-card card history" aria-labelledby="historyTitle">
+    <details id="historyDetails" class="ys-disclosure history-disclosure">
+      <summary><h2 id="historyTitle" class="ys-card-title inline-heading">最近处理</h2><span id="historyCount" class="ys-disclosure-meta"></span><svg class="ys-icon ys-disclosure-chevron" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9.5 5.5 16 12l-6.5 6.5"/></svg></summary>
+      <ol id="historyList" class="history-list"></ol>
     </details>
   </section>
 </main>
 
-<dialog id="settingsDialog" aria-labelledby="settingsTitle">
-  <div class="dialog-body">
-    <div class="dialog-head"><h2 id="settingsTitle">设置</h2><button class="btn icon close-dialog" type="button" aria-label="关闭"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button></div>
-    <label class="inline"><input id="aiConfirmed" type="checkbox"> 使用 AI 作答</label>
-    <p class="muted small">关闭后只整理题目和资料，不调用 Claude。</p>
-    <div class="setting">
-      <strong>Claude API 密钥</strong>
-      <p id="apiKeyStatus" class="muted small" role="status">正在读取…</p>
-      <form id="apiKeyForm" class="inline">
-        <input id="apiKeyInput" type="password" autocomplete="off" spellcheck="false" placeholder="sk-ant-…" aria-label="新的 Claude API 密钥" required>
-        <button class="btn small" type="submit">保存</button>
-        <button id="apiKeyClear" class="link small" type="button">删除</button>
-      </form>
-      <p class="muted small">按 API 用量计费。保存前会向 Anthropic 验证；保存后不再显示完整密钥。</p>
+<dialog id="settingsDialog" class="ys-dialog settings-dialog" aria-labelledby="settingsTitle">
+  <div class="ys-dialog-head">
+    <div class="ys-dialog-heading"><h2 id="settingsTitle" class="ys-dialog-title" tabindex="-1" autofocus>设置</h2></div>
+    <button class="ys-btn ys-btn--icon ys-btn--quiet close-dialog" type="button" aria-label="关闭"><svg class="ys-icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6.5 6.5l11 11M17.5 6.5l-11 11"/></svg></button>
+  </div>
+  <div class="ys-dialog-body">
+    <div class="group">
+      <label class="group-row switch-row"><span class="group-label">使用 AI 作答</span><input id="aiConfirmed" class="switch" type="checkbox" role="switch"></label>
     </div>
+    <p class="group-foot">关闭后只整理题目和资料，不调用 Claude。</p>
+    <h3 class="group-head">Claude API 密钥</h3>
+    <div class="group">
+      <p id="apiKeyStatus" class="group-row key-status" role="status">正在读取…</p>
+      <form id="apiKeyForm" class="group-row key-form inline">
+        <input id="apiKeyInput" class="ys-input" type="password" autocomplete="off" spellcheck="false" placeholder="sk-ant-…" aria-label="新的 Claude API 密钥" required>
+        <button class="ys-btn ys-btn--primary btn small" type="submit">保存</button>
+        <button id="apiKeyClear" class="ys-btn ys-btn--danger link small" type="button">删除</button>
+      </form>
+    </div>
+    <p class="group-foot">按 API 用量计费。保存前会向 Anthropic 验证；保存后不再显示完整密钥。</p>
   </div>
 </dialog>
 
-<dialog id="policyDialog" aria-labelledby="policyTitle">
-  <form id="policyForm" class="dialog-body">
-    <div class="dialog-head"><div><h2 id="policyTitle">课程规则</h2><p class="muted small">只保存在小主机上，作答时传给模型。</p></div><button class="btn icon close-dialog" type="button" aria-label="关闭"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button></div>
-    <label class="field"><span>教师的 AI 规定</span>
-      <select id="policyUse"><option value="unknown">未知</option><option value="allowed">允许</option><option value="limited">有限度允许</option><option value="forbidden">禁止（仅记录，不阻止生成）</option></select></label>
-    <label class="field"><span>规定原文与来源</span><textarea id="policyEvidence" rows="3"></textarea></label>
-    <label class="field"><span>允许的用途（有限度允许时必填）</span><textarea id="policyLimits" rows="2"></textarea></label>
-    <label class="field"><span>需要附上的 AI 使用说明</span><textarea id="policyDisclosure" rows="2"></textarea></label>
-    <label class="field"><span>你的真实个人事实（每行一项，这门课所有作业都会用到）</span><textarea id="personalFacts" rows="3"></textarea></label>
-    <p id="policyError" class="error" hidden></p>
-    <div class="dialog-foot"><button class="btn primary" type="submit">保存</button></div>
+<dialog id="policyDialog" class="ys-dialog" aria-labelledby="policyTitle">
+  <form id="policyForm">
+    <div class="ys-dialog-head">
+      <div class="ys-dialog-heading"><h2 id="policyTitle" class="ys-dialog-title" tabindex="-1" autofocus>课程规则</h2><p class="ys-dialog-sub">只保存在小主机上，作答时传给模型。</p></div>
+      <button class="ys-btn ys-btn--icon ys-btn--quiet close-dialog" type="button" aria-label="关闭"><svg class="ys-icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6.5 6.5l11 11M17.5 6.5l-11 11"/></svg></button>
+    </div>
+    <div class="ys-dialog-body form-stack">
+      <label class="ys-field field"><span class="ys-field-label">教师的 AI 规定</span>
+        <span class="ys-select"><select id="policyUse"><option value="unknown">未知</option><option value="allowed">允许</option><option value="limited">有限度允许</option><option value="forbidden">禁止（仅记录，不阻止生成）</option></select><svg class="ys-icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5.5 9.5 12 16l6.5-6.5"/></svg></span></label>
+      <label class="ys-field field"><span class="ys-field-label">规定原文与来源</span><textarea id="policyEvidence" class="ys-input" rows="3"></textarea></label>
+      <label class="ys-field field"><span class="ys-field-label">允许的用途（有限度允许时必填）</span><textarea id="policyLimits" class="ys-input" rows="2"></textarea></label>
+      <label class="ys-field field"><span class="ys-field-label">需要附上的 AI 使用说明</span><textarea id="policyDisclosure" class="ys-input" rows="2"></textarea></label>
+      <label class="ys-field field"><span class="ys-field-label">你的真实个人事实（每行一项，这门课所有作业都会用到）</span><textarea id="personalFacts" class="ys-input" rows="3"></textarea></label>
+      <div class="form-error" role="alert"><svg class="ys-icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3.5a8.5 8.5 0 1 0 0 17 8.5 8.5 0 0 0 0-17zM12 7.75v5M12 16.25h.01"/></svg><p id="policyError" class="error" hidden></p></div>
+    </div>
+    <div class="ys-dialog-foot dialog-foot"><button class="ys-btn ys-btn--primary btn primary" type="submit">保存</button></div>
   </form>
 </dialog>
 
-<dialog id="supplementDialog" aria-labelledby="supplementTitle">
-  <form id="supplementForm" class="dialog-body">
-    <div class="dialog-head"><div><h2 id="supplementTitle"></h2><p class="muted small">补充说明只用于这项作业。</p></div><button class="btn icon close-dialog" type="button" aria-label="关闭"><svg class="i" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button></div>
-    <section id="answerInputsSection" hidden>
-      <strong>需要你填写的栏位</strong>
-      <p id="answerInputNote" class="muted small"></p>
-      <div id="answerInputs"></div>
-    </section>
-    <details id="extraSupplement" open>
-      <summary>补充说明与个人事实</summary>
-      <div class="dialog-body nested">
-        <label class="field"><span>对这项作业的补充说明</span><textarea id="supplementText" rows="4" placeholder="例如：第 2 题按课堂上讲的例子来写"></textarea></label>
-        <label class="field"><span>真实个人事实（每行一项）</span><textarea id="supplementFacts" rows="3" placeholder="例如：实际观看内容、调查记录"></textarea></label>
+<dialog id="supplementDialog" class="ys-dialog supplement-dialog" aria-labelledby="supplementTitle">
+  <form id="supplementForm">
+    <div class="ys-dialog-head">
+      <div class="ys-dialog-heading"><h2 id="supplementTitle" class="ys-dialog-title" tabindex="-1" autofocus></h2><p class="ys-dialog-sub">补充说明只用于这项作业。</p></div>
+      <button class="ys-btn ys-btn--icon ys-btn--quiet close-dialog" type="button" aria-label="关闭"><svg class="ys-icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6.5 6.5l11 11M17.5 6.5l-11 11"/></svg></button>
+    </div>
+    <div class="ys-dialog-body form-stack">
+      <section id="answerInputsSection" class="form-section" aria-labelledby="answerInputsTitle" hidden>
+        <h3 id="answerInputsTitle" class="form-section-title">需要你填写的栏位</h3>
+        <p id="answerInputNote" class="ys-field-help"></p>
+        <div id="answerInputs" class="answer-inputs"></div>
+      </section>
+      <details id="extraSupplement" class="ys-disclosure form-disclosure" open>
+        <summary><span>补充说明与个人事实</span><svg class="ys-icon ys-disclosure-chevron" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9.5 5.5 16 12l-6.5 6.5"/></svg></summary>
+        <div class="ys-disclosure-body form-stack">
+          <label class="ys-field field"><span class="ys-field-label">对这项作业的补充说明</span><textarea id="supplementText" class="ys-input" rows="4" placeholder="例如：第 2 题按课堂上讲的例子来写"></textarea></label>
+          <label class="ys-field field"><span class="ys-field-label">真实个人事实（每行一项）</span><textarea id="supplementFacts" class="ys-input" rows="3" placeholder="例如：实际观看内容、调查记录"></textarea></label>
+        </div>
+      </details>
+      <div id="supplementQuestions" class="supplement-questions"></div>
+      <details id="browserQuestionSection" class="ys-disclosure form-disclosure">
+        <summary><span>导入需要登录的表单题目</span><svg class="ys-icon ys-disclosure-chevron" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9.5 5.5 16 12l-6.5 6.5"/></svg></summary>
+        <div class="ys-disclosure-body form-stack">
+          <p class="ys-field-help">需要学校登录的表单无法匿名读取题目。可在已登录的浏览器里取得题目数据后在这里导入；不会复制密码、cookies 或点击提交。</p>
+          <div id="restrictedFormLinks" class="actions form-links"></div>
+          <label class="ys-field field"><span class="ys-field-label">原表单链接</span><input id="captureUrl" class="ys-input" type="url"></label>
+          <label class="ys-field field"><span class="ys-field-label">题目数据</span><textarea id="captureScript" class="ys-input" rows="3" spellcheck="false"></textarea></label>
+          <div><button id="importQuestions" class="ys-btn btn small" type="button">导入题目</button></div>
+        </div>
+      </details>
+      <div class="run-choice">
+        <label id="supplementAiRow" class="switch-line inline small"><span>使用 AI 重新作答</span><input id="supplementAi" class="switch" type="checkbox" role="switch"></label>
+        <p id="supplementModel" class="ys-field-help"></p>
       </div>
-    </details>
-    <div id="supplementQuestions" class="small"></div>
-    <details id="browserQuestionSection" class="small">
-      <summary>导入需要登录的表单题目</summary>
-      <div class="dialog-body nested">
-        <p class="muted">需要学校登录的表单无法匿名读取题目。可在已登录的浏览器里取得题目数据后在这里导入；不会复制密码、cookies 或点击提交。</p>
-        <div id="restrictedFormLinks" class="actions"></div>
-        <label class="field"><span>原表单链接</span><input id="captureUrl" type="url"></label>
-        <label class="field"><span>题目数据</span><textarea id="captureScript" rows="3"></textarea></label>
-        <div><button id="importQuestions" class="btn small" type="button">导入题目</button></div>
-      </div>
-    </details>
-    <label id="supplementAiRow" class="inline small"><input id="supplementAi" type="checkbox"> 使用 AI 重新作答</label>
-    <p id="supplementModel" class="muted small"></p>
-    <p id="supplementError" class="error" hidden></p>
-    <div class="dialog-foot">
-      <button id="saveSupplement" class="btn" type="button">只保存</button>
-      <button id="continueSupplement" class="btn primary" type="submit">保存并重做</button>
+      <div class="form-error" role="alert"><svg class="ys-icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3.5a8.5 8.5 0 1 0 0 17 8.5 8.5 0 0 0 0-17zM12 7.75v5M12 16.25h.01"/></svg><p id="supplementError" class="error" hidden></p></div>
+    </div>
+    <div class="ys-dialog-foot dialog-foot">
+      <button id="saveSupplement" class="ys-btn btn" type="button">只保存</button>
+      <button id="continueSupplement" class="ys-btn ys-btn--primary btn primary" type="submit">保存并重做</button>
     </div>
   </form>
 </dialog>
 
-<div id="toast" class="toast" role="status" hidden></div>
+<div id="toast" class="ys-toast toast" role="status" hidden></div>
 </body>
 </html>
