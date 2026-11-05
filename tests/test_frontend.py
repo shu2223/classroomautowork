@@ -606,10 +606,13 @@ def test_the_model_catalog_follows_the_active_provider(tmp_path):
         catalog["default_effort"] is None and catalog["source"] == "OpenAI 兼容接口 api.example.com"
     )
     assert all(x["defaultReasoningEffort"] is None for x in catalog["models"])
+    # The same five efforts as Claude's (默认, sending none, is the page's own choice).
     assert [x["reasoningEffort"] for x in catalog["models"][0]["supportedReasoningEfforts"]] == [
         "low",
         "medium",
         "high",
+        "xhigh",
+        "max",
     ]
     # A Claude list cached in ui/models.json never stands in for the endpoint's, nor the reverse.
     atomic_json(
@@ -631,7 +634,7 @@ def test_a_job_keeps_the_provider_it_started_with(tmp_path, monkeypatch):
     providers.save_provider(tmp_path, {"provider": "openai"})
     for model, effort, words in [
         ("claude-sonnet-5-5", None, "OpenAI 兼容接口设置的模型"),
-        ("served-a", "xhigh", "推理强度"),
+        ("served-a", "minimal", "推理强度"),
     ]:
         with pytest.raises(WorkflowError, match=words):
             jobs.start_selected(selection, ai_confirmed=True, model=model, effort=effort)
@@ -817,7 +820,9 @@ def test_the_settings_dialog_says_what_is_sent_and_when_the_key_may_stay_empty()
     # The reuse rule is shown only once a key is saved, and in its real terms.
     reuse = page.split('<span id="openaiKeyReuse"', 1)[1].split(">", 1)[0]
     assert " hidden" in reuse and "协议、主机和端口不变时可以留空" in page
-    assert '$("openaiKeyReuse").hidden = !status?.configured' in script
+    # Both endpoint forms share the renderer (2026-11-05); each names its own reuse line.
+    assert "el.reuse.hidden = !status?.configured" in script
+    assert 'reuse: $("openaiKeyReuse")' in script and 'reuse: $("compatKeyReuse")' in script
     # The foot note names the private data that reaches a third-party endpoint.
     foot = page.split('<section id="openaiSettings"', 1)[1].split("</section>", 1)[0]
     assert "学生资料（姓名、学号等）" in foot and "补充说明" in foot and "个人事实" in foot

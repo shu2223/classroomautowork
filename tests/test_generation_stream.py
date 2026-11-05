@@ -281,7 +281,7 @@ def test_an_openai_job_without_settings_stops_before_any_request(tmp_path, monke
         openai_package(tmp_path, monkeypatch, endpoint)
         for model, effort, words in [
             ("bad model", None, "OpenAI 兼容接口的模型"),
-            ("unit-model", "xhigh", "推理强度"),
+            ("unit-model", "minimal", "推理强度"),
         ]:
             with pytest.raises(WorkflowError, match=words):
                 drafting.generate_review(

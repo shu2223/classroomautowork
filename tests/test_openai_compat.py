@@ -231,6 +231,9 @@ def test_streamed_answer_is_validated_and_reported(endpoint):
         "degradations": [],
         "streamed": True,
         "finish_reason": "stop",
+        "output_limit": {"requested": None, "sent": None, "param": None},
+        "effort": {"requested": "high", "sent": "high"},
+        "reply_json": "bare",
     }
     assert isinstance(outcome["duration_ms"], int)
     assert labels[0] == openai_compat.ACTIVITY["reasoning"]
@@ -409,7 +412,9 @@ def test_an_error_inside_the_stream(endpoint):
         turn(endpoint)
 
 
-@pytest.mark.parametrize("finish, words", [("length", "长度上限"), ("content_filter", "内容审核")])
+@pytest.mark.parametrize(
+    "finish, words", [("length", "默认输出上限"), ("content_filter", "内容审核")]
+)
 def test_finish_reasons_that_mean_no_answer(endpoint, finish, words):
     endpoint.replies.append(reply_stream(chunks(json.dumps(answer()), finish=finish)))
     with pytest.raises(WorkflowError, match=words):
@@ -701,6 +706,7 @@ def test_list_models_reads_the_list_and_refuses_what_is_not_one(endpoint):
         "ids": ["m-1", "m-2"],
         "status": 200,
         "key_checked": True,
+        "shape": "openai",
     }
     assert endpoint.requests[0]["path"] == "/v1/models"
     assert endpoint.requests[0]["headers"]["Authorization"] == "Bearer " + KEY

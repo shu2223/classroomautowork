@@ -5,8 +5,10 @@ images), a strict JSON schema as response_format, streamed. A background thread 
 into a queue, so a pause, the 15-minute turn limit and the 5-minute idle limit end the wait and
 cut the connection, as on the Claude path. Servers differ in what they accept: a 400 or 422 that
 names a feature drops that feature and repeats the same request, one step per feature and never
-twice. The answer is validated here against the schema, so a lenient server cannot slip a
-malformed result through.
+twice. The optional output limit (max_tokens) is renamed, clamped to the server's stated maximum
+or dropped the same way, and an effort above high steps down once before it is dropped. The
+answer is validated here against the schema, so a lenient server cannot slip a malformed result
+through.
 
 The key travels only in the Authorization header to the configured address (redirects are never
 followed, since they would carry the header elsewhere) and is never put into an error, a record or
@@ -36,10 +38,23 @@ TURN_SECONDS = 15 * 60
 IDLE_SECONDS = 5 * 60
 CONNECT_SECONDS = 30
 LIST_SECONDS = 20
-EFFORTS = ("low", "medium", "high")
+# The efforts a job may choose, the same five words as on the Claude path; "默认" sends none.
+EFFORTS = ("low", "medium", "high", "xhigh", "max")
+# The order effort words go up in, to step down within what a server says it takes ("minimal"
+# is the lowest OpenAI word; the app never asks for it, but a server's list may offer it).
+EFFORT_ORDER = ("minimal", "low", "medium", "high", "xhigh", "max")
+# Above what the OpenAI API names itself: a refusal of one of these steps down once before the
+# effort is dropped. A refusal of low, medium or high drops it at once, as it always did.
+ABOVE_HIGH = ("xhigh", "max")
+# The output limit is sent as max_tokens (or max_completion_tokens, for OpenAI's reasoning models
+# that refuse max_tokens). A clamp to a server's stated maximum is used only down to this much
+# room: below it the request itself is too long, and the size handling takes over.
+MIN_OUTPUT_ROOM = 1000
 SCHEMA_NAME = "assignment_review"
 API_KEY_SOURCE = "openai_compatible"
 USER_AGENT = "classroomautowork (OpenAI-compatible client)"
+# The Anthropic-format endpoint's save check names itself as such, not as an OpenAI client.
+ANTHROPIC_USER_AGENT = "classroomautowork (Anthropic-compatible client)"
 MAX_REPLY_BYTES = 32_000_000
 MAX_ERROR_BYTES = 65_536
 MAX_LIST_BYTES = 8_000_000
@@ -57,9 +72,31 @@ TURN_MESSAGE = (
     "OpenAI 兼容接口的回合超过 15 分钟仍未完成，已停止等待并断开连接。"
     "请稍后重试，或换用更快的模型；" + KEPT
 )
+
+
+def _span(seconds) -> str:
+    seconds = int(seconds)
+    return f"{seconds // 60} 分钟" if seconds >= 120 and seconds % 60 == 0 else f"{seconds} 秒"
+
+
+def idle_message(seconds=IDLE_SECONDS) -> str:
+    """The idle-limit error for a turn given `seconds` of silence (a connection test has less)."""
+    if seconds == IDLE_SECONDS:
+        return IDLE_MESSAGE
+    return IDLE_MESSAGE.replace("5 分钟", _span(seconds))
+
+
+def turn_message(seconds=TURN_SECONDS) -> str:
+    if seconds == TURN_SECONDS:
+        return TURN_MESSAGE
+    return TURN_MESSAGE.replace("15 分钟", _span(seconds))
+
+
 # Each step drops one feature a server refused; json_schema falls back to json_object, then to a
 # prompt-only request. The order is the order the request is relaxed in. (A refusal for size
-# drops the page images as its own step, images_size; see degradable.)
+# drops the page images as its own step, images_size; the output limit has its own steps,
+# max_tokens_param, max_tokens_clamp and max_tokens; a refused xhigh or max goes down once as
+# reasoning_effort_lowered before reasoning_effort drops it. See degradable.)
 STEPS = ("reasoning_effort", "stream_options", "json_schema", "json_object", "images", "stream")
 STEP_WORDS = {
     # Only words about the effort or thinking itself: a length error can mention "reasoning
@@ -82,16 +119,76 @@ STEP_WORDS = {
     "stream": re.compile(r"\bstream"),
 }
 # A request longer than the model can read, in the words of OpenAI, vLLM, DeepSeek, Mistral,
-# DashScope, Gemini and Anthropic-style proxies.
+# DashScope, Gemini, Anthropic-style proxies, llama.cpp ("exceeds the available context size"),
+# xAI ("maximum prompt length"), Moonshot ("exceeded model token limit"), Zhipu ("Prompt 超长")
+# and SiliconFlow ("must be less than max_seq_len").
 TOO_LONG = re.compile(
-    r"context[\s_.-]*(?:length|window|limit)|maximum[\s_.-]*context|too[\s_.-]*many[\s_.-]*tokens"
+    r"context[\s_.-]*(?:length|window|limit|size)|maximum[\s_.-]*context"
+    r"|too[\s_.-]*many[\s_.-]*tokens|maximum[\s_.-]*prompt[\s_.-]*length"
     r"|(?:prompt|input)[\s_.-]*(?:is[\s_.-]*)?too[\s_.-]*long|input[\s_.-]*(?:length|token)"
-    r"|reduce[\s_.-]*the[\s_.-]*length|exceeds?\b[^.]{0,60}\btokens?\b"
+    r"|reduce[\s_.-]*the[\s_.-]*length|\bexceed(?:s|ed)?\b[^.]{0,60}\btokens?\b"
+    r"|max[\s_.-]*seq[\s_.-]*len|超长"
 )
+# new-api / one-api relays: the key's group has no channel that serves this model (they answer
+# HTTP 503, "当前分组 default 下对于模型 X 无可用渠道"): the model or the group, not an outage.
+NO_CHANNEL = re.compile(r"无可用渠道|没有可用渠道|no available channels?\b", re.I)
 # A request body larger than the server takes (a 413, or Gemini's 400 about its payload size).
 TOO_LARGE = re.compile(
     r"payload[\s_.-]*(?:size|too)|(?:request|body|entity)[\s_.-]*(?:is[\s_.-]*)?too[\s_.-]*large"
     r"|(?:request|body)[\s_.-]*size|exceeds?\b[^.]{0,60}\bbytes?\b|too[\s_.-]*many[\s_.-]*images"
+)
+# A refusal about the output limit names it (max_tokens, max_completion_tokens, Gemini's
+# maxOutputTokens, TGI's max_new_tokens, Bedrock's "maximum tokens") or speaks of completion or
+# output tokens, or of what goes "in the completion" / "in the output" in a context-length sum.
+LIMIT_WORDS = re.compile(
+    r"max(?:imum)?[\s_.-]*(?:completion[\s_.-]*|output[\s_.-]*|new[\s_.-]*)?tokens"
+    r"|(?:completion|output)[\s_.-]*tokens|(?:in|for)\s+the\s+(?:completion|output)\b"
+)
+# OpenAI's reasoning models refuse max_tokens and name the parameter to use instead. A refusal
+# that names both because the value is too large (vLLM's "'max_tokens' or
+# 'max_completion_tokens' is too large") is a matter of size, not of the name.
+COMPLETION_PARAM = re.compile(r"max[\s_.-]*completion[\s_.-]*tokens")
+SIZE_WORDS = re.compile(
+    r"too\s+large|too\s+big|at\s+most|exceed|range|<=|less\s+than|maximum|greater\s+than|上限|超过"
+)
+# A number as servers write it, with or without thousands separators.
+_N = r"(\d{1,3}(?:,\d{3})+|\d+)"
+# A stated maximum: the whole number, perhaps in quotes or backticks (Groq writes `8192`), and
+# never one written with a unit ("64K", "32k", "3万"), which would be read as 64 or 32 tokens.
+_M = rf"[`'\"]?{_N}(?!\d|,\d)(?!\s?(?:[km](?![a-z])|[万千]))[`'\"]?"
+# Where a server states the most output it takes: (pattern, group, offset), M = group + offset.
+# The one stated first in the message counts (see stated_maximum).
+STATED_MAXIMUM = tuple(
+    (re.compile(pattern), group, offset)
+    for pattern, group, offset in (
+        # Vertex / Gemini: "supported range is from 1 (inclusive) to 65537 (exclusive)"
+        (rf"from\s+1\s*\(inclusive\)\s*to\s+{_M}\s*\(exclusive\)", 1, -1),
+        (rf"from\s+1\s*\(inclusive\)\s*to\s+{_M}\s*\(inclusive\)", 1, 0),
+        # Anthropic, through a relay: "max_tokens: 64000 > 32000, which is the maximum allowed ..."
+        (rf"{_N}\s*>\s*{_M}\s*,?\s*which\s+is\s+the\s+maximum", 2, 0),
+        # OpenAI: "This model supports at most 16384 completion tokens"
+        (rf"at\s+most\s+{_M}", 1, 0),
+        # DeepSeek: "the valid range of max_tokens is [1, 8192]"; also Chinese relays
+        (rf"\[\s*1\s*,\s*{_M}\s*\]", 1, 0),
+        (rf"less\s+than\s+or\s+equal\s+to\s+{_M}", 1, 0),
+        (rf"(?:<=|=<|≤)\s*{_M}", 1, 0),
+        (
+            rf"(?:cannot|can't|not)\s+(?:be\s+)?exceed(?:ing)?\s+(?:the\s+(?:maximum|limit)\s+(?:of\s+)?)?{_M}",
+            1,
+            0,
+        ),
+        (
+            rf"exceeds?\s+(?:the\s+)?(?:maximum|max|limit)(?:\s+(?:of|allowed|value))?\s*:?\s*{_M}",
+            1,
+            0,
+        ),
+        # AWS Bedrock: "exceeds the model limit of 8192. Try again with a maximum tokens value
+        # that is lower than 8192."
+        (rf"(?:model\s+)?limit\s+of\s+{_M}", 1, 0),
+        (rf"lower\s+than\s+{_M}", 1, -1),
+        (rf"(?:最大值|最多|上限|不能超过|不得超过|不可超过|不超过)\D{{0,8}}?{_M}", 1, 0),
+        (rf"取值范围\D{{0,12}}?{_N}\s*(?:到|至|-|~|～|—)\s*{_M}", 2, 0),
+    )
 )
 
 # ---------------------------------------------------------------------------- scrubbing
@@ -190,7 +287,7 @@ def error_fields(body) -> tuple[str, str]:
         return text, text.lower()  # an error body of an odd shape is still read as its text
 
 
-def _error_fields(text) -> tuple[str, str]:
+def _error_fields(text, nested=True) -> tuple[str, str]:
     data = _json(text)
     if data is _NOT_JSON:
         data = None
@@ -200,6 +297,14 @@ def _error_fields(text) -> tuple[str, str]:
         error = data.get("error", data)
         if isinstance(error, str):
             return error, error.lower()
+        meta = error.get("metadata") if isinstance(error, dict) else None
+        raw = meta.get("raw") if isinstance(meta, dict) else None
+        if nested and isinstance(raw, str) and raw.strip():
+            # OpenRouter passes the upstream error on as a string in metadata.raw under its own
+            # "Provider returned error": its words are what a step or the detail line needs.
+            inner, words = _error_fields(raw[:MAX_ERROR_BYTES], nested=False)
+            outer, outer_words = _error_fields(json.dumps({**error, "metadata": None}), False)
+            return f"{outer}: {inner}", f"{outer_words} {words}"
         if isinstance(error, dict):
             message = error.get("message") or error.get("msg") or error.get("error")
             detail = error.get("detail")
@@ -368,7 +473,7 @@ def _bounded(seconds, work):
     return box["value"]
 
 
-def list_models(base_url, key, *, timeout=LIST_SECONDS) -> dict:
+def list_models(base_url, key, *, timeout=LIST_SECONDS, style="openai") -> dict:
     """GET {base}/models to check the address and the key; used when the settings are saved.
 
     Returns {"listed": bool, "ids": [...], "status": code, "key_checked": bool | None}. A server
@@ -377,10 +482,14 @@ def list_models(base_url, key, *, timeout=LIST_SECONDS) -> dict:
     nothing is saved. When the list came back, the same GET without the key tells whether the
     list checks keys at all (OpenRouter's and a local server's do not): key_checked is False when
     it answers too, True when it is refused, None when that could not be told.
+
+    style "anthropic" checks an Anthropic-format endpoint (the Anthropic-compatible provider, a
+    Claude Code relay) the same way: GET {base}/v1/models with the key as x-api-key and as a
+    Bearer token, and anthropic-version; its list ({"data": [{"id": …}]}) reads like OpenAI's.
     """
     started = time.monotonic()
     try:
-        result = _bounded(timeout, lambda line: _list_models(base_url, key, timeout, line))
+        result = _bounded(timeout, lambda line: _list_models(base_url, key, timeout, line, style))
     except _Late:
         raise WorkflowError(
             f"{_host_label(base_url)} 在 {timeout} 秒内没有返回完整的模型列表，无法验证，未保存。"
@@ -388,22 +497,44 @@ def list_models(base_url, key, *, timeout=LIST_SECONDS) -> dict:
         ) from None
     if result["listed"]:
         left = timeout - (time.monotonic() - started)
-        result["key_checked"] = _key_checked(base_url, left) if left >= 1 else None
+        result["key_checked"] = _key_checked(base_url, left, style) if left >= 1 else None
     else:
         result["key_checked"] = None
     return result
+
+
+ANTHROPIC_VERSION = "2023-06-01"
+
+
+def _models_url(base_url, style) -> str:
+    return base_url + ("/v1/models" if style == "anthropic" else "/models")
+
+
+def _list_headers(key, style) -> dict:
+    """The model-list request's headers; without a key, the ones that check whether it needs one."""
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": ANTHROPIC_USER_AGENT if style == "anthropic" else USER_AGENT,
+    }
+    if style == "anthropic":
+        headers["anthropic-version"] = ANTHROPIC_VERSION
+        if key is not None:
+            headers["x-api-key"] = key
+    if key is not None:
+        headers["Authorization"] = "Bearer " + key
+    return headers
 
 
 def _host_label(base_url) -> str:
     return urlsplit(base_url).netloc
 
 
-def _key_checked(base_url, seconds):
+def _key_checked(base_url, seconds, style="openai"):
     """Whether GET {base}/models refuses a request without the key (see list_models)."""
 
     def ask(line):
         request = urllib.request.Request(
-            base_url + "/models", headers={"Accept": "application/json", "User-Agent": USER_AGENT}
+            _models_url(base_url, style), headers=_list_headers(None, style)
         )
         try:
             with opener(line).open(request, timeout=seconds) as response:
@@ -419,10 +550,13 @@ def _key_checked(base_url, seconds):
     return False if status == 200 else True if status in (401, 403) else None
 
 
-def _list_models(base_url, key, timeout, line) -> dict:
+def _list_models(base_url, key, timeout, line, style="openai") -> dict:
     host = _host_label(base_url)
     request = urllib.request.Request(
-        base_url + "/models", headers=_headers(key, "application/json")
+        _models_url(base_url, style),
+        headers=_headers(key, "application/json")
+        if style == "openai"
+        else _list_headers(key, style),
     )
     try:
         with opener(line).open(request, timeout=timeout) as response:
@@ -476,7 +610,10 @@ def _list_models(base_url, key, timeout, line) -> dict:
     except (ValueError, RecursionError):
         raise ConfigurationError(
             with_detail(
-                "这个地址返回的不是模型列表，可能不是 OpenAI 兼容接口的地址，未保存。"
+                "这个地址返回的不是模型列表，可能不是 Anthropic 兼容接口的地址，未保存。"
+                "请检查地址：填中转站给的 ANTHROPIC_BASE_URL，不带 /v1/messages。"
+                if style == "anthropic"
+                else "这个地址返回的不是模型列表，可能不是 OpenAI 兼容接口的地址，未保存。"
                 "请检查地址，通常以 /v1 结尾。",
                 detail_line(error_fields(body[:2000])[0], key, 120),
             )
@@ -496,7 +633,26 @@ def _list_models(base_url, key, timeout, line) -> dict:
         # A listed id goes back to the page as a suggestion: never one that is or holds the key.
         if isinstance(name, str) and name.strip() and not holds_key(name, key):
             ids.append(name.strip())
-    return {"listed": True, "ids": list(dict.fromkeys(ids)), "status": status}
+    return {
+        "listed": True,
+        "ids": list(dict.fromkeys(ids)),
+        "status": status,
+        "shape": _list_shape(data, entries),
+    }
+
+
+def _list_shape(data, entries) -> str | None:
+    """Which API's model list this is: Anthropic's ({"data": [{"type": "model", …}], "has_more",
+    "first_id", "last_id"}) or OpenAI's ({"object": "list", "data": [{"object": "model", …}]})."""
+    top = data if isinstance(data, dict) else {}
+    items = [x for x in entries if isinstance(x, dict)]
+    if {"has_more", "first_id", "last_id"} & set(top) or any(
+        x.get("type") == "model" for x in items
+    ):
+        return "anthropic"
+    if top.get("object") == "list" or any(x.get("object") == "model" for x in items):
+        return "openai"
+    return None
 
 
 def _read(open_request, request, events):
@@ -774,6 +930,15 @@ def _http_error(code, body, headers, *, key, model, host) -> WorkflowError:
         return RequestFailed(
             with_detail(
                 "OpenAI 兼容接口限流或额度已用完（HTTP 429）。请稍后重试，或检查账户额度；" + KEPT,
+                detail,
+            )
+        )
+    if NO_CHANNEL.search(words):
+        return RequestFailed(
+            with_detail(
+                f"OpenAI 兼容接口没有可用于模型“{model}”的渠道（HTTP {code}）：这个模型不在密钥"
+                "（令牌）的分组里，或中转站暂时没有它的渠道。请在设置里换用中转站提供的模型，"
+                "或联系中转站；" + KEPT,
                 detail,
             )
         )
@@ -1098,6 +1263,9 @@ def request_body(content, schema, model, mode) -> dict:
         }
     elif mode["format"] == "json_object":
         body["response_format"] = {"type": "json_object"}
+    # The output limit only when one is set: without it the body is what it always was.
+    if mode.get("limit"):
+        body[mode.get("limit_param") or "max_tokens"] = mode["limit"]
     return body
 
 
@@ -1113,9 +1281,17 @@ def _active(step, mode) -> bool:
     }[step]
 
 
-def _relax(step, mode) -> None:
+def _relax(step, mode, value=None) -> None:
     if step == "reasoning_effort":
         mode["effort"] = None
+    elif step == "reasoning_effort_lowered":
+        mode["effort"], mode["effort_lowered"] = value, True
+    elif step == "max_tokens_param":
+        mode["limit_param"] = "max_completion_tokens"
+    elif step == "max_tokens_clamp":
+        mode["limit"], mode["limit_clamped"] = value, True
+    elif step == "max_tokens":
+        mode["limit"] = None
     elif step == "stream_options":
         mode["stream_options"] = False
     elif step == "json_schema":
@@ -1130,22 +1306,159 @@ def _relax(step, mode) -> None:
 
 
 def degradable(refused, mode) -> str | None:
-    """The feature a 400/422 names, if it is still in the request; None otherwise.
+    """The step a 400/413/422 allows, if what it names is still in the request; None otherwise.
 
-    A refusal for size (a 413, or a 400/422 that says the request is too long or too large)
+    Refusals about the output limit come first, and only while a limit is sent (see
+    _limit_step). Then size: a 413, or a 400/422 that says the request is too long or too large,
     drops the page images, which are most of the request, as one step of its own: images_size.
-    Both image steps take the images out, so at most one of them is ever tried."""
+    Both image steps take the images out, so at most one of them is ever tried. Then the
+    features in STEPS; a refused effort above high steps down once first (see _lowered_effort)."""
+    found = _degrade(refused, mode)
+    return found[0] if found else None
+
+
+def _degrade(refused, mode):
+    """(step, value) for degradable: the value is the new limit or effort a step sends."""
     if refused.code not in (400, 413, 422):
         return None
     _, text = error_fields(refused.body)
+    if mode.get("limit"):
+        found = _limit_step(text, mode)
+        if found:
+            return found
     # Size first: a length error can name a feature in passing ("... including reasoning
     # tokens"), and dropping that feature would not make the request any shorter.
     if refused.code == 413 or TOO_LONG.search(text) or TOO_LARGE.search(text):
-        return "images_size" if mode["images"] else None
+        return ("images_size", None) if mode["images"] else None
     for step in STEPS:
         if _active(step, mode) and STEP_WORDS[step].search(text):
-            return step
+            if step == "reasoning_effort":
+                lowered = _lowered_effort(text, mode)
+                if lowered:
+                    return "reasoning_effort_lowered", lowered
+            return step, None
     return None
+
+
+def _number(text) -> int:
+    return int(text.replace(",", ""))
+
+
+def stated_maximum(text) -> int | None:
+    """The largest output a refusal says the server takes (its words lower-cased), if it says:
+    the maximum stated first in the message, so another number the message also gives ("at most
+    4 images") is not taken for it, and never one below MIN_OUTPUT_ROOM, which no answer fits in
+    (a server that takes so little is better left at its own default)."""
+    found = []
+    for order, (pattern, group, offset) in enumerate(STATED_MAXIMUM):
+        for match in pattern.finditer(text):
+            value = _number(match[group]) + offset
+            if value >= MIN_OUTPUT_ROOM:
+                found.append((match.start(), order, value))
+                break
+    return min(found)[2] if found else None
+
+
+def context_room(text) -> int | None:
+    """The room for output a context-length refusal leaves, from its own sum: OpenAI's
+    "maximum context length is C tokens. However, you requested T tokens (P in the messages, K in
+    the completion)" gives C - (T - K); vLLM's "... C tokens and your request has P input tokens",
+    Anthropic's "P + K > C" and TGI's "must be <= C. Given: P `inputs` tokens" give C - P."""
+    context = re.search(rf"maximum\s+context\s+length\s+(?:is|of)\s+{_N}", text)
+    if context:
+        total = _number(context[1])
+        # OpenRouter "requested about T tokens", SGLang "requested a total of T tokens"
+        asked = re.search(rf"requested\s+(?:about\s+|a\s+total\s+of\s+)?{_N}\s+tokens", text)
+        output = re.search(rf"{_N}\s+(?:tokens\s+)?(?:in|for)\s+the\s+(?:completion|output)", text)
+        if asked and output:
+            return total - (_number(asked[1]) - _number(output[1]))
+        prompt = re.search(
+            rf"(?:request|prompt|messages?)\s+(?:has|have|contains?|uses?)\s+{_N}\s+(?:input\s+)?tokens",
+            text,
+        )
+        if prompt:
+            return total - _number(prompt[1])
+    summed = re.search(rf"{_N}\s*\+\s*{_N}\s*>\s*{_N}", text)
+    if summed:
+        return _number(summed[3]) - _number(summed[1])
+    given = re.search(rf"<=\s*{_N}\.?\s*given:\s*{_N}\s*`?inputs?`?\s+tokens", text)
+    if given:
+        return _number(given[1]) - _number(given[2])
+    return None
+
+
+def _limit_step(text, mode):
+    """What a refusal about the output limit allows, while a limit is sent; each step once.
+
+    a. max_tokens_param: OpenAI's reasoning models refuse max_tokens and name
+       max_completion_tokens: the same limit goes under that name.
+    b. max_tokens_clamp: the server states a maximum M below the limit (or a context-length sum
+       leaves M of at least MIN_OUTPUT_ROOM): the limit becomes M.
+    c. max_tokens: about the limit but no usable maximum (an unknown parameter, a range that
+       says nothing, a second refusal): the limit goes.
+    A context-length sum that leaves less than MIN_OUTPUT_ROOM is the request's own length, and
+    the size handling decides (None here)."""
+    if not LIMIT_WORDS.search(text):
+        return None
+    limit = mode["limit"]
+    room = context_room(text)
+    if room is not None:
+        if room < MIN_OUTPUT_ROOM:
+            return None
+        if room < limit and not mode.get("limit_clamped"):
+            return "max_tokens_clamp", room
+        return "max_tokens", None
+    if (
+        (mode.get("limit_param") or "max_tokens") == "max_tokens"
+        and COMPLETION_PARAM.search(text)
+        and not SIZE_WORDS.search(text)
+    ):
+        return "max_tokens_param", "max_completion_tokens"
+    stated = stated_maximum(text)
+    if stated is not None and 1 <= stated < limit and not mode.get("limit_clamped"):
+        return "max_tokens_clamp", stated
+    return "max_tokens", None
+
+
+# A refusal of the parameter itself, not of its value: no other value would be taken either.
+UNKNOWN_PARAMETER = re.compile(
+    r"unrecognized\s+request\s+argument|unknown\s+(?:field|parameter|argument|key)"
+    r"|extra\s+inputs?\s+(?:are|is)\s+not\s+permitted|extra_forbidden"
+    r"|unexpected\s+(?:keyword|field|parameter|argument)|not\s+a\s+valid\s+(?:field|parameter)"
+    r"|unsupported\s+parameter|argument\s+not\s+supported"
+)
+EFFORT_LIST = re.compile(
+    r"\b(?:supported|valid|allowed|accepted|permitted|possible|available)\s+"
+    r"(?:values?|options?|efforts?|levels?)|one\s+of|should\s+be|must\s+be|expected"
+)
+
+
+def listed_efforts(text) -> list[str]:
+    """The effort words a refusal lists as the ones it takes ("Supported values are: 'low',
+    'medium', and 'high'."; pydantic's "Input should be 'low', 'medium' or 'high'")."""
+    found = []
+    for match in EFFORT_LIST.finditer(text):
+        tail = text[match.end() : match.end() + 160]
+        for word in re.findall(r"\b(minimal|low|medium|high|xhigh|max)\b", tail):
+            if word not in found:
+                found.append(word)
+        if found:
+            break
+    return found
+
+
+def _lowered_effort(text, mode) -> str | None:
+    """The effort to try once instead of a refused xhigh or max: the highest the server lists
+    below it (the lowest it lists when none is below), or high when it lists none."""
+    effort = mode.get("effort")
+    if effort not in ABOVE_HIGH or mode.get("effort_lowered") or UNKNOWN_PARAMETER.search(text):
+        return None
+    rank = EFFORT_ORDER.index
+    listed = [x for x in listed_efforts(text) if x != effort]
+    if not listed:
+        return "high"
+    below = [x for x in listed if rank(x) < rank(effort)]
+    return max(below, key=rank) if below else min(listed, key=rank)
 
 
 def _dump(error) -> bytes:
@@ -1155,11 +1468,24 @@ def _dump(error) -> bytes:
         return b'{"error": "unreadable"}'
 
 
-def _exchange(url, key, body, *, started, clock, cancelled, on_activity, model, host):
+def _exchange(
+    url,
+    key,
+    body,
+    *,
+    started,
+    clock,
+    cancelled,
+    on_activity,
+    model,
+    host,
+    turn_seconds=TURN_SECONDS,
+    idle_seconds=IDLE_SECONDS,
+):
     """One request; returns (_Reply, streamed) or _Refused for an HTTP error to look at."""
     if cancelled():
         raise RunCancelled("已暂停，" + KEPT)
-    line = _Line(IDLE_SECONDS + 15)
+    line = _Line(idle_seconds + 15)
     request = urllib.request.Request(
         url,
         data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
@@ -1174,7 +1500,15 @@ def _exchange(url, key, body, *, started, clock, cancelled, on_activity, model, 
     reply = _Reply(on_activity, key, model, host)
     try:
         return _receive(
-            events, reply, started=started, clock=clock, cancelled=cancelled, key=key, host=host
+            events,
+            reply,
+            started=started,
+            clock=clock,
+            cancelled=cancelled,
+            key=key,
+            host=host,
+            turn_seconds=turn_seconds,
+            idle_seconds=idle_seconds,
         )
     except _InBand as inband:
         code = _status_of(inband.error)
@@ -1201,17 +1535,28 @@ def _web_page(raw, key) -> ConfigurationError:
     )
 
 
-def _receive(events, reply, *, started, clock, cancelled, key, host):
+def _receive(
+    events,
+    reply,
+    *,
+    started,
+    clock,
+    cancelled,
+    key,
+    host,
+    turn_seconds=TURN_SECONDS,
+    idle_seconds=IDLE_SECONDS,
+):
     stream, streamed, html, raw, received = None, None, False, bytearray(), 0
     last = clock()
     while True:
         if cancelled():
             raise RunCancelled("已暂停，" + KEPT)
         now = clock()
-        if now - started > TURN_SECONDS:
-            raise RequestFailed(TURN_MESSAGE)
-        if now - last > IDLE_SECONDS:
-            raise RequestFailed(IDLE_MESSAGE)
+        if now - started > turn_seconds:
+            raise RequestFailed(turn_message(turn_seconds))
+        if now - last > idle_seconds:
+            raise RequestFailed(idle_message(idle_seconds))
         try:
             event = events.get(timeout=0.2)
         except queue.Empty:
@@ -1292,22 +1637,113 @@ def run_turn(
     cancelled=lambda: False,
     on_activity=lambda _label: None,
     clock=time.monotonic,
+    turn_seconds=TURN_SECONDS,
+    idle_seconds=IDLE_SECONDS,
 ) -> dict:
     """Return the validated output and what the server reported, in claude_agent.run_turn's shape,
-    plus the provider details for the generation record."""
+    plus the provider details for the generation record.
+
+    config["max_output_tokens"], when set, goes as max_tokens (see _limit_step for what a refusal
+    of it changes). turn_seconds and idle_seconds bound the whole turn and each silence; a
+    connection test gives itself less than an answer does. A WorkflowError raised once the turn
+    began carries `details`: the provider details as far as they go (what the requests carried,
+    the steps taken), so a failed answer's record says them too."""
     base_url, key = config["base_url"], config["api_key"]
     host = urlsplit(base_url).netloc
     images = sum(block.get("type") == "image" for block in content)
+    limit = config.get("max_output_tokens") or None
     mode = {
         "effort": effort,
+        "effort_lowered": False,
         "stream": True,
         "stream_options": True,
         "format": "json_schema",
         "images": bool(images),
         "images_why": None,
+        "limit": limit,
+        "limit_param": "max_tokens",
+        "limit_clamped": False,
     }
     relaxed = []
+    seen = {"streamed": None, "finish": None, "reply_json": None}
+
+    def details():
+        return {
+            "host": host,
+            "structured_output_mode": mode["format"],
+            "images_sent": images if mode["images"] else 0,
+            "images_dropped": 0 if mode["images"] else images,
+            "degradations": list(relaxed),
+            "streamed": bool(seen["streamed"]),
+            "finish_reason": seen["finish"],
+            # What was asked for and what the request that answered carried.
+            "output_limit": {
+                "requested": limit,
+                "sent": mode["limit"],
+                "param": mode["limit_param"] if mode["limit"] else None,
+            },
+            "effort": {"requested": effort, "sent": mode["effort"]},
+            # "bare": the reply was the JSON object alone; "extracted": it had to be found in
+            # prose or a code fence, as when a server accepts response_format and ignores it.
+            "reply_json": seen["reply_json"],
+        }
+
     started = clock()
+    try:
+        output, reply = _answer(
+            content,
+            schema,
+            model=model,
+            key=key,
+            base_url=base_url,
+            host=host,
+            mode=mode,
+            relaxed=relaxed,
+            seen=seen,
+            requested=limit,
+            started=started,
+            clock=clock,
+            cancelled=cancelled,
+            on_activity=on_activity,
+            turn_seconds=turn_seconds,
+            idle_seconds=idle_seconds,
+        )
+    except WorkflowError as exc:
+        if not isinstance(exc, RunCancelled):
+            exc.details = details()
+        raise
+    return {
+        "output": output,
+        "model": reply.model or model,
+        "session_id": reply.id,
+        "api_key_source": API_KEY_SOURCE,
+        "usage": normalise_usage(reply.usage),
+        "cost_usd": None,
+        "duration_ms": max(0, int(round((clock() - started) * 1000))),
+        "provider": details(),
+    }
+
+
+def _answer(
+    content,
+    schema,
+    *,
+    model,
+    key,
+    base_url,
+    host,
+    mode,
+    relaxed,
+    seen,
+    requested,
+    started,
+    clock,
+    cancelled,
+    on_activity,
+    turn_seconds,
+    idle_seconds,
+):
+    """run_turn's requests and the checks of the reply: (output, reply)."""
     while True:
         outcome = _exchange(
             base_url + "/chat/completions",
@@ -1319,11 +1755,14 @@ def run_turn(
             on_activity=on_activity,
             model=model,
             host=host,
+            turn_seconds=turn_seconds,
+            idle_seconds=idle_seconds,
         )
         if isinstance(outcome, _Refused):
-            step = degradable(outcome, mode)
-            if step:
-                _relax(step, mode)
+            found = _degrade(outcome, mode)
+            if found:
+                step, value = found
+                _relax(step, mode, value)
                 relaxed.append(step)
                 continue
             raise _http_error(
@@ -1331,11 +1770,17 @@ def run_turn(
             )
         reply, streamed = outcome
         break
+    seen["streamed"], seen["finish"] = streamed, reply.finish_label() or None
     text = reply.text()
     if reply.finish == "length":
+        # Still a WorkflowError: the one automatic repair asks for a short, complete answer.
         raise WorkflowError(
-            "模型的输出达到长度上限，结果被截断（finish_reason: length）。"
-            "请换用输出上限更大的模型，或减少这次的资料后重试；" + KEPT
+            truncated_message(
+                mode,
+                reasoning_only=not text and reply.reasoning,
+                requested=requested,
+                refused="max_tokens" in relaxed,
+            )
         )
     if reply.finish == "content_filter":
         raise WorkflowError(
@@ -1359,6 +1804,9 @@ def run_turn(
             + KEPT
         )
     candidates = json_candidates(text)
+    seen["reply_json"] = (
+        "bare" if _json(THINK.sub("", text, count=1).strip()) is not _NOT_JSON else "extracted"
+    )
     output, mismatch = None, None
     for candidate in candidates:
         try:
@@ -1373,6 +1821,7 @@ def run_turn(
             # Neither [DONE] nor a finish reason: the stream was cut, whatever the text looks like.
             raise RequestFailed("连接在模型输出完成前断开，没有得到完整结果。请重试；" + KEPT)
         if not candidates:
+            seen["reply_json"] = None
             raise WorkflowError(
                 with_detail(
                     "模型返回的内容不是可以解析的 JSON。请重试，或换用支持结构化输出的模型；"
@@ -1385,21 +1834,54 @@ def run_turn(
             f"模型返回的 JSON 不符合要求的格式：{detail_line(str(mismatch), key, 160)}。"
             "请重试，或换用支持结构化输出的模型；" + KEPT
         )
-    return {
-        "output": output,
-        "model": reply.model or model,
-        "session_id": reply.id,
-        "api_key_source": API_KEY_SOURCE,
-        "usage": normalise_usage(reply.usage),
-        "cost_usd": None,
-        "duration_ms": max(0, int(round((clock() - started) * 1000))),
-        "provider": {
-            "host": host,
-            "structured_output_mode": mode["format"],
-            "images_sent": images if mode["images"] else 0,
-            "images_dropped": 0 if mode["images"] else images,
-            "degradations": relaxed,
-            "streamed": bool(streamed),
-            "finish_reason": reply.finish_label() or None,
-        },
-    }
+    return output, reply
+
+
+def truncated_message(mode, *, reasoning_only=False, requested=None, refused=False) -> str:
+    """finish_reason "length": the output hit the limit the request carried, or the server's own
+    default when none was sent. The way out depends on which, on whether the limit was already
+    the most the server takes (after a clamp), and on whether the server refused the limit
+    parameter itself (refused: the saved limit, `requested`, could not be sent at all)."""
+    limit = mode.get("limit")
+    unsendable = bool(requested) and refused and not limit
+    if reasoning_only:
+        where = f"输出上限（{limit} tokens）" if limit else "接口的默认输出上限"
+        fix = (
+            "可以在设置 → 模型接口里调高「输出上限」，或把推理强度调低后重试；"
+            if limit and not mode.get("limit_clamped")
+            else "可以把推理强度调低，或换用输出上限更大的模型后重试；"
+            if limit or unsendable
+            else "可以在设置 → 模型接口里填写「输出上限」（例如 16000），或把推理强度调低后重试；"
+        )
+        return (
+            f"模型的推理用完了{where}，还没有输出答案就被截断（finish_reason: length）。"
+            + (
+                f"这个接口不接受输出上限参数，设置里的 {requested} tokens 没有发送；"
+                if unsendable
+                else ""
+            )
+            + fix
+            + KEPT
+        )
+    if limit and mode.get("limit_clamped"):
+        return (
+            f"模型的输出达到了输出上限（{limit} tokens），结果被截断（finish_reason: length）。"
+            "这已经是接口说这个模型最多能输出的 token 数；请换用输出上限更大的模型，"
+            "或减少这次的资料后重试；" + KEPT
+        )
+    if limit:
+        return (
+            f"模型的输出达到了输出上限（{limit} tokens），结果被截断（finish_reason: length）。"
+            "可以在设置 → 模型接口里调高「输出上限」后重试（推理用的 token 也算在内）；" + KEPT
+        )
+    if unsendable:
+        return (
+            "模型的输出达到了接口的默认输出上限，结果被截断（finish_reason: length）。"
+            f"这个接口不接受输出上限参数，设置里的 {requested} tokens 没有发送，调高它也没有用；"
+            "请换用输出上限更大的模型，或减少这次的资料后重试；" + KEPT
+        )
+    return (
+        "模型的输出达到了接口的默认输出上限，结果被截断（finish_reason: length）。"
+        "可以在设置 → 模型接口里填写「输出上限」（例如 16000）后重试，"
+        "或换用输出上限更大的模型；" + KEPT
+    )

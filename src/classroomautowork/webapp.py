@@ -5,6 +5,8 @@ import io
 import json
 import re
 import secrets
+import select
+import socket
 import urllib.request
 import webbrowser
 import zipfile
@@ -14,8 +16,9 @@ from urllib.parse import urlparse
 
 from filelock import FileLock, Timeout
 
+from . import connection_test
 from .config import Settings
-from .errors import WorkflowError
+from .errors import Busy, RunCancelled, WorkflowError
 from .local import atomic_json, prefer_ipv4, require_private_path, sha256_file
 from .ui_jobs import FILES, FrontendJobs, read_json
 
@@ -124,6 +127,15 @@ class LocalHandler(BaseHTTPRequestHandler):
                 pass
         self._send(status, {"error": message})
 
+    def _client_gone(self) -> bool:
+        """Whether the page closed the connection (it gave up waiting, reloaded or was closed): a
+        long request such as the connection test then stops instead of running on for nobody."""
+        try:
+            readable, _, _ = select.select([self.connection], [], [], 0)
+            return bool(readable) and self.connection.recv(1, socket.MSG_PEEK) == b""
+        except (OSError, ValueError):
+            return True
+
     def _body(self):
         if self.headers.get("Content-Type", "").split(";")[0] != "application/json":
             raise WorkflowError("请求必须是 JSON。")
@@ -166,7 +178,8 @@ class LocalHandler(BaseHTTPRequestHandler):
                 result = jobs.bootstrap()
             elif path == "/api/models":
                 result = jobs.models()
-            elif path == "/api/settings/openai":
+            elif path in ("/api/settings/openai", "/api/settings/anthropic-compatible"):
+                # Either path gives every provider's status and the endpoints' model suggestions.
                 result = jobs.openai_settings()
             elif match := re.fullmatch(r"/api/jobs/([a-f0-9]{32})", path):
                 result = jobs.job(match[1])
@@ -302,18 +315,28 @@ class LocalHandler(BaseHTTPRequestHandler):
                     raise WorkflowError("刷新请求不接受额外参数。")
                 result = jobs.refresh()
             elif path == "/api/review":
-                if set(payload) - {"selected", "model", "effort", "ai_confirmed"}:
+                if set(payload) - {"selected", "model", "effort", "ai_confirmed", "provider"}:
                     raise WorkflowError("生成请求包含不支持的参数。")
+                # provider: whose model list the toolbar showed; a job never starts on another.
                 result = jobs.start_selected(
                     payload.get("selected"),
                     model=payload.get("model"),
                     effort=payload.get("effort"),
                     ai_confirmed=payload.get("ai_confirmed", False),
+                    shown_provider=payload.get("provider"),
                 )
             elif path == "/api/documents/authorize":
                 if payload:
                     raise WorkflowError("文档授权请求不接受额外参数。")
                 result = jobs.authorize_documents()
+            elif path == "/api/settings/test":
+                # One tiny real request; a second one while it runs is a 409 (Busy). It ends when
+                # the page stops waiting (RunCancelled): nobody is left to answer then.
+                try:
+                    result = jobs.test_connection(payload, cancelled=self._client_gone)
+                except RunCancelled:
+                    self.close_connection = True
+                    return
             elif match := re.fullmatch(
                 r"/api/jobs/([a-f0-9]{32})/items/([0-9]+:[0-9]+)/(supplement|continue|followup|questions|answers)",
                 path,
@@ -328,7 +351,14 @@ class LocalHandler(BaseHTTPRequestHandler):
                 elif operation == "questions":
                     result = jobs.import_questions(job_id, key, payload)
                 else:
-                    if set(payload) - {"text", "personal_facts", "model", "effort", "ai_confirmed"}:
+                    if set(payload) - {
+                        "text",
+                        "personal_facts",
+                        "model",
+                        "effort",
+                        "ai_confirmed",
+                        "provider",
+                    }:
                         raise WorkflowError("补充请求包含不支持的参数。")
                     result = jobs.save_item_supplement(
                         job_id,
@@ -338,6 +368,7 @@ class LocalHandler(BaseHTTPRequestHandler):
                         model=payload.get("model"),
                         effort=payload.get("effort"),
                         ai_confirmed=payload.get("ai_confirmed", False),
+                        shown_provider=payload.get("provider"),
                     )
             elif match := re.fullmatch(
                 r"/api/jobs/([a-f0-9]{32})/items/([0-9]+:[0-9]+)/export-answer", path
@@ -361,7 +392,7 @@ class LocalHandler(BaseHTTPRequestHandler):
             self._send(200, result)
         except Exception as exc:
             self._send(
-                400,
+                409 if isinstance(exc, Busy) else 400,
                 {"error": str(exc) if isinstance(exc, WorkflowError) else "本机操作失败，请重试。"},
             )
 
@@ -374,6 +405,7 @@ class LocalHandler(BaseHTTPRequestHandler):
                 "/api/settings/api-key": self.server.jobs.set_api_key,
                 "/api/settings/provider": self.server.jobs.set_provider,
                 "/api/settings/openai": self.server.jobs.set_openai,
+                "/api/settings/anthropic-compatible": self.server.jobs.set_compat,
             }.get(self._path())
             if settings:
                 self._send(200, settings(self._body()))
@@ -436,6 +468,8 @@ def serve(settings: Settings | None = None, *, open_browser=True, port=0, token=
         server.serve_forever(poll_interval=0.3)
     finally:
         if server:
+            # A connection test that runs ends now, with its Claude Code process.
+            connection_test.stop()
             server.jobs.wait_idle(timeout=30)
             server.server_close()
         info_path.unlink(missing_ok=True)

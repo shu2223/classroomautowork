@@ -1,5 +1,6 @@
-"""Local review production. Only an explicit UI action starts a model turn (the Claude API or the
-OpenAI-compatible endpoint the job was started with); no Classroom writes."""
+"""Local review production. Only an explicit UI action starts a model turn (the Claude API, the
+Anthropic-compatible endpoint or the OpenAI-compatible endpoint the job was started with); no
+Classroom writes."""
 
 import copy
 import hashlib
@@ -27,15 +28,17 @@ from .form_fill import form_answer_coverage, prepare_response_forms, validate_an
 from .local import atomic_json, require_private_path, sha256_file, utc_now
 from .policy import confirmed_gate
 from .progress import report
+from .providers import COMPAT, claude_limit, turn_config
 from .providers import MODEL_NAME as OPENAI_MODEL
-from .providers import turn_config
 from .review import finalize
 from .student import StudentProfile
 from .supplements import personal_facts
 
 PROMPT_VERSION = "classroom-draft-v17-report-style"
-# generation.json names the provider "openai_compatible"; jobs and settings say "openai".
+# generation.json names the provider "openai_compatible"; jobs and settings say "openai". The
+# Anthropic-compatible endpoint is "anthropic_compatible" in both.
 OPENAI_RECORD = "openai_compatible"
+COMPAT_RECORD = "anthropic_compatible"
 SKILL = Path(__file__).resolve().parents[2] / "skills" / "classroom-assistant"
 EVIDENCE_CHARACTERS = 100_000
 OUTPUT_CHARACTERS = 64_000
@@ -128,7 +131,9 @@ def blocked_review(package: Path, *, materials_only=False) -> dict:
 
 def record_provider(generation: dict) -> str:
     """The provider a generation record came from; records before providers were Claude's."""
-    return "openai" if generation.get("provider") == OPENAI_RECORD else "anthropic"
+    return {OPENAI_RECORD: "openai", COMPAT_RECORD: "anthropic_compatible"}.get(
+        generation.get("provider"), "anthropic"
+    )
 
 
 def requested_model(generation: dict):
@@ -142,7 +147,8 @@ def same_provider(generation: dict, provider, host) -> bool:
         return True
     if record_provider(generation) != provider:
         return False
-    return provider != "openai" or generation.get("host") == host
+    # An endpoint's results are kept apart per host, as its cache identity is per address.
+    return provider == "anthropic" or generation.get("host") == host
 
 
 def reusable_review(package: Path, *, model=None, effort=None, provider=None, host=None):
@@ -629,7 +635,7 @@ def generate_review(
         return blocked_review(package, materials_only=True)
     # The provider is the one the job started with; its settings are read now, so a key or
     # address changed since then is the one used. The key stays in this frame only.
-    endpoint = None
+    endpoint = relay = None
     if provider == "openai":
         endpoint = turn_config(package.parents[3])
         if model is None:
@@ -637,6 +643,15 @@ def generate_review(
         if not isinstance(model, str) or not OPENAI_MODEL.fullmatch(model):
             raise WorkflowError("请选择 OpenAI 兼容接口的模型。")
         if effort is not None and effort not in openai_compat.EFFORTS:
+            raise WorkflowError("推理强度无效。")
+    elif provider == "anthropic_compatible":
+        # The same Claude Code turn as the Claude API, sent to the endpoint's address.
+        relay = turn_config(package.parents[3], COMPAT)
+        if model is None:
+            model, effort = relay["models"][0], DEFAULT_EFFORT
+        if not isinstance(model, str) or not OPENAI_MODEL.fullmatch(model):
+            raise WorkflowError("请选择 Anthropic 兼容接口的模型。")
+        if effort is not None and effort not in EFFORTS:
             raise WorkflowError("推理强度无效。")
     elif provider == "anthropic":
         if model is None:
@@ -647,7 +662,7 @@ def generate_review(
             raise WorkflowError("推理强度无效。")
     else:
         raise WorkflowError("模型接口无效。")
-    host = endpoint["host"] if endpoint else None
+    host = endpoint["host"] if endpoint else relay["host"] if relay else None
     manifest["ai_confirmation"] = ai_confirmed
     manifest["policy"] = confirmed_gate(manifest["policy"], ai_confirmed)
     manifest["student_profile"] = asdict(StudentProfile.load(package.parents[3]))
@@ -692,7 +707,13 @@ def generate_review(
         return {**same_content, "reused": True}
     # Claude's identity is unchanged, so earlier Claude results stay reusable; an endpoint's
     # answers are kept apart per address.
-    turn = ["claude-cli-v1"] if not endpoint else ["openai-compatible-v1", endpoint["base_url"]]
+    turn = (
+        ["openai-compatible-v1", endpoint["base_url"]]
+        if endpoint
+        else ["claude-cli-v1", "anthropic-compatible", relay["base_url"]]
+        if relay
+        else ["claude-cli-v1"]
+    )
     identity = hashlib.sha256(
         json.dumps(
             [
@@ -769,9 +790,9 @@ def generate_review(
         "ai_confirmed": ai_confirmed,
         "package": str(package),
     }
-    if endpoint:
+    if endpoint or relay:
         # The host names the endpoint in the record; its key never enters it.
-        generation.update(provider=OPENAI_RECORD, host=host)
+        generation.update(provider=OPENAI_RECORD if endpoint else COMPAT_RECORD, host=host)
 
     def save():
         atomic_json(generation_path, generation)
@@ -818,11 +839,41 @@ def generate_review(
                 degradations=details["degradations"],
                 streamed=details["streamed"],
                 finish_reason=details["finish_reason"],
+                # {requested, sent, param} and {requested, sent}: what the request that answered
+                # carried, after any step down (reasoning_effort stays the one chosen).
+                output_limit=details["output_limit"],
+                effort=details["effort"],
+            )
+        elif relay:
+            generation.update(status="running", model=model)
+            save()
+            report(
+                progress,
+                f"已通过 Claude Code 向 Anthropic 兼容接口（{host}）发起请求（{model}），"
+                "正在等待模型阅读题目和课堂资料",
+                "ai",
+            )
+            outcome = run_turn(
+                inputs,
+                output_schema(manifest["requirement_source_ids"]),
+                model=model,
+                effort=effort,
+                cwd=package,
+                cancelled=cancelled,
+                on_activity=activity,
+                api_key=relay["api_key"],
+                base_url=relay["base_url"],
+                auth="helper",
+                host=host,
+                max_output_tokens=relay["max_output_tokens"],
+                doubt_address=relay.get("doubt_address", False),
             )
         else:
             generation.update(status="running", model=model, provider="anthropic")
             save()
             report(progress, f"已启动 Claude（{model}），正在阅读题目和课堂资料", "ai")
+            # The optional limit; with none, the turn is sent exactly as it always was.
+            limit = claude_limit(package.parents[3])
             outcome = run_turn(
                 inputs,
                 output_schema(manifest["requirement_source_ids"]),
@@ -832,6 +883,14 @@ def generate_review(
                 cancelled=cancelled,
                 on_activity=activity,
                 api_key=load_key(package.parents[3]),
+                **({"max_output_tokens": limit} if limit else {}),
+            )
+        if not endpoint and (outcome.get("output_limit") or outcome.get("degradations")):
+            # A Claude Code turn records its limit {requested, sent, param} and what it had to
+            # give up (a clamped limit, a dropped image) only when there is something to say.
+            generation.update(
+                output_limit=outcome.get("output_limit"),
+                degradations=outcome.get("degradations") or [],
             )
         generation.update(
             thread_id=outcome["session_id"],
@@ -853,8 +912,38 @@ def generate_review(
             status="interrupted" if isinstance(exc, RunCancelled) else "failed",
             error=str(exc) if isinstance(exc, WorkflowError) else "本机 AI 结果核对失败。",
         )
+        failed_turn_details(generation, getattr(exc, "details", None), endpoint=bool(endpoint))
         save()
         raise
+
+
+def failed_turn_details(generation: dict, details, *, endpoint: bool) -> None:
+    """What a turn that failed had sent (its run_turn's `details`): the output limit and the
+    effort the last request carried and the steps taken, so a failed answer's record shows them
+    as a completed one does. A Claude Code turn records them only when there is something to say,
+    so a failed Claude API turn with nothing set gains no new keys."""
+    if not isinstance(details, dict):
+        return
+    if endpoint:
+        generation.update(
+            {
+                k: details[k]
+                for k in (
+                    "structured_output_mode",
+                    "images_sent",
+                    "images_dropped",
+                    "degradations",
+                    "output_limit",
+                    "effort",
+                )
+                if k in details
+            }
+        )
+    elif details.get("output_limit") or details.get("degradations"):
+        generation.update(
+            output_limit=details.get("output_limit"),
+            degradations=details.get("degradations") or [],
+        )
 
 
 def recover_completed_result(package: Path, *, model, effort, forms=None, provider=None, host=None):

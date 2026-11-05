@@ -99,13 +99,10 @@
     </div>
     <p class="group-foot">关闭后只整理题目和资料，不调用模型。</p>
     <h3 id="providerTitle" class="group-head">模型接口</h3>
-    <div class="group">
-      <div class="group-row provider-row">
-        <div id="providerSeg" class="ys-seg ys-seg--fill provider-seg" role="group" aria-labelledby="providerTitle">
-          <button type="button" data-provider="anthropic" aria-pressed="true">Claude API</button>
-          <button type="button" data-provider="openai" aria-pressed="false">OpenAI 兼容</button>
-        </div>
-      </div>
+    <div id="providerSeg" class="group provider-list" role="group" aria-labelledby="providerTitle">
+      <button type="button" class="group-row provider-option" data-provider="anthropic" aria-pressed="true"><span class="provider-text"><span class="provider-name">Claude API</span><span class="provider-sub">Anthropic 官方接口，按 API 用量计费</span></span><svg class="ys-icon provider-check" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg></button>
+      <button type="button" class="group-row provider-option" data-provider="anthropic_compatible" aria-pressed="false"><span class="provider-text"><span class="provider-name">Anthropic 兼容</span><span class="provider-sub">经本机 Claude Code 连接中转站</span></span><svg class="ys-icon provider-check" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg></button>
+      <button type="button" class="group-row provider-option" data-provider="openai" aria-pressed="false"><span class="provider-text"><span class="provider-name">OpenAI 兼容</span><span class="provider-sub">DeepSeek、通义千问、Ollama 等</span></span><svg class="ys-icon provider-check" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg></button>
     </div>
     <div id="providerNotice" class="ys-alert ys-alert--warn provider-notice" role="status" hidden>
       <svg class="ys-icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.27 4.5a2 2 0 0 1 3.46 0l7.36 12.75a2 2 0 0 1-1.73 3H4.64a2 2 0 0 1-1.73-3zM12 9.5v4M12 16.75h.01"/></svg>
@@ -114,21 +111,57 @@
     <p id="providerNote" class="group-foot">切换后，工具栏的模型随之改变；正在进行的任务仍用开始时的接口。</p>
 
     <section id="anthropicSettings" class="provider-settings" aria-labelledby="anthropicTitle">
-      <h3 id="anthropicTitle" class="group-head">Claude API 密钥</h3>
-      <div class="group">
-        <p id="apiKeyStatus" class="group-row key-status" role="status">正在读取…</p>
-        <form id="apiKeyForm" class="group-row key-form inline">
-          <input id="apiKeyInput" class="ys-input" type="password" autocomplete="off" spellcheck="false" placeholder="sk-ant-…" aria-label="新的 Claude API 密钥" required>
-          <button class="ys-btn ys-btn--primary btn small" type="submit">保存</button>
-          <button id="apiKeyClear" class="ys-btn ys-btn--danger link small" type="button">删除</button>
-        </form>
-      </div>
-      <p class="group-foot">按 API 用量计费。保存前会向 Anthropic 验证；保存后不再显示完整密钥。</p>
+      <h3 id="anthropicTitle" class="group-head">Claude API</h3>
+      <form id="apiKeyForm" class="group endpoint-form" novalidate>
+        <div id="apiKeyStatus" class="group-row key-status status-row" role="status">正在读取…</div>
+        <label class="group-row field-row"><span class="field-label">密钥</span>
+          <input id="apiKeyInput" class="ys-input" type="password" autocomplete="new-password" data-1p-ignore data-lpignore="true" spellcheck="false" placeholder="sk-ant-…" aria-describedby="apiKeyHelp">
+          <span id="apiKeyHelp" class="ys-field-help">以 sk-ant- 开头。<span id="apiKeyReuse" hidden>已保存密钥时，只改输出上限可以留空。</span></span></label>
+        <label class="group-row field-row"><span class="field-label">输出上限</span>
+          <input id="claudeMaxTokens" class="ys-input limit-input" type="text" inputmode="numeric" autocomplete="off" spellcheck="false" placeholder="不设上限" aria-describedby="claudeMaxTokensHelp">
+          <span id="claudeMaxTokensHelp" class="ys-field-help">可选，单位 tokens，1000–1000000，推理用的 token 也算在内。留空则由 Claude Code 按模型决定。</span></label>
+        <div class="group-row form-actions">
+          <button id="apiKeySave" class="ys-btn ys-btn--primary btn small" type="submit">保存</button>
+          <button id="claudeTest" class="ys-btn btn small test-button" type="button" data-test-provider="anthropic" disabled>测试连接</button>
+          <button id="apiKeyClear" class="ys-btn ys-btn--danger link small" type="button" hidden>删除</button>
+        </div>
+        <div id="claudeTestResult" class="group-row status-row test-result" data-test-result="anthropic" role="status" hidden></div>
+        <div class="form-error openai-error" role="alert"><svg class="ys-icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3.5a8.5 8.5 0 1 0 0 17 8.5 8.5 0 0 0 0-17zM12 7.75v5M12 16.25h.01"/></svg><p id="claudeError" class="error" hidden></p></div>
+      </form>
+      <p class="group-foot">按 API 用量计费。保存前会向 Anthropic 验证密钥；保存后不再显示完整密钥。<span class="test-help">“测试连接”只发一次很短的请求，会用掉少量 token。</span></p>
+    </section>
+
+    <section id="compatSettings" class="provider-settings" aria-labelledby="compatTitle" hidden>
+      <h3 id="compatTitle" class="group-head">Anthropic 兼容接口</h3>
+      <form id="compatForm" class="group openai-form endpoint-form" novalidate>
+        <div id="compatStatus" class="group-row key-status status-row" role="status" hidden></div>
+        <label class="group-row field-row"><span class="field-label">接口地址</span>
+          <input id="compatBaseUrl" class="ys-input" type="url" inputmode="url" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="https://api.example.com" aria-describedby="compatBaseHelp">
+          <span id="compatBaseHelp" class="ys-field-help">填中转站给的 ANTHROPIC_BASE_URL，不带 /v1/messages，例如 https://api.example.com。</span></label>
+        <label class="group-row field-row"><span class="field-label">密钥</span>
+          <input id="compatKey" class="ys-input" type="password" autocomplete="new-password" data-1p-ignore data-lpignore="true" spellcheck="false" placeholder="sk-…" aria-describedby="compatKeyHelp">
+          <span id="compatKeyHelp" class="ys-field-help"><span id="compatKeyReuse" hidden>地址的协议、主机和端口不变时可以留空，沿用已保存的密钥。</span>中转站给的密钥，以 x-api-key 和 Bearer 两种方式发送。</span></label>
+        <label class="group-row field-row"><span class="field-label">模型</span>
+          <input id="compatModels" class="ys-input model-input" type="text" list="compatModelList" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="例如 claude-sonnet-5-5" aria-describedby="compatModelsHelp">
+          <datalist id="compatModelList"></datalist>
+          <span id="compatModelsHelp" class="ys-field-help">一个或多个，用逗号分开；第一个是默认模型。<span id="compatModelsHint"></span></span></label>
+        <label class="group-row field-row"><span class="field-label">输出上限</span>
+          <input id="compatMaxTokens" class="ys-input limit-input" type="text" inputmode="numeric" autocomplete="off" spellcheck="false" placeholder="不设上限" aria-describedby="compatMaxTokensHelp">
+          <span id="compatMaxTokensHelp" class="ys-field-help">可选，单位 tokens，1000–1000000，推理用的 token 也算在内。留空则由 Claude Code 按模型决定。</span></label>
+        <div class="group-row form-actions">
+          <button id="compatSave" class="ys-btn ys-btn--primary btn small" type="submit">保存并验证</button>
+          <button id="compatTest" class="ys-btn btn small test-button" type="button" data-test-provider="anthropic_compatible" disabled>测试连接</button>
+          <button id="compatClear" class="ys-btn ys-btn--danger link small" type="button" hidden>删除</button>
+        </div>
+        <div id="compatTestResult" class="group-row status-row test-result" data-test-result="anthropic_compatible" role="status" hidden></div>
+        <div class="form-error openai-error" role="alert"><svg class="ys-icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3.5a8.5 8.5 0 1 0 0 17 8.5 8.5 0 0 0 0-17zM12 7.75v5M12 16.25h.01"/></svg><p id="compatError" class="error" hidden></p></div>
+      </form>
+      <p class="group-foot">作答时由本机 Claude Code 把题目、资料、页面图片、学生资料和补充说明发给这个接口。保存前读取模型列表验证，不消耗 token。<span class="test-help">“测试连接”只发一次很短的请求，会用掉少量 token。</span></p>
     </section>
 
     <section id="openaiSettings" class="provider-settings" aria-labelledby="openaiTitle" hidden>
       <h3 id="openaiTitle" class="group-head">OpenAI 兼容接口</h3>
-      <form id="openaiForm" class="group openai-form" novalidate>
+      <form id="openaiForm" class="group openai-form endpoint-form" novalidate>
         <div id="openaiStatus" class="group-row key-status status-row" role="status" hidden></div>
         <label class="group-row field-row"><span class="field-label">接口地址</span>
           <input id="openaiBaseUrl" class="ys-input" type="url" inputmode="url" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="https://api.example.com/v1" aria-describedby="openaiBaseHelp">
@@ -140,13 +173,18 @@
           <input id="openaiModels" class="ys-input model-input" type="text" list="openaiModelList" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="例如 deepseek-chat" aria-describedby="openaiModelsHelp">
           <datalist id="openaiModelList"></datalist>
           <span id="openaiModelsHelp" class="ys-field-help">一个或多个，用逗号分开；第一个是默认模型。<span id="openaiModelsHint"></span></span></label>
+        <label class="group-row field-row"><span class="field-label">输出上限</span>
+          <input id="openaiMaxTokens" class="ys-input limit-input" type="text" inputmode="numeric" autocomplete="off" spellcheck="false" placeholder="不设上限" aria-describedby="openaiMaxTokensHelp">
+          <span id="openaiMaxTokensHelp" class="ys-field-help">可选，单位 tokens，1000–1000000，推理用的 token 也算在内。留空则不发送，由接口决定；答案常被截断时再填，例如 16000。</span></label>
         <div class="group-row form-actions">
           <button id="openaiSave" class="ys-btn ys-btn--primary btn small" type="submit">保存并验证</button>
+          <button id="openaiTest" class="ys-btn btn small test-button" type="button" data-test-provider="openai" disabled>测试连接</button>
           <button id="openaiClear" class="ys-btn ys-btn--danger link small" type="button" hidden>删除</button>
         </div>
+        <div id="openaiTestResult" class="group-row status-row test-result" data-test-result="openai" role="status" hidden></div>
         <div class="form-error openai-error" role="alert"><svg class="ys-icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3.5a8.5 8.5 0 1 0 0 17 8.5 8.5 0 0 0 0-17zM12 7.75v5M12 16.25h.01"/></svg><p id="openaiError" class="error" hidden></p></div>
       </form>
-      <p class="group-foot">保存前会读取这个接口的模型列表，验证地址和密钥，不消耗 token。作答时把题目、课程资料文字、页面图片，以及设置里的学生资料（姓名、学号等）、补充说明和个人事实发给这个接口；保存后不再显示完整密钥。</p>
+      <p class="group-foot">保存前会读取这个接口的模型列表，验证地址和密钥，不消耗 token。作答时把题目、课程资料文字、页面图片，以及设置里的学生资料（姓名、学号等）、补充说明和个人事实发给这个接口；保存后不再显示完整密钥。<span class="test-help">“测试连接”只发一次很短的请求，会用掉少量 token。</span></p>
     </section>
   </div>
 </dialog>

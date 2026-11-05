@@ -2205,6 +2205,8 @@ div.title { cursor: auto; }
 .panel-content .ys-facts { font-size: var(--ys-fs-ui); }
 .panel-content .ys-facts > dd { overflow-wrap: anywhere; }
 .record-error { margin: var(--ys-space-3) 0 0; }
+/* A fact's qualifier on its own muted line (an Anthropic-compatible cost is an estimate). */
+.panel-content .ys-facts > dd .record-note { display: block; color: var(--ys-muted); font-size: var(--ys-fs-ui-sub); overflow-wrap: normal; }
 
 /* the draft: the exporter's faces (Mincho body, Gothic headings) and its table header */
 .draft { color: var(--ys-ink); font-size: var(--ys-fs-body); line-height: var(--ys-lh-prose); }
@@ -2370,12 +2372,33 @@ label.group-row { cursor: pointer; }
 .group-foot { margin: 6px var(--ys-space-4) 0; color: var(--ys-muted); font-size: var(--ys-fs-footnote); line-height: 1.5; }
 .key-status { font-size: var(--ys-fs-ui); }
 .key-status > .fact-row { row-gap: 2px; }
-.key-form { flex-wrap: wrap; gap: var(--ys-space-2); padding-top: var(--ys-space-3); padding-bottom: var(--ys-space-3); }
-.key-form > .ys-input { flex: 1 1 12em; }
 
-/* the model provider: one segmented control across its row; the chosen provider's settings follow it */
-.provider-row { padding: var(--ys-space-2); }
-.provider-row > .ys-seg { flex: 1 1 auto; width: auto; }
+/* the model provider: three choices as an inset list with a check mark (three segment labels do not fit a phone), the
+   chosen provider's settings follow it */
+.provider-option {
+  width: 100%;
+  border: 0;
+  background: transparent;
+  color: var(--ys-ink);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+@media (hover: hover) {
+  .provider-option:hover { background: var(--ys-row-hover); }
+}
+.provider-option:active { background: var(--ys-row-pressed); }
+.provider-option:focus-visible { outline-offset: -2px; }
+/* the first and last rows round with the group (its radius less its hairline), so a focus ring follows the corner */
+.provider-option:first-child { border-radius: 11px 11px 0 0; }
+.provider-option:last-child { border-radius: 0 0 11px 11px; }
+.provider-text { display: flex; flex: 1 1 auto; flex-direction: column; gap: 2px; min-width: 0; }
+.provider-name { font-size: var(--ys-fs-ui); line-height: var(--ys-lh-ui); }
+.provider-sub { color: var(--ys-muted); font-size: var(--ys-fs-ui-sub); line-height: 1.45; }
+.provider-check { flex: none; color: var(--ys-accent); visibility: hidden; }
+.provider-option[aria-pressed="true"] .provider-check { visibility: visible; }
+.provider-list[aria-busy="true"] .provider-option { cursor: progress; }
 .provider-notice { margin-top: var(--ys-space-3); }
 /* the OpenAI-compatible endpoint: what is saved, then one field per row, label over input over help */
 .status-row { flex-direction: column; align-items: flex-start; justify-content: center; gap: 2px; }
@@ -2392,9 +2415,21 @@ label.field-row { cursor: default; }
 }
 .field-label { font-size: var(--ys-fs-footnote); font-weight: var(--ys-fw-semibold); line-height: 1.4; }
 /* with nothing saved the status row is hidden, and the first field draws no hairline over itself */
-.openai-form > [hidden] + .group-row::before { display: none; }
+.endpoint-form > [hidden] + .group-row::before { display: none; }
 .form-actions { flex-wrap: wrap; gap: var(--ys-space-2); padding-top: var(--ys-space-3); padding-bottom: var(--ys-space-3); }
 .openai-error { margin: 0 var(--ys-space-3) var(--ys-space-3) var(--ys-space-4); }
+/* the output limit is a short number: the field does not run the row's width on the desktop */
+.limit-input { max-width: 16em; }
+/* a connection test's result, in its own group row: plain when it worked (a muted check, the facts muted), what the
+   endpoint did not take as amber lines, and the red mark with the error and the server's words when it failed */
+.test-result { gap: 4px; }
+.test-head { display: inline-flex; align-items: center; gap: 6px; font-weight: var(--ys-fw-semibold); }
+.test-head > .ys-icon { flex: none; color: var(--ys-muted); }
+.test-head.bad, .test-head.bad > .ys-icon { color: var(--ys-bad); }
+.test-error { min-width: 0; max-width: 100%; overflow-wrap: anywhere; }
+.test-result > .fact-row { color: var(--ys-muted); font-size: var(--ys-fs-ui-sub); }
+.status-sub.fact-row { max-width: 100%; }
+.test-help { display: block; margin-top: 4px; }
 /* the model field offers the endpoint's ids as it is typed in; Chrome's datalist triangle (which came and went with the
    text after the last comma) is not drawn, as the system draws no native control marks */
 .model-input::-webkit-calendar-picker-indicator { display: none !important; }
@@ -2727,6 +2762,7 @@ label.field-row { cursor: default; }
 /* ---------- forced colours ---------- */
 
 @media (forced-colors: active) {
+  .provider-check { color: Highlight; }
   .issues .dot { background: CanvasText; forced-color-adjust: none; }
   .switch { border: 1px solid CanvasText; background: Canvas; forced-color-adjust: none; }
   .switch::after { background: CanvasText; box-shadow: none; }

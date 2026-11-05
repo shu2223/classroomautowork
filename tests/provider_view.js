@@ -2,7 +2,8 @@
 const fs = require('node:fs'), vm = require('node:vm'), assert = require('node:assert/strict'), path = require('node:path');
 const source = fs.readFileSync(path.join(__dirname, '../src/classroomautowork/web/app.js'), 'utf8');
 const code = source.split('// Provider presentation; exercised by tests/provider_view.js.')[1].split('// End provider presentation.')[0];
-const names = ['jobProvider', 'recordProvider', 'modelLabel', 'stepNames', 'redoChoice', 'redoLine', 'imagesDroppedWhy', 'imagesNote', 'recordModels', 'savedMessage'];
+const names = ['jobProvider', 'recordProvider', 'modelLabel', 'stepNames', 'redoChoice', 'redoLine', 'imagesDroppedWhy', 'imagesNote', 'recordModels', 'savedMessage',
+  'effortRecord', 'limitRecord', 'lastTestLine', 'billingRecord', 'costRecord', 'effortMeta'];
 const f = vm.runInNewContext(code + `\n({${names.join(',')}})`, {});
 
 // A job's provider: recorded; earlier AI review jobs were Claude's; a fill job and a materials-only job have none.
@@ -58,11 +59,66 @@ assert.equal(f.imagesDroppedWhy({degradations: ['json_schema', 'images']}), '接
 const label = id => id;
 assert.deepEqual([...f.recordModels({provider: 'openai_compatible', model: 'demo-gpt-5-staging', requested_model: 'demo-gpt-5'}, label)], ['demo-gpt-5-staging', '所选 demo-gpt-5']);
 assert.deepEqual([...f.recordModels({provider: 'openai_compatible', model: 'demo-gpt-5', requested_model: 'demo-gpt-5'}, label)], ['demo-gpt-5']);
-assert.deepEqual([...f.recordModels({provider: 'anthropic', model: 'claude-x', requested_model: 'claude-y'}, label)], ['claude-x']);
+// A relay may serve another Claude model than the one asked for: the record says both, on any provider.
+assert.deepEqual([...f.recordModels({provider: 'anthropic_compatible', model: 'claude-sonnet-4-5-20250929', requested_model: 'claude-opus-5-5'}, label)],
+  ['claude-sonnet-4-5-20250929', '所选 claude-opus-5-5']);
+assert.deepEqual([...f.recordModels({provider: 'anthropic', model: 'claude-x', requested_model: 'claude-x'}, label)], ['claude-x']);
+assert.deepEqual([...f.recordModels({provider: 'anthropic', model: 'claude-x', requested_model: 'claude-y'}, x => x.toUpperCase())], ['CLAUDE-X', '所选 CLAUDE-Y']);
 
 // 保存并验证's toast says what was checked: a list that answers without the key did not check the key.
 assert.equal(f.savedMessage({models_listed: true, key_checked: true, unlisted_models: []}, false), '已验证并保存');
 assert.match(f.savedMessage({models_listed: true, key_checked: false, unlisted_models: []}, true), /^已保存，作答改用这个接口。这个接口不用密钥也能读取模型列表/);
 assert.match(f.savedMessage({models_listed: false}, false), /没有提供模型列表/);
 assert.match(f.savedMessage({models_listed: true, key_checked: null, unlisted_models: ['x']}, false), /^已验证并保存。接口的模型列表里没有 x/);
+// The 记录 tab's 推理强度: the chosen effort, a step down the server asked for, or none sent.
+const words = {low: '低', medium: '中', high: '高', xhigh: '很高', max: '最高'};
+assert.equal(f.effortRecord({reasoning_effort: null}, words), '默认');
+assert.equal(f.effortRecord({reasoning_effort: 'high', degradations: []}, words), '高');
+assert.equal(f.effortRecord({reasoning_effort: 'xhigh', degradations: ['reasoning_effort_lowered'], effort: {requested: 'xhigh', sent: 'high'}}, words), '很高 → 高（接口不支持很高）');
+assert.equal(f.effortRecord({reasoning_effort: 'max', degradations: ['reasoning_effort_lowered', 'reasoning_effort'], effort: {requested: 'max', sent: null}}, words), '最高（接口不支持，未发送）');
+assert.equal(f.effortRecord({reasoning_effort: 'low', degradations: ['reasoning_effort']}, words), '低（接口不支持，未发送）');
+
+// The 记录 tab's 输出上限: absent from older records; what was asked for and what the request that answered carried.
+assert.equal(f.limitRecord({}), null);
+assert.equal(f.limitRecord({output_limit: {requested: null, sent: null, param: null}}), '未设置（由接口决定）');
+assert.equal(f.limitRecord({output_limit: {requested: 16000, sent: 16000, param: 'max_tokens'}}), '16000 tokens');
+assert.equal(f.limitRecord({output_limit: {requested: 64000, sent: 32000, param: 'max_tokens'}}), '64000 → 32000 tokens（接口给出的最大值）');
+assert.equal(f.limitRecord({output_limit: {requested: 16000, sent: 16000, param: 'max_completion_tokens'}}), '16000 tokens（以 max_completion_tokens 发送）');
+assert.equal(f.limitRecord({output_limit: {requested: 16000, sent: null, param: null}}), '16000 tokens（接口不接受，未发送）');
+
+// The status row's 上次测试 line: "上次测试：正常 · 2.1 秒 · 17:40", or the failure with its words below.
+assert.equal(f.lastTestLine(null, '17:40'), null);
+const plain = value => JSON.parse(JSON.stringify(value));  // values from the vm context, compared as data
+assert.deepEqual(plain(f.lastTestLine({at: 'x', ok: true, summary: '正常 · 2.1 秒'}, '17:40')), {facts: ['上次测试：正常', '2.1 秒', '17:40'], detail: null});
+assert.deepEqual(plain(f.lastTestLine({at: 'x', ok: false, summary: 'OpenAI 兼容接口拒绝了密钥（HTTP 401）。'}, '17:41')), {facts: ['上次测试：失败', '17:41'], detail: 'OpenAI 兼容接口拒绝了密钥（HTTP 401）。'});
+
+// The Anthropic-compatible endpoint (a Claude Code relay): its records, its Claude models' names and its cost estimate.
+assert.equal(f.recordProvider({provider: 'anthropic_compatible'}), 'anthropic_compatible');
+const compatList = {provider: 'anthropic_compatible', models: [{model: 'claude-opus-5-5', displayName: 'Claude Opus 5.5'}, {model: 'relay-x', displayName: 'relay-x'}], claude_names: claudeNames};
+assert.equal(f.modelLabel('claude-opus-5-5', 'anthropic_compatible', compatList), 'Claude Opus 5.5');
+assert.equal(f.modelLabel('relay-x', 'anthropic_compatible', compatList), 'relay-x');
+assert.equal(f.modelLabel('claude-haiku-5-5', 'anthropic_compatible', openaiList), 'Claude Haiku 5.5');
+assert.equal(f.stepNames({provider: 'anthropic_compatible'}, 'openai')[1], 'Claude 作答');
+assert.equal(f.redoLine('Claude Opus 5.5', 'anthropic_compatible', 'anthropic'), '重做会改用 Anthropic 兼容接口的 Claude Opus 5.5。');
+assert.equal(f.redoLine('Claude Opus 5.5', 'anthropic_compatible', 'anthropic_compatible'), '重做会使用 Claude Opus 5.5。');
+// Claude Code drops refused images itself: the record has no count, only the step.
+assert.match(f.imagesNote({provider: 'anthropic_compatible', degradations: ['images']}), /^接口不接受页面图片，Claude Code 去掉图片后作答/);
+assert.equal(f.imagesNote({provider: 'anthropic_compatible', degradations: ['max_tokens_clamp']}), null);
+// No limit set, Claude Code's own default refused and clamped; a limit sent as CLAUDE_CODE_MAX_OUTPUT_TOKENS reads plain.
+assert.equal(f.limitRecord({output_limit: {requested: null, sent: 32000, param: 'CLAUDE_CODE_MAX_OUTPUT_TOKENS'}}), '默认 → 32000 tokens（接口给出的最大值）');
+assert.equal(f.limitRecord({output_limit: {requested: 64000, sent: 32000, param: 'CLAUDE_CODE_MAX_OUTPUT_TOKENS'}}), '64000 → 32000 tokens（接口给出的最大值）');
+assert.equal(f.limitRecord({output_limit: {requested: 16000, sent: 16000, param: 'CLAUDE_CODE_MAX_OUTPUT_TOKENS'}}), '16000 tokens');
+assert.equal(f.billingRecord({provider: 'anthropic_compatible', host: 'node-cf.example', api_key_source: 'apiKeyHelper'}), 'Anthropic 兼容接口（node-cf.example）');
+assert.equal(f.billingRecord({provider: 'openai_compatible', host: 'api.example.com'}), 'OpenAI 兼容接口（api.example.com）');
+assert.equal(f.billingRecord({provider: 'anthropic', api_key_source: 'ANTHROPIC_API_KEY'}), 'Claude API 密钥');
+// The estimate's qualifier goes on a line of its own, so a phone does not break it inside a word.
+assert.deepEqual([...f.costRecord({provider: 'anthropic_compatible', cost_usd: 0.01234})], ['约 0.0123 美元', '按 Claude 官方价估算，实际以接口计费为准']);
+assert.equal(f.costRecord({provider: 'anthropic', cost_usd: 0.5}), '0.5000 美元');
+assert.equal(f.costRecord({provider: 'openai_compatible'}), '—');
+// The answer panel's 强度 fact says the effort the endpoint took: the lowered one, none when it took none.
+const efforts = {low: '低', medium: '中', high: '高', xhigh: '很高', max: '最高'};
+assert.equal(f.effortMeta({reasoning_effort: 'xhigh', effort: {requested: 'xhigh', sent: 'high'}}, efforts), '高强度');
+assert.equal(f.effortMeta({reasoning_effort: 'max', effort: {requested: 'max', sent: null}}, efforts), null);
+assert.equal(f.effortMeta({reasoning_effort: 'high'}, efforts), '高强度');
+assert.equal(f.effortMeta({reasoning_effort: null, effort: {requested: null, sent: null}}, efforts), '默认强度');
 console.log('Provider view checks passed');

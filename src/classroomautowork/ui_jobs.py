@@ -7,8 +7,8 @@ import uuid
 from dataclasses import asdict, replace
 from pathlib import Path
 
+from . import connection_test
 from .answer_document import create_answer_document, valid_answer_document
-from .api_key import key_status, save_key
 from .auth import documents_authorized
 from .batch import course_batches
 from .claude_agent import model_catalog
@@ -36,8 +36,13 @@ from .pending import discover_pending
 from .policy import CoursePolicy, confirmed_gate
 from .progress import ProgressUpdate
 from .providers import (
+    KINDS,
     active_provider,
+    claude_status,
+    compat_catalog,
     openai_catalog,
+    save_claude,
+    save_compat,
     save_openai,
     save_provider,
     settings_view,
@@ -84,6 +89,13 @@ POLICY_FIELDS = {
 
 def item_key(item: dict) -> str:
     return item["course_id"] + ":" + item["assignment_id"]
+
+
+PROVIDER_LABELS = {
+    "anthropic": "Claude API",
+    "anthropic_compatible": "Anthropic 兼容接口",
+    "openai": "OpenAI 兼容接口",
+}
 
 
 def job_provider(job: dict):
@@ -262,7 +274,7 @@ class FrontendJobs:
                         "result_jobs": result_jobs,
                         "active_job_id": self._active,
                         # Kept for pages that predate the provider block, which carries it too.
-                        "api_key": key_status(self.settings.data_dir),
+                        "api_key": claude_status(self.settings.data_dir),
                         "provider": provider_status(self.settings.data_dir),
                         "submission": "manual_only",
                     }
@@ -329,9 +341,8 @@ class FrontendJobs:
             self._save(job)
 
     def set_api_key(self, values):
-        if set(values) != {"key"}:
-            raise WorkflowError("密钥设置只接受 key。")
-        return save_key(self.settings.data_dir, values["key"])
+        """The Claude API's key and its optional output limit: {key?, max_output_tokens?}."""
+        return save_claude(self.settings.data_dir, values)
 
     def set_provider(self, values):
         return save_provider(self.settings.data_dir, values)
@@ -339,8 +350,15 @@ class FrontendJobs:
     def set_openai(self, values):
         return save_openai(self.settings.data_dir, values)
 
+    def set_compat(self, values):
+        return save_compat(self.settings.data_dir, values)
+
     def openai_settings(self):
         return settings_view(self.settings.data_dir)
+
+    def test_connection(self, values, *, cancelled=lambda: False):
+        """One tiny real request through the provider's answer path (connection_test.py)."""
+        return connection_test.run(self.settings.data_dir, values, cancelled=cancelled)
 
     def models(self):
         """The model list of the active provider, for the toolbar."""
@@ -353,15 +371,17 @@ class FrontendJobs:
         names = {x["model"]: x["displayName"] for x in model_catalog()["models"]}
         if provider == "openai":
             return {**openai_catalog(self.settings.data_dir), "claude_names": names}
+        if provider == "anthropic_compatible":
+            return {**compat_catalog(self.settings.data_dir), "claude_names": names}
         return {**model_catalog(), "provider": "anthropic", "claude_names": names}
 
     def _start_catalog(self, provider):
         """The list a new job's model is checked against. ui/models.json, which nothing in the
         app writes, can stand in for the Claude list (the tests use it) when it is a usable one;
         it never stands in for the OpenAI-compatible list, which always comes from the saved
-        settings."""
-        if provider == "openai":
-            return self._catalog("openai")
+        settings (as the Anthropic-compatible one does)."""
+        if provider in KINDS:
+            return self._catalog(provider)
         cached = read_json(self.root / "models.json")
         if (
             isinstance(cached, dict)
@@ -478,8 +498,14 @@ class FrontendJobs:
         effort=None,
         ai_confirmed=False,
         provider=None,
+        shown_provider=None,
     ):
-        """provider None means the active one; a retry passes the provider its job used."""
+        """provider None means the active one; a retry passes the provider its job used.
+
+        shown_provider: the provider whose model list the page showed when the user chose (the
+        toolbar, or the redo dialog). The model and effort were chosen from that list, so a job
+        never starts on another provider, and so never bills another account: when the active
+        provider was switched meanwhile (in another tab or on another device), it is refused."""
         if not isinstance(selected, list) or not 1 <= len(selected) <= 200:
             raise ConfigurationError("请勾选 1–200 项作业。")
         if not isinstance(defer_media, bool):
@@ -523,15 +549,25 @@ class FrontendJobs:
         # when it cannot be used names that job, not the toolbar.
         pinned = provider is not None
         provider = provider or active_provider(self.settings.data_dir)
-        if provider not in {"anthropic", "openai"}:
+        if provider not in {"anthropic", "anthropic_compatible", "openai"}:
             raise ConfigurationError("模型接口无效。")
+        if shown_provider is not None and not pinned and shown_provider != provider:
+            if shown_provider not in PROVIDER_LABELS:
+                raise ConfigurationError("模型接口无效。")
+            shown = PROVIDER_LABELS[shown_provider]
+            raise ConfigurationError(
+                f"模型接口已在别处切换为 {PROVIDER_LABELS[provider]}，页面上列出的还是 {shown}"
+                f"{' ' if shown[-1].isascii() else ''}的模型，没有开始作答。"
+                "请重新选择模型后再点“完成”。"
+            )
+        kind = KINDS.get(provider)
         try:
             catalog = self._start_catalog(provider)
         except ConfigurationError:
-            if not pinned or provider != "openai":
+            if not pinned or not kind:
                 raise
             raise ConfigurationError(
-                "这个任务用的是 OpenAI 兼容接口，它的设置已删除或损坏，不能按原样重试。"
+                f"这个任务用的是 {kind.label}，它的设置已删除或损坏，不能按原样重试。"
                 "请在设置里重新填写这个接口后再重试；或在列表里重新勾选这些作业，"
                 "点“完成”用当前的模型接口作答。"
             ) from None
@@ -539,11 +575,11 @@ class FrontendJobs:
         entry = next((x for x in catalog["models"] if x["model"] == model), None)
         if not entry:
             raise ConfigurationError(
-                f"这个任务用的模型“{model}”已不在 OpenAI 兼容接口的设置里。请在设置里加回这个模型"
+                f"这个任务用的模型“{model}”已不在 {kind.label}的设置里。请在设置里加回这个模型"
                 "后再重试；或在列表里重新勾选这些作业，用当前的模型作答。"
-                if pinned and provider == "openai"
-                else "所选模型不在 OpenAI 兼容接口设置的模型里，请重新选择，或在设置里添加这个模型。"
-                if provider == "openai"
+                if pinned and kind
+                else f"所选模型不在 {kind.label}设置的模型里，请重新选择，或在设置里添加这个模型。"
+                if kind
                 else "所选模型不在可用模型列表中，请重新读取模型列表。"
             )
         allowed = {x["reasoningEffort"] for x in entry.get("supportedReasoningEfforts", [])}
@@ -702,6 +738,7 @@ class FrontendJobs:
         model=None,
         effort=None,
         ai_confirmed=False,
+        shown_provider=None,
     ):
         with self._lock:
             if self._active:
@@ -721,6 +758,7 @@ class FrontendJobs:
                 model=model,
                 effort=effort,
                 ai_confirmed=ai_confirmed,
+                shown_provider=shown_provider,
             )
 
     def import_followup(self, job_id, key):
@@ -967,6 +1005,8 @@ class FrontendJobs:
                             if not job.get("ai_confirmed")
                             else "，正在交给 OpenAI 兼容接口的所选模型"
                             if provider == "openai"
+                            else "，正在经 Anthropic 兼容接口交给所选 Claude 模型"
+                            if provider == "anthropic_compatible"
                             else "，正在交给所选 Claude 模型"
                         ),
                     )
