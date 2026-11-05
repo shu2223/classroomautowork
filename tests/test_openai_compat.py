@@ -246,7 +246,13 @@ def test_streamed_answer_is_validated_and_reported(endpoint):
         "type": "json_schema",
         "json_schema": {"name": "assignment_review", "strict": True, "schema": SCHEMA},
     }
-    assert body["messages"] == [{"role": "user", "content": "原题与资料"}]
+    # The schema rides in the prompt too: some relays accept response_format and drop it.
+    assert body["messages"] == [
+        {
+            "role": "user",
+            "content": "原题与资料\n\n" + openai_compat.schema_instruction(SCHEMA),
+        }
+    ]
     assert KEY not in json.dumps(outcome, ensure_ascii=False)
 
 
@@ -516,11 +522,25 @@ def test_images_go_as_data_urls_and_are_dropped_with_a_note_when_refused(endpoin
         {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
         {"type": "text", "text": "页面图片 2：講義資料 · 第4页 [E:bbb]"},
         {"type": "image_url", "image_url": {"url": "data:image/png;base64,BBBB"}},
+        {"type": "text", "text": openai_compat.schema_instruction(SCHEMA)},
     ]
     assert isinstance(second, str) and second.startswith("原题与资料")
     assert "页面图片 1：講義資料 · 第3页 [E:aaa]；页面图片 2：講義資料 · 第4页 [E:bbb]" in second
     assert "AAAA" not in second and "不接受图片" in second
     assert outcome["provider"]["images_sent"] == 0 and outcome["provider"]["images_dropped"] == 2
+
+
+def test_a_relay_that_drops_response_format_still_shows_the_schema(endpoint):
+    # A relay that takes response_format and forwards the request without it: the model sees
+    # the schema only in the prompt, so every required field must be spelled out there.
+    endpoint.replies.append(reply_stream(chunks(json.dumps(answer()))))
+    turn(endpoint)
+    body = endpoint.requests[0]["body"]
+    assert body["response_format"]["type"] == "json_schema"
+    prompt = body["messages"][0]["content"]
+    assert prompt.endswith(openai_compat.schema_instruction(SCHEMA))
+    for field in SCHEMA["required"]:
+        assert f'"{field}"' in prompt
 
 
 def test_a_server_that_refuses_stream_gets_one_plain_request(endpoint):

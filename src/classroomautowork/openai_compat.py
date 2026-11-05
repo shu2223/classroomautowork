@@ -1078,8 +1078,9 @@ def request_body(content, schema, model, mode) -> dict:
                 "missing_sources 和 questions，不要猜测。",
             }
         )
-    if mode["format"] != "json_schema":
-        parts.append({"type": "text", "text": schema_instruction(schema)})
+    # The schema goes into the prompt in every mode: some relays accept response_format and then
+    # drop it, and the model, never shown the schema, answers without required fields.
+    parts.append({"type": "text", "text": schema_instruction(schema)})
     images = any(part["type"] == "image_url" for part in parts)
     # Text alone goes as one string: some servers take content parts only together with images.
     message = parts if images else "\n\n".join(part["text"] for part in parts)
