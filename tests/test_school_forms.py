@@ -432,3 +432,51 @@ def test_order_pairing_ignores_header_pictures_and_other_sizes(tmp_path):
     column.update(attr_width=0, attr_height=0, natural_width=1480, natural_height=832)
     assert school_forms.match_images(form, [column]) == {"110": "/x/c"}
     assert school_forms.match_images(form, [header, rendered("/x/a", ids=())]) == {"110": "/x/a"}
+
+
+def test_a_signed_in_forms_picture_host_is_googles():
+    """2026-11-06, live: signed in, Google serves form pictures from docs.google.com."""
+    from classroomautowork.school_browser import google_picture
+
+    assert google_picture("https://docs.google.com/forms-images-rt/ANbbkiiAPdBFpdd8mVHrHOUiq")
+    assert google_picture("https://lh7-rt.googleusercontent.com/formsz/AN7BsVA=w740")
+    assert not google_picture("https://docs.google.com/forms/d/e/x/viewform")
+    assert not google_picture("https://evilgoogleusercontent.com/x.png")
+    assert not google_picture("https://docs.google.com.evil.example/forms-images-rt/x")
+
+
+def test_the_question_picture_pairs_with_the_picture_inside_that_question():
+    """The rendered picture inside question 1124768656 (its data-params) is that question's."""
+    from test_form_types import LOOK, page
+
+    from classroomautowork.form_read import parse_form
+
+    form = parse_form(page([LOOK]), "https://docs.google.com/forms/d/e/unit-look/viewform")
+    rendered = [
+        {
+            "index": 0,
+            "natural_width": 740,
+            "natural_height": 1110,
+            "width": 590,
+            "height": 895,
+            "attr_width": 0,
+            "attr_height": 0,
+            "item_ids": ["1124768656"],
+            "in_list": True,
+            "google": True,
+            "path": "/capture/000.img",
+        },
+        {
+            "index": 1,
+            "natural_width": 74,
+            "natural_height": 24,
+            "width": 74,
+            "height": 24,
+            "attr_width": 74,
+            "attr_height": 24,
+            "item_ids": [],
+            "in_list": False,
+            "google": False,
+        },
+    ]
+    assert school_forms.match_images(form, rendered) == {"1124768656": "/capture/000.img"}

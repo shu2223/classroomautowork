@@ -15,7 +15,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 from .errors import PermissionDenied, WorkflowError
 
 MAX_PAGE_BYTES = 4 * 1024 * 1024
-PARSER_VERSION = "published-form-v2-images"
+PARSER_VERSION = "published-form-v3-question-images"
 FORM_PATH = re.compile(
     r"/forms/(?:u/\d+/)?d/(e/)?([A-Za-z0-9_-]{8,200})/(?:viewform|formResponse)/?"
 )
@@ -190,30 +190,31 @@ def parse_form(html: str, url: str) -> dict:
                 # not a public download URL. The authorized browser supplies
                 # pixels separately; never guess a URL from this identifier.
                 descriptor = item[6] if len(item) > 6 else None
-                if (
-                    not isinstance(descriptor, list)
-                    or len(descriptor) < 3
-                    or not isinstance(descriptor[0], str)
-                    or not re.fullmatch(r"[A-Za-z0-9_-]{8,200}", descriptor[0])
-                    or not isinstance(descriptor[2], list)
-                    or len(descriptor[2]) < 2
-                    or any(type(value) is not int or value <= 0 for value in descriptor[2][:2])
-                ):
-                    warnings.append("表单包含无法识别的图像，需在原页面核对。")
+                if not _media_descriptor(descriptor):
+                    warnings.append(IMAGE_WARNING)
                     continue
-                picture = {
-                    "item_id": str(item_id),
-                    "page": page,
-                    "title": label or "",
-                    "description": help_text or "",
-                    "type": "image",
-                    "media_id": descriptor[0],
-                    "width": descriptor[2][0],
-                    "height": descriptor[2][1],
-                }
+                picture = _picture(item_id, page, label, help_text, "image", descriptor)
                 media.append(picture)
                 warnings.append(image_gap_warning(picture))
                 continue
+            # A picture added to a question itself (the question's image button) sits at index 9
+            # of the question: [[media ID, None, [width, height, alignment]]]. It is a material of
+            # that question (one per question), recorded like an image item under the question's
+            # own ID, so the rendered picture inside that question pairs with it.
+            attached = item[9] if len(item) > 9 else None
+            if attached is not None:
+                if (
+                    isinstance(attached, list)
+                    and len(attached) == 1
+                    and _media_descriptor(attached[0])
+                ):
+                    picture = _picture(
+                        item_id, page, label, help_text, "question_image", attached[0]
+                    )
+                    media.append(picture)
+                    warnings.append(image_gap_warning(picture))
+                else:
+                    warnings.append(IMAGE_WARNING)
             if kind not in TYPES:
                 warnings.append(UNKNOWN_WARNING)
                 unknown = _unknown_question(item_id, page, label, help_text, entries)
@@ -322,6 +323,35 @@ def _unknown_question(item_id, page, label, help_text, entries):
         "description": help_text or "",
         "type": UNKNOWN,
         "fields": fields,
+    }
+
+
+IMAGE_WARNING = "表单包含无法识别的图像，需在原页面核对。"
+
+
+def _media_descriptor(descriptor) -> bool:
+    """[media ID, …, [width, height, …]]: an opaque ID and a positive size."""
+    return (
+        isinstance(descriptor, list)
+        and len(descriptor) >= 3
+        and isinstance(descriptor[0], str)
+        and re.fullmatch(r"[A-Za-z0-9_-]{8,200}", descriptor[0]) is not None
+        and isinstance(descriptor[2], list)
+        and len(descriptor[2]) >= 2
+        and all(type(value) is int and value > 0 for value in descriptor[2][:2])
+    )
+
+
+def _picture(item_id, page, label, help_text, kind, descriptor) -> dict:
+    return {
+        "item_id": str(item_id),
+        "page": page,
+        "title": label or "",
+        "description": help_text or "",
+        "type": kind,
+        "media_id": descriptor[0],
+        "width": descriptor[2][0],
+        "height": descriptor[2][1],
     }
 
 

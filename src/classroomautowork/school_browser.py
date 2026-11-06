@@ -312,6 +312,19 @@ def parse_accounts(body: str) -> tuple[list[str], bool]:
     return list(dict.fromkeys(match.lower() for match in EMAIL.findall(text))), False
 
 
+def google_picture(url: str) -> bool:
+    """A picture Google serves for a form: from googleusercontent.com (public forms), or from
+    docs.google.com/forms-images… (what a signed-in view of a form loads its pictures from)."""
+    host = guard.host_of(url)
+    if host == "googleusercontent.com" or host.endswith(".googleusercontent.com"):
+        return True
+    try:
+        path = urlsplit(url).path
+    except ValueError:
+        return False
+    return host == "docs.google.com" and path.startswith("/forms-images")
+
+
 def jpeg_size(data: bytes) -> tuple[int, int]:
     """Width and height from a JPEG's frame header, or (0, 0)."""
     index = 2
@@ -1825,7 +1838,7 @@ class SchoolBrowser:
             }
             entry["item_ids"] = [x for x in image.get("item_ids") or [] if isinstance(x, str)]
             entry["in_list"] = image.get("in_list") is True
-            entry["google"] = guard.host_of(image["url"]).endswith("googleusercontent.com")
+            entry["google"] = google_picture(image["url"])
             response = page.responses.get(image["url"])
             saved = sum(1 for x in result if x.get("path"))
             if entry["google"] and response and response[2] == 200 and saved < MAX_IMAGES:

@@ -389,3 +389,62 @@ def test_a_closed_form_is_not_reported_as_a_login_wall():
         with pytest.raises(WorkflowError) as login:
             handler.redirect_request(Request(URL), None, 302, "Found", {}, target)
         assert needs_login(login.value)
+
+
+# The live form of 2026-11-06: one paragraph question with a picture added to the question itself
+# (index 9 of the item), not a separate image item. It was read as text only, so the model was
+# told the picture was missing.
+LOOK = [
+    1124768656,
+    "このルックを、見ていない人に言葉で伝えてください。",
+    None,
+    1,
+    [[1688752510, None, 1]],
+    None,
+    None,
+    None,
+    None,
+    [["s-blob-v1-IMAGE-7vFIkBsonRc", None, [740, 1110, 0]]],
+    None,
+    [None, "このルックを、見ていない人に言葉で伝えてください。"],
+]
+
+
+def test_a_picture_added_to_a_question_is_its_material():
+    value = parse_form(page([LOOK]), URL)
+    assert [q["item_id"] for q in value["questions"]] == ["1124768656"]
+    assert value["questions"][0]["type"] == "paragraph"
+    assert value["media"] == [
+        {
+            "item_id": "1124768656",
+            "page": 1,
+            "title": LOOK[1],
+            "description": "",
+            "type": "question_image",
+            "media_id": "s-blob-v1-IMAGE-7vFIkBsonRc",
+            "width": 740,
+            "height": 1110,
+        }
+    ]
+    # Until its pixels are attached the picture is a gap, as an image item is.
+    assert not value["read_complete"] and "图片材料尚未读取" in value["warnings"][0]
+
+
+@pytest.mark.parametrize(
+    "attached",
+    [
+        [["bad id!", None, [740, 1110, 0]]],
+        [["s-blob-v1-IMAGE-x1234567", None, [0, 1110, 0]]],
+        [["s-blob-v1-IMAGE-x1234567", None, [740, 1110]]] * 2,
+        "s-blob-v1-IMAGE-x1234567",
+    ],
+)
+def test_a_question_picture_that_cannot_be_read_is_a_warning(attached):
+    item = [*LOOK[:9], attached, *LOOK[10:]]
+    value = parse_form(page([item]), URL)
+    assert value["media"] == [] and len(value["questions"]) == 1
+    assert "表单包含无法识别的图像，需在原页面核对。" in value["warnings"]
+
+
+def test_questions_without_a_picture_are_unchanged(form):
+    assert form["media"] == [] and all(q["type"] != "question_image" for q in form["questions"])
