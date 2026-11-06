@@ -26,11 +26,59 @@ TYPES = {
     3: "dropdown",
     4: "checkbox",
     5: "scale",
-    7: "grid",
+    7: "grid",  # "checkbox_grid" when its rows allow several columns
     9: "date",
     10: "time",
     13: "file_upload",
+    18: "rating",  # stars or hearts; read like a linear scale when the page data lists its values
 }
+# A question of a type this reader does not know is kept as "unknown" (title, entry IDs, whether
+# it is required), so coverage lists it for the student to answer in the form instead of the
+# question silently disappearing; the form then also says it was not completely read.
+UNKNOWN = "unknown"
+UNKNOWN_WARNING = "表单包含需目视核对的图像、视频或未知题型；不可声称已完整读取。"
+# The label an "Other" option (its text is empty in the page data) is shown and answered by. An
+# answer that picks it is this label followed by the respondent's own words (form_fill.py).
+OTHER_CHOICE = "[その他の自由記入]"
+# How a date or time field is answered, from the field's flags in the page data:
+# date [include_time, include_year] at entry[7]; time [duration] at entry[6] (entry[7] in some
+# documented layouts). These layouts are the commonly documented published-form format and were
+# not checked against a live form; without flags a date has a year and no time, a time is a
+# time of day.
+DATE_FORMATS = {
+    (False, True): "YYYY-MM-DD",
+    (False, False): "MM-DD",
+    (True, True): "YYYY-MM-DD HH:MM",
+    (True, False): "MM-DD HH:MM",
+}
+TIME_FORMATS = {False: "HH:MM", True: "HH:MM:SS"}
+
+
+def _flags(entry, *indexes):
+    for index in indexes:
+        if len(entry) > index and isinstance(entry[index], list):
+            return [value == 1 or value is True for value in entry[index]]
+    return []
+
+
+def _field_details(kind, entry, row_number) -> dict:
+    """What a grid row, a date, a time or a field with an "Other" option adds to a field.
+
+    Fields of the other types get nothing, so their questions (and the answers checked
+    against them) stay exactly as before."""
+    if kind == 7:
+        names = entry[3] if len(entry) > 3 else None
+        label = names[0] if isinstance(names, list) and names else None
+        return {"row": label if isinstance(label, str) and label else f"第 {row_number} 行"}
+    if kind == 9:
+        flags = _flags(entry, 7)
+        time_flag = flags[0] if flags else False
+        year = flags[1] if len(flags) > 1 else True
+        return {"format": DATE_FORMATS[(time_flag, year)]}
+    if kind == 10:
+        flags = _flags(entry, 6, 7)
+        return {"format": TIME_FORMATS[bool(flags and flags[0])]}
+    return {}
 
 
 def form_url(value: str) -> str:
@@ -70,11 +118,42 @@ def form_references(item: dict) -> list[str]:
     return result
 
 
+class FormClosed(PermissionDenied):
+    """The form no longer accepts answers (Google sends its viewform to …/closedform)."""
+
+    reason = "form_closed"
+
+
+FORM_PAGE = re.compile(r"/forms/(?:u/\d+/)?d/(e/)?([A-Za-z0-9_-]{8,200})/([A-Za-z]{1,40})/?")
+
+
+def other_form_page(url: str, form: str) -> str:
+    """The page name when `url` is another page of the same form (closedform, …), else ''."""
+    try:
+        parsed, own = urlparse(url), FORM_PATH.fullmatch(urlparse(form).path)
+    except ValueError:
+        return ""
+    match = FORM_PAGE.fullmatch(parsed.path)
+    if parsed.hostname != "docs.google.com" or not match or not own:
+        return ""
+    return match[3] if (match[1], match[2]) == (own[1], own[2]) else ""
+
+
 class _ResponderRedirects(HTTPRedirectHandler):
     def redirect_request(self, request, fp, code, msg, headers, newurl):
         try:
             target = form_url(newurl)
         except WorkflowError as exc:
+            # The same form's own other pages are no login wall: say what they are, so a closed
+            # form is not reported as needing the school login.
+            page = other_form_page(newurl, request.full_url)
+            if page == "closedform":
+                raise FormClosed("表单已关闭，不再接受回答；没有读取题目。") from exc
+            if page:
+                raise PermissionDenied(
+                    f"表单跳转到了它的 {page} 页面，不是题目页面；没有读取题目。"
+                ) from exc
+            # Google's sign-in, or anywhere else a login-only form may send an anonymous reader.
             raise PermissionDenied(
                 "表单要求浏览器登录或重定向到非题目页面；未读取题目，也未扩大授权。"
             ) from exc
@@ -136,40 +215,39 @@ def parse_form(html: str, url: str) -> dict:
                 warnings.append(image_gap_warning(picture))
                 continue
             if kind not in TYPES:
-                warnings.append("表单包含需目视核对的图像、视频或未知题型；不可声称已完整读取。")
+                warnings.append(UNKNOWN_WARNING)
+                unknown = _unknown_question(item_id, page, label, help_text, entries)
+                if unknown:
+                    questions.append(unknown)
                 continue
-            if not isinstance(label, str) or not isinstance(entries, list) or not entries:
-                raise ValueError
-            fields = []
-            for entry in entries:
-                if not isinstance(entry, list) or len(entry) < 3 or not isinstance(entry[0], int):
+            if kind == 18:
+                # The rating layout was not checked against a live form: read it like a scale
+                # when it lists its values, else keep it for the student to answer in the form.
+                try:
+                    fields, _ = _fields(kind, entries) if isinstance(label, str) else ([], False)
+                except (ValueError, TypeError, IndexError):
+                    fields = []
+                if not fields or not all(field["choices"] for field in fields):
+                    warnings.append(UNKNOWN_WARNING)
+                    unknown = _unknown_question(item_id, page, label, help_text, entries)
+                    if unknown:
+                        questions.append(unknown)
+                    continue
+                kind_name = TYPES[kind]
+            else:
+                if not isinstance(label, str) or not isinstance(entries, list) or not entries:
                     raise ValueError
-                choices = []
-                for option in entry[1] or []:
-                    if not isinstance(option, list) or not isinstance(option[0], str):
-                        raise ValueError
-                    choices.append(option[0] or "[その他の自由記入]")
-                # Google can shuffle displayed choices per visit. Values, not positions,
-                # identify choices; random order must not regenerate unchanged answers.
-                if kind in {2, 3, 4}:
-                    choices = sorted(choices)
-                fields.append(
-                    {
-                        "entry_id": str(entry[0]),
-                        "choices": choices,
-                        "required": bool(entry[2]),
-                        "constraints": entry[3:8],
-                    }
-                )
-            if kind in {7, 13}:
-                warnings.append("表单含网格或文件上传题，需用户核对原页面；不会自动作答或上传。")
+                fields, several = _fields(kind, entries)
+                kind_name = "checkbox_grid" if several else TYPES[kind]
+            # File upload questions are read like any other; only the upload itself stays the
+            # student's (form_fill lists them as 需要你在表单里自己上传), so it is no reading gap.
             questions.append(
                 {
                     "item_id": str(item_id),
                     "page": page,
                     "title": label,
                     "description": help_text or "",
-                    "type": TYPES[kind],
+                    "type": kind_name,
                     "fields": fields,
                 }
             )
@@ -191,6 +269,60 @@ def parse_form(html: str, url: str) -> dict:
         raise WorkflowError(
             "Google Forms 题目结构无法可靠识别，已停止；不能以链接或模板冒充题目。"
         ) from exc
+
+
+def _fields(kind, entries):
+    """The answer fields of one question (a grid: one per row), and whether it is a checkbox
+    grid. Raises ValueError for page data of an unexpected shape."""
+    fields = []
+    several = False
+    for row_number, entry in enumerate(entries, 1):
+        if not isinstance(entry, list) or len(entry) < 3 or not isinstance(entry[0], int):
+            raise ValueError
+        choices = []
+        for option in entry[1] or []:
+            if not isinstance(option, list) or not isinstance(option[0], str):
+                raise ValueError
+            # "Other" is the option with no text and, where the page data says so, the is-other
+            # flag (option[4]); a blank option without that flag stays blank.
+            other = not option[0] and (len(option) < 5 or option[4] in (1, True))
+            choices.append(OTHER_CHOICE if other else option[0])
+        # Google can shuffle displayed choices per visit. Values, not positions,
+        # identify choices; random order must not regenerate unchanged answers.
+        if kind in {2, 3, 4}:
+            choices = sorted(choices)
+        field = {
+            "entry_id": str(entry[0]),
+            "choices": choices,
+            "required": bool(entry[2]),
+            "constraints": entry[3:8],
+            **_field_details(kind, entry, row_number),
+        }
+        if kind in {2, 4} and OTHER_CHOICE in choices:
+            field["other"] = True
+        # A checkbox grid: each row may take several columns (entry[11] = [1]).
+        several = several or (kind == 7 and bool(_flags(entry, 11)[:1] == [True]))
+        fields.append(field)
+    return fields, several
+
+
+def _unknown_question(item_id, page, label, help_text, entries):
+    """A question of an unknown type, when its page data still names its answer fields."""
+    if not isinstance(label, str) or not isinstance(entries, list) or not entries:
+        return None
+    fields = []
+    for entry in entries:
+        if not isinstance(entry, list) or len(entry) < 3 or type(entry[0]) is not int:
+            return None
+        fields.append({"entry_id": str(entry[0]), "choices": [], "required": bool(entry[2])})
+    return {
+        "item_id": str(item_id),
+        "page": page,
+        "title": label,
+        "description": help_text or "",
+        "type": UNKNOWN,
+        "fields": fields,
+    }
 
 
 def image_gap_warning(picture: dict) -> str:

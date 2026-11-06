@@ -1,8 +1,9 @@
 """Callable orchestration: read the knowledge base, prepare review packages, hand off.
 
 Course data comes from the knowledge API, plus the bounded Forms GET reader for form questions the
-knowledge base does not hold. Course text never becomes a command, executable path, configuration,
-scope, approval or account selection.
+knowledge base does not hold (login-only forms: the school-login browser in read mode, see
+school_forms). Course text never becomes a command, executable path, configuration, scope,
+approval or account selection.
 """
 
 import json
@@ -13,7 +14,7 @@ from pathlib import Path
 from .config import Settings
 from .errors import ConfigurationError, PermissionDenied, RunCancelled, WorkflowError
 from .external_sources import external_chunks, source_urls
-from .form_capture import attach_form_images, authenticated_form_cache
+from .form_capture import attach_form_images
 from .form_read import PARSER_VERSION, form_chunks, form_references, read_form
 from .google_read import drive_attachments
 from .kb_client import KnowledgeClient
@@ -22,6 +23,7 @@ from .pages import LONG_EDGE, RENDER_VERSION, SLIDE_TYPES, page_images, renderab
 from .pending import PENDING_STATES, discover_pending
 from .policy import CoursePolicy
 from .progress import report
+from .school_forms import STALE_NOTE, restricted_form, school_account
 from .search import retrieve
 from .store import Store, artifact, fingerprint
 from .student import StudentProfile
@@ -147,7 +149,14 @@ def attach_page_images(reader, settings, store, document, chunks, *, every_page)
 
 
 def sync_course(
-    reader, settings: Settings, store: Store, course_id: str, *, progress=None, submissions=()
+    reader,
+    settings: Settings,
+    store: Store,
+    course_id: str,
+    *,
+    progress=None,
+    submissions=(),
+    selected_ids=(),
 ) -> dict:
     policy = CoursePolicy.load(settings.data_dir, course_id)
     course = reader.course(course_id)
@@ -166,6 +175,9 @@ def sync_course(
         )
         records.extend((kind, stable_source(item)) for item in fetch(course_id))
     selected = {item["courseWorkId"] for item in submissions}
+    # Login-only forms are opened in the school-login browser only for these assignments' own
+    # forms (the job's selection); a form another post links to uses a capture, if there is one.
+    own_forms_of = selected | set(selected_ids)
     attachments, origins, resolutions = {}, {}, {}
     linked_forms, form_origins, response_forms = {}, {}, {}
     for kind, item in records:
@@ -210,8 +222,14 @@ def sync_course(
             try:
                 form = read_form(url)
             except PermissionDenied as exc:
-                form = authenticated_form_cache(settings.data_dir, settings.school_email, url, exc)
-            form = attach_form_images(settings.data_dir, settings.school_email, form)
+                # Login-only: the school-login browser (read mode), else a recent capture.
+                own = any(
+                    origin["role"] == "coursework" and origin["assignment_id"] in own_forms_of
+                    for origin in form_origins[source_id]
+                )
+                form = restricted_form(settings, url, exc, progress, use_browser=own)
+            stale = form.pop("stale_capture", False)
+            form = attach_form_images(settings.data_dir, school_account(settings), form)
             revision = fingerprint(form)
 
             def save_form(key, value=form):
@@ -251,7 +269,7 @@ def sync_course(
                     "origins": form_origins[source_id],
                     "error": warning,
                 }
-                for warning in form["warnings"]
+                for warning in form["warnings"] + ([STALE_NOTE] if stale else [])
             )
         except RunCancelled:
             raise
@@ -262,6 +280,9 @@ def sync_course(
                     "url": url,
                     "origins": form_origins[source_id],
                     "error": str(exc),
+                    # The form's questions were not read at all (not just a picture missing):
+                    # login_required, login_expired, account_mismatch or read_failed.
+                    "form_unread": getattr(exc, "reason", "read_failed"),
                 }
             )
     for source_id, url in list(linked_forms.items())[100:]:
@@ -642,6 +663,7 @@ def prepare(
                         submissions=[
                             x for x in own_submissions[cid] if x["courseWorkId"] in selected_ids
                         ],
+                        selected_ids=selected_ids,
                     )
                 result = prepare_assignment(
                     settings, store, courses[cid], item["assignment_id"], extra_queries

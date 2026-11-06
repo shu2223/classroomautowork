@@ -1,4 +1,10 @@
-"""Import question data read in an authorized browser; never copy cookies or tokens."""
+"""Question data read in an authorized browser; never cookies or tokens.
+
+Two sources: the question data the user pasted from their own signed-in browser
+("user_authorized_browser_import"), and the school-login browser of this mini PC
+("school_login_browser", school_forms.py). Both are bound to the account that read them and
+trusted for 24 hours.
+"""
 
 import copy
 import hashlib
@@ -15,6 +21,9 @@ from .local import atomic_json, require_private_path, sha256_file, utc_now
 
 MAX_AGE = timedelta(hours=24)
 MAX_IMAGE_BYTES = 15 * 1024 * 1024
+PASTED = "user_authorized_browser_import"
+SCHOOL_BROWSER = "school_login_browser"
+SOURCES = {PASTED, SCHOOL_BROWSER}
 
 
 def _path(data_dir: Path, url: str) -> Path:
@@ -143,8 +152,10 @@ def attach_form_images(data_dir: Path, account: str, form: dict) -> dict:
 
 
 def import_form_capture(
-    data_dir: Path, account: str, url: str, question_script: str, allowed_urls
+    data_dir: Path, account: str, url: str, question_script: str, allowed_urls, *, source=PASTED
 ) -> dict:
+    if source not in SOURCES:
+        raise WorkflowError("表单题目的来源无效。")
     canonical = form_url(url)
     if canonical not in {form_url(value) for value in allowed_urls}:
         raise WorkflowError("导入表单必须是这项作业原始来源中的链接。")
@@ -157,40 +168,65 @@ def import_form_capture(
         "form": form,
         "account": account.lower(),
         "captured_at": utc_now(),
-        "source": "user_authorized_browser_import",
+        "source": source,
     }
     record["sha256"] = _digest(record)
     atomic_json(_path(data_dir, canonical), record)
     return form
 
 
+LOGIN_MARKERS = ("HTTP 401", "学校账户登录", "需要登录", "表单要求浏览器登录")
+
+
+def needs_login(error: Exception) -> bool:
+    """The anonymous read met a login wall (not a deleted, forbidden or broken form)."""
+    return isinstance(error, PermissionDenied) and any(
+        marker in str(error) for marker in LOGIN_MARKERS
+    )
+
+
+def _verified(data_dir: Path, account: str, url: str, max_age=MAX_AGE) -> dict:
+    """The capture record of this form for this account, younger than max_age; ValueError if
+    there is none, it was changed, or it is too old."""
+    path = _path(data_dir, url)
+    record = json.loads(path.read_text(encoding="utf-8"))
+    digest = record.pop("sha256")
+    captured = datetime.fromisoformat(record["captured_at"])
+    if captured.tzinfo is None:
+        raise ValueError
+    age = datetime.now(UTC) - captured
+    if (
+        _digest(record) != digest
+        or record["account"] != account.lower()
+        or form_url(record["form"]["url"]) != form_url(url)
+        or not timedelta(0) <= age <= max_age
+        or record["source"] not in SOURCES
+    ):
+        raise ValueError
+    return record
+
+
+def recent_capture(data_dir: Path, account: str, url: str, max_age: timedelta, source: str):
+    """The questions of a capture of this source younger than max_age, else None (the school
+    browser then need not open the same form again within one job)."""
+    try:
+        record = _verified(data_dir, account, url, max_age)
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    return record["form"] if record["source"] == source else None
+
+
 def authenticated_form_cache(data_dir: Path, account: str, url: str, error: Exception) -> dict:
     # A deleted/forbidden form must not silently reuse an old browser capture.
-    if not isinstance(error, PermissionDenied) or not any(
-        marker in str(error)
-        for marker in ("HTTP 401", "学校账户登录", "需要登录", "表单要求浏览器登录")
-    ):
+    if not needs_login(error):
         raise error
     path = _path(data_dir, url)
     if not path.is_file():
         raise PermissionDenied(
-            f"原表单需要学校账户登录读取：{form_url(url)}。请使用‘补充并继续’中的登录题目读取入口；没有题目时不会猜答案。"
+            f"原表单需要学校账户登录读取：{form_url(url)}。请在 设置 → 学校账号 登录后重试，"
+            "或在“补充后重做”里导入题目；没有题目时不会猜答案。"
         ) from error
     try:
-        record = json.loads(path.read_text(encoding="utf-8"))
-        digest = record.pop("sha256")
-        captured = datetime.fromisoformat(record["captured_at"])
-        if captured.tzinfo is None:
-            raise ValueError
-        age = datetime.now(UTC) - captured
-        if (
-            _digest(record) != digest
-            or record["account"] != account.lower()
-            or form_url(record["form"]["url"]) != form_url(url)
-            or not timedelta(0) <= age <= MAX_AGE
-            or record["source"] != "user_authorized_browser_import"
-        ):
-            raise ValueError
-        return record["form"]
-    except (ValueError, KeyError, TypeError):
+        return _verified(data_dir, account, url)["form"]
+    except (OSError, ValueError, KeyError, TypeError):
         raise PermissionDenied("登录浏览器读取的题目已过期或校验失败，请重新读取原表单。") from None

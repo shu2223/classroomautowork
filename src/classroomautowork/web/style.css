@@ -2529,6 +2529,92 @@ label.field-row { cursor: default; }
 }
 .run-choice > .ys-field-help:empty { display: none; }
 
+/* ---------- 设置 → 学校账号 and its sign-in view ---------- */
+
+.status-warn { color: var(--ys-warn); }
+/* a line in the answer panel's notes can end in its action (登录学校账号, 重试未完成), a small button on a line of its own
+   under the words (44px to the touch, like every small button) */
+.note-action { display: flex; width: fit-content; margin: 8px 0 0; }
+/* the group's two-line help line breaks evenly, without a lone last character */
+.school-settings .group-foot { text-wrap: balance; }
+
+/* the sign-in view: the remote page's live picture fills the sheet; the text field, the keys and the status sit under it */
+.school-dialog {
+  width: min(880px, calc(100vw - 32px));
+  height: min(92dvh, 900px);
+  max-height: min(92dvh, 900px);
+}
+.school-host { display: flex; align-items: center; gap: 4px; min-width: 0; }
+.school-host > .ys-icon { flex: none; width: 13px; height: 13px; }
+/* no host yet (the page is opening): the line keeps its place; closed: no lock */
+.school-host.is-empty { visibility: hidden; }
+.school-host.is-closed > .ys-icon { display: none; }
+.school-host > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.school-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ys-space-3);
+  overflow: hidden;
+}
+/* only the view gives way; everything else keeps its height */
+.school-body > * { flex-shrink: 0; }
+.school-body > .school-view { flex: 1 1 auto; min-height: 96px; }
+.school-view {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: var(--ys-hairline) solid var(--ys-line);
+  border-radius: var(--ys-radius-control);
+  background: var(--ys-surface-2);
+  overflow: hidden;
+  overflow: clip;
+  touch-action: none;
+}
+.school-frame {
+  display: block;
+  max-width: 100%;
+  max-height: 100%;
+  cursor: pointer;
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
+  touch-action: none;
+}
+.school-view-note { color: var(--ys-muted); font-size: var(--ys-fs-ui-sub); }
+.school-controls { display: flex; flex-direction: column; gap: var(--ys-space-2); }
+.school-text-row { display: flex; gap: var(--ys-space-2); min-width: 0; }
+.school-text { flex: 1 1 auto; width: auto; min-width: 0; }
+.school-reveal, .school-text-row > .ys-btn { flex: none; }
+.school-keys { display: flex; flex-wrap: wrap; gap: var(--ys-space-2); }
+.school-keys > .ys-btn { min-width: 4.5em; }
+/* two lines kept for the status, so a longer one does not make the view (and the picture in it) smaller */
+.school-status { min-height: calc(2 * 1.45em); margin: 0; color: var(--ys-muted); font-size: var(--ys-fs-ui-sub); line-height: 1.45; }
+/* a window that closed in the ordinary way is said calmly, and its last picture fades */
+.form-error.is-quiet { border-color: var(--ys-line); background: var(--ys-surface-2); color: var(--ys-muted); }
+.school-dialog.is-ended .school-frame { opacity: .4; filter: grayscale(1); }
+/* typing on a touch screen (its keyboard up): the picture keeps the view's width and shows the band around the remote
+   field (app.js moves it); the status keeps one line */
+.school-dialog.is-typing .school-view { align-items: flex-start; }
+.school-dialog.is-typing .school-frame { max-height: none; }
+.school-dialog.is-typing .school-status { min-height: 1.45em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* an iPad's keyboard: the sheet moves into the visible part of the screen (app.js sets the two values only while the
+   keyboard is up), so the picture, the field, the keys and 完成 stay above it */
+@media (pointer: coarse) and (min-width: 641px) {
+  .ys-dialog.school-dialog.is-keyboard {
+    position: fixed;
+    inset: calc(var(--school-top, 0px) + 8px) 0 auto 0;
+    height: min(900px, calc(var(--school-vh, 100dvh) - 16px));
+    max-height: none;
+    margin: 0 auto;
+  }
+}
+
+/* a date or time answer is short, as is the word for an "Other" choice */
+.format-input { max-width: 16em; }
+.other-input { margin-top: 6px; }
+.choice-set > .other-input { margin-top: 4px; }
+
 /* ---------- toast ---------- */
 
 .ys-toast { text-wrap: pretty; }
@@ -2757,6 +2843,29 @@ label.field-row { cursor: default; }
   .events > li { grid-template-columns: 5.5em minmax(0, 1fr); }
 
   .settings-dialog .ys-dialog-body { padding-right: var(--ys-space-4); padding-left: var(--ys-space-4); }
+
+  /* the sign-in view takes the whole screen; while the keyboard is up it is the visible part of it (app.js sets
+     --school-vh and --school-top from visualViewport), so the field and the keys stay above the keyboard */
+  .ys-dialog.school-dialog {
+    position: fixed;
+    inset: var(--school-top, 0px) 0 auto 0;
+    width: 100%;
+    height: var(--school-vh, 100dvh);
+    max-height: none;
+    margin: 0;
+    border: 0;
+    border-radius: 0;
+  }
+  .school-dialog .ys-dialog-head { padding-top: calc(10px + env(safe-area-inset-top)); }
+  /* four keys share the row under the thumb */
+  .school-keys { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .school-keys > .ys-btn { min-width: 0; padding: 0 var(--ys-space-2); }
+  .school-dialog .ys-dialog-body { padding-top: var(--ys-space-3); padding-bottom: var(--ys-space-3); }
+  .school-dialog .ys-dialog-foot { padding-bottom: max(var(--ys-space-3), env(safe-area-inset-bottom)); }
+  /* the keyboard is up while typing: the picture gets the room of 取消 and 完成 (the head's × still cancels; 完成 is back
+     once the keyboard goes down, which it does by itself when Google lets the view through) */
+  .school-dialog.is-typing.is-keyboard .ys-dialog-foot { display: none; }
+  .school-dialog.is-typing .school-body { gap: var(--ys-space-2); }
 }
 
 /* ---------- forced colours ---------- */

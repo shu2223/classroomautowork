@@ -14,6 +14,17 @@ class NeedsInput(WorkflowError):
     """Recoverable missing questions or user facts, rather than a processing crash."""
 
 
+class FormsUnread(NeedsInput):
+    """The assignment's own Google Form was not read (no school login, an expired one, another
+    account, or a read error). The item stops before any model call: without the questions an
+    answer can only be empty, and the turn would be billed for nothing."""
+
+
+class MissingSources(NeedsInput):
+    """The model answered nothing and named what it lacked. The automatic repair is not spent:
+    the same inputs would give the same empty answer. The student supplies what is missing."""
+
+
 class RunCancelled(WorkflowError):
     """Stop at a safe processing boundary while preserving completed work."""
 

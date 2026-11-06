@@ -186,6 +186,55 @@
       </form>
       <p class="group-foot">保存前会读取这个接口的模型列表，验证地址和密钥，不消耗 token。作答时把题目、课程资料文字、页面图片，以及设置里的学生资料（姓名、学号等）、补充说明和个人事实发给这个接口；保存后不再显示完整密钥。<span class="test-help">“测试连接”只发一次很短的请求，会用掉少量 token。</span></p>
     </section>
+
+    <section id="schoolSettings" class="school-settings" aria-labelledby="schoolTitle">
+      <h3 id="schoolTitle" class="group-head">学校账号</h3>
+      <div class="group school-group">
+        <div id="schoolLoginStatus" class="group-row key-status status-row" role="status">正在读取…</div>
+        <div class="group-row form-actions">
+          <button id="schoolSignIn" class="ys-btn ys-btn--primary btn small" type="button">登录</button>
+          <button id="schoolLogout" class="ys-btn ys-btn--danger link small" type="button" hidden>退出登录</button>
+        </div>
+      </div>
+      <p class="group-foot">登录只保存在小主机上，只用来读取表单的题目和图片；AI 和程序都不能提交任何内容。</p>
+    </section>
+  </div>
+</dialog>
+
+<dialog id="schoolDialog" class="ys-dialog school-dialog" aria-labelledby="schoolDialogTitle">
+  <div class="ys-dialog-head">
+    <div class="ys-dialog-heading">
+      <h2 id="schoolDialogTitle" class="ys-dialog-title" tabindex="-1" autofocus>登录学校账号</h2>
+      <p id="schoolHostLine" class="ys-dialog-sub school-host is-empty"><svg class="ys-icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 10.5V8a4 4 0 0 1 8 0v2.5M6.5 10.5h11a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1h-11a1 1 0 0 1-1-1v-7a1 1 0 0 1 1-1z"/></svg><span id="schoolHost"></span></p>
+    </div>
+    <button id="schoolClose" class="ys-btn ys-btn--icon ys-btn--quiet" type="button" aria-label="取消登录" title="取消"><svg class="ys-icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6.5 6.5l11 11M17.5 6.5l-11 11"/></svg></button>
+  </div>
+  <div class="ys-dialog-body school-body">
+    <div id="schoolHint" class="ys-alert ys-alert--warn school-hint" role="status" hidden><svg class="ys-icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.27 4.5a2 2 0 0 1 3.46 0l7.36 12.75a2 2 0 0 1-1.73 3H4.64a2 2 0 0 1-1.73-3zM12 9.5v4M12 16.75h.01"/></svg><div class="ys-alert-body"><p id="schoolHintText"></p></div></div>
+    <div id="schoolView" class="school-view">
+      <img id="schoolFrame" class="school-frame" alt="Google 登录页的实时画面，点按会点到登录页上" draggable="false" hidden>
+      <p id="schoolViewNote" class="school-view-note" role="status">正在打开 Google 登录页…</p>
+    </div>
+    <div class="school-controls">
+      <div class="school-text-row">
+        <input id="schoolText" class="ys-input school-text" type="text" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" enterkeyhint="send" maxlength="2000" placeholder="在这里输入，发送到登录页" aria-label="要发送到登录页的文字" aria-describedby="schoolStatusLine" data-1p-ignore data-lpignore="true">
+        <button id="schoolReveal" class="ys-btn btn school-reveal" type="button" aria-pressed="false" aria-controls="schoolText" hidden>显示</button>
+        <button id="schoolSend" class="ys-btn ys-btn--primary btn" type="button">发送</button>
+      </div>
+      <div class="school-keys" role="group" aria-label="发送到登录页的按键">
+        <button class="ys-btn btn small" type="button" data-school-key="Enter">回车</button>
+        <button class="ys-btn btn small" type="button" data-school-key="Backspace">退格</button>
+        <button class="ys-btn btn small" type="button" data-school-key="Tab">Tab</button>
+        <button id="schoolBack" class="ys-btn btn small" type="button">返回</button>
+      </div>
+      <p id="schoolStatusLine" class="school-status" role="status" aria-live="polite"></p>
+    </div>
+    <div class="form-error" role="alert"><svg class="ys-icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3.5a8.5 8.5 0 1 0 0 17 8.5 8.5 0 0 0 0-17zM12 7.75v5M12 16.25h.01"/></svg><p id="schoolError" class="error" hidden></p></div>
+  </div>
+  <div class="ys-dialog-foot dialog-foot">
+    <button id="schoolCancel" class="ys-btn btn ys-dialog-foot-start" type="button">取消</button>
+    <button id="schoolTakeover" class="ys-btn ys-btn--primary btn" type="button" hidden>在这里重新打开</button>
+    <button id="schoolFinish" class="ys-btn btn" type="button">完成</button>
   </div>
 </dialog>
 

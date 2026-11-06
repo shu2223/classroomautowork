@@ -18,6 +18,8 @@ from .completion import MODE, candidate_mode
 from .document_fill import missing_answer_fields
 from .errors import (
     ConfigurationError,
+    FormsUnread,
+    MissingSources,
     NeedsInput,
     PermissionDenied,
     RequestFailed,
@@ -54,6 +56,27 @@ DRAFT_FORMAT = (
     "表格只在原题要求时使用'|'表格。"
     "document_answers.text 和 form_answers.values 是直接填入原栏的纯文本，不带任何 Markdown 或 HTML 符号，"
     "不用标题和列表符号，需要分行时直接换行。"
+)
+
+# How each native form field is answered (form_fill.check_values checks exactly this).
+FORM_VALUES = (
+    "其他选项（choices 里的“[その他の自由記入]”）写成这个标记紧接着要填的内容，"
+    "例如“[その他の自由記入]ニット素材”，不能只写标记；一栏最多一项其他。"
+    "网格题（grid、checkbox_grid）的每一行是 fields 里的一个 entry_id，row 是行名、choices 是列名："
+    "grid 每行放一个列名，checkbox_grid 每行可放多个列名。"
+    "日期题（date）和时间题（time）只按栏位的 format 写："
+    "YYYY-MM-DD、MM-DD（没有年份）、YYYY-MM-DD HH:MM 或 MM-DD HH:MM（日期加时刻）、"
+    "HH:MM（24 小时制的时刻）、HH:MM:SS（时长），例如“2026-11-05”“14:30”“01:30:00”。"
+    "评分题（rating）和线性量表一样，从 choices 里选一个值。"
+    "文件上传题（file_upload）不能预填，由学生自己在表单里上传：返回 values=[]、needs_user=true，"
+    "在 review_note 写明要上传什么。"
+    "未知题型（unknown）也不能预填：返回 values=[]、needs_user=true，在 review_note 写明建议的答案。"
+)
+VALUES_DESCRIPTION = (
+    "按题型：文字、单选、下拉、量表、评分和网格的每一行一个值，复选和复选网格可多个；"
+    "其他选项写“[その他の自由記入]”紧接内容；日期和时间按栏位的 format "
+    "（YYYY-MM-DD、MM-DD、YYYY-MM-DD HH:MM、MM-DD HH:MM、HH:MM、HH:MM:SS）；"
+    "文件上传和未知题型留空。"
 )
 
 STUDENT_VOICE = (
@@ -286,7 +309,7 @@ def output_schema(requirement_source_ids=None):
                         "form_url": text,
                         "entry_id": text,
                         "context_sha256": text,
-                        "values": strings,
+                        "values": {**strings, "description": VALUES_DESCRIPTION},
                         "needs_user": {"type": "boolean"},
                         "review_note": text,
                     }
@@ -552,8 +575,9 @@ def build_input(
         "逐栏核对原表单：每个必填栏都要返回一条记录，不可因draft已写过答案而省略原生栏位。"
         "确因缺少真实个人事实或原始材料而不能作答的必填栏仍返回values=[]、needs_user=true，"
         "在review_note具体说明缺少什么，不能无记录地漏掉题目。"
-        "values 为字符串数组：文字、单选、下拉题只放一个值，复选题放所有选项的原文值，不按选项位置。"
-        "填入用户的已知身份和所有能依资料作答的题目，不以尚需审阅为由只输出本机 Markdown。"
+        "values 为字符串数组：文字、单选、下拉、线性量表题只放一个值，复选题放所有选中选项的原文值，不按选项位置。"
+        + FORM_VALUES
+        + "填入用户的已知身份和所有能依资料作答的题目，不以尚需审阅为由只输出本机 Markdown。"
         "文字栏只放真实可用的作业答案，不放内部证据标记、审核说明或‘请自行填写’。"
         "返回JSON前逐栏检查document_answers和form_answers：新写正文避免‘・’，"
         "未要求引用的答案删除多余的参照、来源文件名和参考文献尾注；保留原选项及可信身份原值，"
@@ -1175,13 +1199,99 @@ def accept_model_result(
     return receipt
 
 
+UNREAD_FORM = {
+    "login_required": "这项作业的 Google 表单需要学校账号登录才能读取题目。"
+    "请在 设置 → 学校账号 登录后重试；这次没有调用 AI。",
+    "login_expired": "学校账号的登录已过期，这项作业的 Google 表单没有读到题目。"
+    "请在 设置 → 学校账号 重新登录后重试；这次没有调用 AI。",
+    "account_mismatch": "登录的学校账号与设置里的学校邮箱不一致，没有用它读取这项作业的 Google 表单。"
+    "请在 设置 → 学校账号 退出后用学校邮箱登录，再重试；这次没有调用 AI。",
+    "form_closed": "这项作业的 Google 表单已关闭，不再接受回答，所以没有读到题目；这次没有调用 AI。"
+    "老师重新开放表单后再重试即可。",
+    "read_failed": "这项作业的 Google 表单没有读到题目，所以没有作答；这次没有调用 AI。"
+    "请稍后重试；仍然不行时，可以在“补充后重做”里导入题目。",
+}
+# The reasons a school login fixes; the message names the first of these when several own forms
+# are unread for different reasons, since signing in is then the step to take.
+LOGIN_REASONS = ("login_required", "login_expired", "account_mismatch")
+# Words in what the model lacked that point at a form (not "information", "format", …).
+FORM_WORDS = re.compile(r"\bforms?\b|google ?forms?|表单|表單|フォーム", re.IGNORECASE)
+
+
+def unread_own_forms(manifest: dict) -> list[dict]:
+    """The warnings of this assignment's own Google Forms whose questions were not read at all
+    (workflow.sync_course marks them form_unread), not a form some other post links to."""
+    assignment_id = manifest.get("assignment_id")
+    return [
+        warning
+        for warning in manifest.get("warnings", [])
+        if warning.get("form_unread")
+        and any(
+            origin.get("assignment_id") == assignment_id and origin.get("role") == "coursework"
+            for origin in warning.get("origins") or []
+        )
+    ]
+
+
+def unread_forms_message(unread: list[dict]) -> str:
+    """What stopped the item, and how to go on; the reader's own words go on the detail line."""
+    first = next((x for x in unread if x["form_unread"] in LOGIN_REASONS), unread[0])
+    reason = first["form_unread"] if first["form_unread"] in UNREAD_FORM else "read_failed"
+    more = f"（共 {len(unread)} 份表单没有读到）" if len(unread) > 1 else ""
+    detail = str(first.get("error") or "").split("\n")[0]
+    if reason != "read_failed":
+        detail = first.get("url") or detail
+    return UNREAD_FORM[reason] + more + ("\n" + detail[:300] if detail else "")
+
+
+def _short(text, limit=80) -> str:
+    text = re.sub(r"\s+", " ", str(text)).strip()
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def missing_sources_message(missing: list[str], manifest: dict) -> str:
+    """An empty answer that names what it lacked: say what, and how to supply it."""
+    shown = "；".join(_short(value) for value in missing[:3])
+    more = f"（共 {len(missing)} 项）" if len(missing) > 3 else ""
+    # (An unread own form stops the item before any model call, so only the words count here.)
+    forms = any(FORM_WORDS.search(str(value)) for value in missing)
+    return (
+        f"模型没有给出答案，它缺少：{shown}{more}。"
+        + ("需要登录的表单请在 设置 → 学校账号 登录后重试；" if forms else "")
+        + "其他资料请在“补充后重做”里写进补充说明后重做。"
+        "同样的资料再试一次也只会得到空答案，所以没有自动重试。"
+    )
+
+
 def generate_answer(package, **options):
-    """One automatic repair, using the same model and cached input, with no new grants."""
+    """One automatic repair, using the same model and cached input, with no new grants.
+
+    Two stops come first, both without a model call that cannot help: the assignment's own
+    form was not read (FormsUnread, before any turn), and an empty answer that names what it
+    lacks (MissingSources, without the repair: the same inputs give the same answer)."""
     if not options.get("ai_confirmed"):
         return generate_review(package, **options)
+    progress = options.get("progress", lambda _: None)
+    try:
+        manifest = json.loads((Path(package) / "manifest.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        manifest = {}  # generate_review reports a package it cannot read
+    unread = unread_own_forms(manifest)
+    if unread:
+        progress("这项作业的表单没有读到题目，停在作答之前，没有调用 AI")
+        raise FormsUnread(unread_forms_message(unread))
     for attempt in range(2):
         try:
             receipt = generate_review(package, repair_attempt=attempt, **options)
+            generation = receipt.get("generation") or {}
+            missing = [x for x in generation.get("missing_sources") or [] if str(x).strip()]
+            if (
+                not receipt.get("draft_sha256")
+                and generation.get("requirements_complete") is False
+                and missing
+            ):
+                progress("模型没有给出答案并列出了缺少的资料；同样的资料重试也一样，没有自动重试")
+                raise MissingSources(missing_sources_message(missing, manifest))
             if receipt.get("draft_sha256"):
                 generation = receipt.get("generation", {})
                 document_complete = generation.get("document_mapping_complete") is not False
@@ -1198,7 +1308,7 @@ def generate_answer(package, **options):
                 failure = WorkflowError("原文档或表单仍有题目没有逐栏答案，正在补全映射。")
             else:
                 failure = WorkflowError("AI 未生成实际答案，已保留真实资料分析。")
-        except (RunCancelled, PermissionDenied, ConfigurationError, RequestFailed):
+        except (RunCancelled, PermissionDenied, ConfigurationError, RequestFailed, MissingSources):
             # A refused or failed request (a limit, the quota, the size, the server, the network)
             # would fail again at once; only an answer that came back incomplete is repaired.
             raise

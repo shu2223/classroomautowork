@@ -28,7 +28,16 @@ description: 作答规则：根据课程资料库里的待完成 Classroom 作�
 
 `needs_user` 只说明需要核对，不能把普通知识题当成用户个人资料。听力、阅读、教材缺失时，在 `review_note` 写清缺失材料及受影响题目；题干中人物的经历不是用户个人经历。
 
-Google Forms 作业先读取 `response_forms` 和 `source_kind: form` 中所有分页的题目、选项和说明。身份页不能代表整个表单。逐题答案写入 `draft`，同时返回 `form_answers`：复制程序提供的 `form_url`、`entry_id`、`context_sha256`；`values` 为原选项值或答案文字数组。文字、单选、下拉只放一个值，复选放所有选中值。原栏中不放内部引用标记或审阅说明。程序据此生成原生预填链接，由用户打开、核对并手动提交。
+Google Forms 作业先读取 `response_forms` 和 `source_kind: form` 中所有分页的题目、选项和说明。身份页不能代表整个表单。逐题答案写入 `draft`，同时返回 `form_answers`：复制程序提供的 `form_url`、`entry_id`、`context_sha256`；`values` 为原选项值或答案文字数组。文字、单选、下拉、线性量表只放一个值，复选放所有选中值。原栏中不放内部引用标记或审阅说明。程序据此生成原生预填链接，由用户打开、核对并手动提交；程序和你都不能提交。
+
+各题型的值，程序逐一核对，格式不对的不会预填：
+
+- **其他选项**：choices 里的 `[その他の自由記入]` 是“其他”。选它时写成这个标记紧接要填的内容，例如 `[その他の自由記入]ニット素材`，不能只写标记；一栏最多一项其他，复选题可以和普通选项一起选。
+- **网格**（`grid` 单选题网格、`checkbox_grid` 复选框网格）：每一行是 `fields` 里的一个 `entry_id`，`row` 是行名，`choices` 是列名。每行各返回一条记录：`grid` 一行一个列名，`checkbox_grid` 一行可以有多个列名。
+- **日期**（`date`）按栏位的 `format`：`YYYY-MM-DD`，没有年份的 `MM-DD`，带时刻的 `YYYY-MM-DD HH:MM` 或 `MM-DD HH:MM`。**时间**（`time`）：时刻 `HH:MM`（24 小时制），时长 `HH:MM:SS`。只写数字和分隔符，例如 `2026-11-05`、`14:30`、`01:30:00`。实际观察、出席等个人日期仍只用用户提供的事实。
+- **评分**（`rating`）和线性量表一样，从 `choices` 里选一个值。
+- **文件上传**（`file_upload`）不能预填，由学生自己在表单里上传：返回 `values: []`、`needs_user: true`，在 `review_note` 写明要上传什么。
+- **未知题型**（`unknown`，程序认不出的题型）也不能预填：返回 `values: []`、`needs_user: true`，在 `review_note` 写明建议的答案，由学生在表单里自己作答。
 
 ## 语气与格式
 

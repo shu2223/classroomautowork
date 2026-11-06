@@ -12,14 +12,15 @@ import webbrowser
 import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from filelock import FileLock, Timeout
 
-from . import connection_test
+from . import connection_test, school_browser
 from .config import Settings
 from .errors import Busy, RunCancelled, WorkflowError
 from .local import atomic_json, prefer_ipv4, require_private_path, sha256_file
+from .school_browser import CDPError
 from .ui_jobs import FILES, FrontendJobs, read_json
 
 ASSETS = Path(__file__).parent / "web"
@@ -181,6 +182,12 @@ class LocalHandler(BaseHTTPRequestHandler):
             elif path in ("/api/settings/openai", "/api/settings/anthropic-compatible"):
                 # Either path gives every provider's status and the endpoints' model suggestions.
                 result = jobs.openai_settings()
+            elif path == "/api/school-login/status":
+                result = jobs.school_login_status()
+            elif path == "/api/school-login/frame":
+                # Long-poll for the next view of the sign-in page (works through the tunnel).
+                after, wait = self._frame_query()
+                result = jobs.school_login_frame(after, wait)
             elif match := re.fullmatch(r"/api/jobs/([a-f0-9]{32})", path):
                 result = jobs.job(match[1])
             elif match := re.fullmatch(r"/api/policies/([0-9]+)", path):
@@ -303,12 +310,24 @@ class LocalHandler(BaseHTTPRequestHandler):
                 {"error": str(exc) if isinstance(exc, WorkflowError) else "本机读取失败，请重试。"},
             )
 
+    def _frame_query(self):
+        query = parse_qs(urlparse(self.path).query, keep_blank_values=True)
+        if set(query) - {"after", "wait"} or any(len(values) != 1 for values in query.values()):
+            raise WorkflowError("画面请求的参数无效。")
+        after, wait = query.get("after", ["0"])[0], query.get("wait", ["20"])[0]
+        if not re.fullmatch(r"\d{1,9}", after) or not re.fullmatch(r"\d{1,2}", wait):
+            raise WorkflowError("画面请求的参数无效。")
+        return int(after), min(int(wait), 25)
+
     def do_POST(self):
         if not self._guard(mutation=True):
             return
+        path = self._path()
+        if path == "/api/school-login/input":
+            self._school_input()
+            return
         try:
             payload = self._body()
-            path = self._path()
             jobs = self.server.jobs
             if path == "/api/refresh":
                 if payload:
@@ -382,6 +401,14 @@ class LocalHandler(BaseHTTPRequestHandler):
                 if payload:
                     raise WorkflowError("填入请求不接受远端文档 ID 或额外写入指令。")
                 result = jobs.fill_existing(match[1], match[2])
+            elif path == "/api/school-login/start":
+                result = jobs.school_login_start(payload)
+            elif match := re.fullmatch(
+                r"/api/school-login/(back|finish|cancel|logout)", path or ""
+            ):
+                if payload:
+                    raise WorkflowError("这个操作不接受参数。")
+                result = jobs.school_login_action(match[1])
             elif match := re.fullmatch(r"/api/jobs/([a-f0-9]{32})/(pause|retry)", path):
                 if payload:
                     raise WorkflowError("任务操作不接受额外参数。")
@@ -395,6 +422,23 @@ class LocalHandler(BaseHTTPRequestHandler):
                 409 if isinstance(exc, Busy) else 400,
                 {"error": str(exc) if isinstance(exc, WorkflowError) else "本机操作失败，请重试。"},
             )
+
+    def _school_input(self):
+        """A tap, a key or text for the sign-in page. What the user typed is in this request only:
+        it goes to Chromium and nowhere else, and no answer or error repeats any of it."""
+        try:
+            result = self.server.jobs.school_login_input(self._body())
+        except CDPError:
+            result, status = {"error": "登录页没有响应，请稍等后再试。"}, 400
+        except Busy as exc:
+            result, status = {"error": str(exc)}, 409
+        except WorkflowError as exc:
+            result, status = {"error": str(exc)}, 400
+        except Exception:  # noqa: BLE001 - never echo anything of the request
+            result, status = {"error": "本机操作失败，请重试。"}, 400
+        else:
+            status = 200
+        self._send(status, result)
 
     def do_PUT(self):
         if not self._guard(mutation=True):
@@ -468,8 +512,10 @@ def serve(settings: Settings | None = None, *, open_browser=True, port=0, token=
         server.serve_forever(poll_interval=0.3)
     finally:
         if server:
-            # A connection test that runs ends now, with its Claude Code process.
+            # A connection test that runs ends now, with its Claude Code process; the
+            # school-login browser (and any sign-in session) stops too.
             connection_test.stop()
+            school_browser.stop_all()
             server.jobs.wait_idle(timeout=30)
             server.server_close()
         info_path.unlink(missing_ok=True)

@@ -7,7 +7,7 @@ import uuid
 from dataclasses import asdict, replace
 from pathlib import Path
 
-from . import connection_test
+from . import connection_test, school_browser
 from .answer_document import create_answer_document, valid_answer_document
 from .auth import documents_authorized
 from .batch import course_batches
@@ -24,8 +24,8 @@ from .completion import (
 )
 from .config import Settings
 from .document_fill import fill_review
-from .drafting import generate_answer, recover_completed_result
-from .errors import ConfigurationError, RunCancelled, WorkflowError
+from .drafting import generate_answer, recover_completed_result, unread_own_forms
+from .errors import ConfigurationError, FormsUnread, MissingSources, RunCancelled, WorkflowError
 from .form_capture import import_form_capture
 from .form_fill import fill_response_forms, form_gap_reason, prepare_response_forms
 from .form_read import form_references, form_url
@@ -48,6 +48,7 @@ from .providers import (
     settings_view,
 )
 from .providers import status as provider_status
+from .school_forms import school_account
 from .student import StudentProfile
 from .supplements import load_supplement, normalized, save_supplement
 from .user_answers import load_user_answers, save_user_answers
@@ -276,6 +277,10 @@ class FrontendJobs:
                         # Kept for pages that predate the provider block, which carries it too.
                         "api_key": claude_status(self.settings.data_dir),
                         "provider": provider_status(self.settings.data_dir),
+                        # 设置 → 学校账号: who is signed in (the email only; no session data).
+                        "school_login": school_browser.login_state(
+                            self.settings.data_dir, self.settings.school_email
+                        ),
                         "submission": "manual_only",
                     }
                 )
@@ -359,6 +364,64 @@ class FrontendJobs:
     def test_connection(self, values, *, cancelled=lambda: False):
         """One tiny real request through the provider's answer path (connection_test.py)."""
         return connection_test.run(self.settings.data_dir, values, cancelled=cancelled)
+
+    # -- 设置 → 学校账号: the school-login browser's sign-in session (school_browser.py)
+
+    def _school(self):
+        return school_browser.manager(self.settings)
+
+    def school_login_status(self):
+        return self._school().status()
+
+    def school_login_start(self, values):
+        """Open Google's sign-in in the remote view, sized like the page's view of it;
+        `takeover` closes a sign-in window open elsewhere and opens it here."""
+        keys = {"width", "height", "touch", "scale", "takeover"}
+        if set(values) - keys or not {"width", "height"} <= set(values):
+            raise WorkflowError("登录窗口只接受画面尺寸、是否触摸、缩放和是否在这里重新打开。")
+        touch, scale = values.get("touch", False), values.get("scale", 1)
+        takeover = values.get("takeover", False)
+        if (
+            type(touch) is not bool
+            or type(takeover) is not bool
+            or scale not in (1, 2)
+            or type(scale) is not int
+        ):
+            raise WorkflowError("登录窗口的触摸、缩放或重新打开选项无效。")
+        return self._school().start(
+            width=values["width"],
+            height=values["height"],
+            touch=touch,
+            scale=scale,
+            takeover=takeover,
+        )
+
+    def school_login_frame(self, after, wait):
+        """The newest view of the sign-in page; the JPEG goes to the page as base64."""
+        import base64
+
+        try:
+            frame = self._school().frame(after=after, timeout=wait)
+        except WorkflowError as exc:
+            # The session is over (finished, cancelled, idle, or the page was gone too long).
+            return {"ended": True, "message": str(exc)}
+        return {
+            **{key: value for key, value in frame.items() if key != "jpeg"},
+            "image": base64.b64encode(frame.get("jpeg") or b"").decode("ascii"),
+        }
+
+    def school_login_input(self, values):
+        # What the user types goes to the sign-in page only: never logged, stored or returned.
+        return self._school().input(values)
+
+    def school_login_action(self, name):
+        browser = self._school()
+        return {
+            "back": browser.back,
+            "finish": browser.finish,
+            "cancel": browser.cancel,
+            "logout": browser.logout,
+        }[name]()
 
     def models(self):
         """The model list of the active provider, for the toolbar."""
@@ -786,7 +849,7 @@ class FrontendJobs:
                     pass
         form = import_form_capture(
             self.settings.data_dir,
-            self.settings.school_email,
+            school_account(self.settings),
             values["url"],
             values["question_script"],
             allowed,
@@ -997,9 +1060,14 @@ class FrontendJobs:
 
                 provider = job_provider(job) or "anthropic"
                 for result in self._prepared_packages(job_id, job, assignment_event):
+                    unread = job.get("ai_confirmed") and unread_own_forms(
+                        read_json(Path(result["package"]) / "manifest.json", {}) or {}
+                    )
                     self._log(
                         job_id,
-                        "真实题目与课堂资料已准备"
+                        "课堂资料已准备，但这项作业的表单没有读到题目"
+                        if unread
+                        else "真实题目与课堂资料已准备"
                         + (
                             "；本次只整理资料"
                             if not job.get("ai_confirmed")
@@ -1087,6 +1155,12 @@ class FrontendJobs:
                             self._fill_response_item(job_id, result, Path(receipt["package"]))
                     except RunCancelled:
                         raise
+                    except FormsUnread as exc:
+                        # The assignment's own form was not read: stopped before any model call.
+                        self._item(job_id, result, status="needs_form", error=str(exc))
+                    except MissingSources as exc:
+                        # An empty answer naming what it lacks: the student supplies it.
+                        self._item(job_id, result, status="needs_user", error=str(exc))
                     except WorkflowError as exc:
                         self._item(
                             job_id,

@@ -3,26 +3,85 @@
 This module has no response POST, submit action, browser credentials or form-edit API.
 The browser opens a validated viewform GET with exact native entry IDs and values.
 Opening is recorded separately from browser verification and Google's draft saving.
+Submitting is always the student's own click in Google Forms, after checking every answer.
+
+Every type Google can prefill is filled: text, choices (with the "Other" option), linear
+scales and ratings, both grids (one entry per row), dates and times. A file upload cannot be
+prefilled; it is listed for the student to upload in the form, as is a question of a type the
+reader does not know ("unknown"), for the student to answer there.
 """
 
 import hashlib
 import json
 import re
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlencode
 
 from filelock import FileLock, Timeout
 
 from .errors import PermissionDenied, WorkflowError
-from .form_capture import authenticated_form_cache
-from .form_read import form_references, form_url, read_form
+from .form_read import OTHER_CHOICE, form_references, form_url, read_form
 from .local import atomic_json, require_private_path, sha256_file, utc_now
 from .policy import CoursePolicy, confirmed_gate
 from .progress import ProgressUpdate
+from .school_forms import restricted_form, school_account
 from .student import StudentProfile
 from .user_answers import load_user_answers, merge_answers
 
-SUPPORTED = {"short_text", "paragraph", "single_choice", "dropdown", "checkbox", "scale"}
+SUPPORTED = {
+    "short_text",
+    "paragraph",
+    "single_choice",
+    "dropdown",
+    "checkbox",
+    "scale",
+    "rating",
+    "grid",
+    "checkbox_grid",
+    "date",
+    "time",
+}
+# Keys form_read derives from what a field already holds (its choices, its constraints): left out
+# of the digest, so answers prepared before the reader added them still fit the same form.
+DERIVED_KEYS = {"other", "row", "format"}
+# Types whose field takes several values: checkboxes, and a checkbox grid's row.
+MULTIPLE = {"checkbox", "checkbox_grid"}
+# Google's prefill names a chosen "Other" option so, with its text in a parameter of its own.
+OTHER_VALUE = "__other_option__"
+OTHER_SUFFIX = ".other_option_response"
+# A date or time value in the field's format (form_read.DATE_FORMATS / TIME_FORMATS), checked as
+# a real calendar date or clock time; a date without a year is checked against a leap year.
+VALUE_FORMATS = {
+    "YYYY-MM-DD": (r"\d{4}-\d{2}-\d{2}", "%Y-%m-%d"),
+    "MM-DD": (r"\d{2}-\d{2}", "%Y-%m-%d"),
+    "YYYY-MM-DD HH:MM": (r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}", "%Y-%m-%d %H:%M"),
+    "MM-DD HH:MM": (r"\d{2}-\d{2} \d{2}:\d{2}", "%Y-%m-%d %H:%M"),
+    "HH:MM": (r"\d{2}:\d{2}", "%H:%M"),
+    "HH:MM:SS": (r"\d{2}:[0-5]\d:[0-5]\d", None),
+}
+
+
+def other_text(value: str):
+    """The respondent's words of an "Other" answer ("[その他の自由記入]…"), else None."""
+    if not value.startswith(OTHER_CHOICE):
+        return None
+    return value[len(OTHER_CHOICE) :].lstrip(" 　:：").strip()
+
+
+def value_matches(value: str, fmt: str) -> bool:
+    pattern, parse = VALUE_FORMATS.get(fmt, (None, None))
+    if not pattern or not re.fullmatch(pattern, value):
+        return False
+    if parse is None:  # a duration: hours of any two digits, minutes and seconds below 60
+        return True
+    try:
+        datetime.strptime(("2000-" if fmt.startswith("MM") else "") + value, parse)
+    except ValueError:
+        return False
+    return True
+
+
 IDENTITY = {
     "学籍番号": "student_id",
     "学号": "student_id",
@@ -107,8 +166,6 @@ def form_answer_coverage(forms, answers, profile=None):
         for question in form["questions"]:
             for field in question["fields"]:
                 answer = supplied.get((form["url"], field["entry_id"]))
-                if answer and answer.get("values"):
-                    continue
                 detail = {
                     "form_url": form["url"],
                     "item_id": question["item_id"],
@@ -118,7 +175,10 @@ def form_answer_coverage(forms, answers, profile=None):
                     "required": field["required"],
                 }
                 if question["type"] not in SUPPORTED:
+                    # Never prefilled, whatever the model wrote: the student does it in the form.
                     coverage["unsupported_fields"].append(detail)
+                    continue
+                if answer and answer.get("values"):
                     continue
                 personal_key = identity_key(question["title"])
                 unknown_identity = (
@@ -149,12 +209,27 @@ def form_answer_coverage(forms, answers, profile=None):
     return coverage
 
 
+def _digest_question(question):
+    return {
+        **question,
+        "fields": [
+            {key: value for key, value in field.items() if key not in DERIVED_KEYS}
+            for field in question["fields"]
+        ],
+    }
+
+
 def context_digest(form):
+    """What an answer was written for. Questions of an unknown type are not part of it (the
+    reader used to drop them, and nothing is ever filled into them)."""
     return hashlib.sha256(
         json.dumps(
             {
                 "url": form_url(form["url"]),
-                "questions": sorted(form["questions"], key=lambda q: q["item_id"]),
+                "questions": sorted(
+                    (_digest_question(q) for q in form["questions"] if q["type"] != "unknown"),
+                    key=lambda q: q["item_id"],
+                ),
                 "sections": form["sections"],
                 "description": form["description"],
                 "title": form["title"],
@@ -203,6 +278,54 @@ def prepare_response_forms(package: Path) -> list[dict]:
     return result
 
 
+def check_values(question: dict, field: dict, values: list[str]) -> None:
+    """The values must be the field's own choices, its "Other" with words, or its date or time
+    format; anything else is refused before a link is made."""
+    title = question.get("title") or field["entry_id"]
+    fmt = field.get("format")
+    if question["type"] in {"date", "time"}:
+        if not fmt or not value_matches(values[0], fmt):
+            raise WorkflowError(
+                f"表单答案的日期或时间格式不对，应为 {fmt or '原题的格式'}：{title}。未打开填写。"
+            )
+        return
+    if not field["choices"]:
+        return
+    others = []
+    for value in values:
+        if value in field["choices"] and value != OTHER_CHOICE:
+            continue
+        words = other_text(value) if field.get("other") else None
+        if words:
+            others.append(words)
+            continue
+        if field.get("other") and value.startswith(OTHER_CHOICE):
+            raise WorkflowError(
+                f"表单答案选了“其他”却没有写内容：{title}。应写成“{OTHER_CHOICE}”加内容。"
+            )
+        raise WorkflowError("表单答案包含原题不存在的选项，未打开填写。")
+    if len(others) > 1:
+        raise WorkflowError(f"表单答案的“其他”只能有一项：{title}。")
+
+
+def prefill_parameters(question: dict, field: dict, values: list[str]) -> list[tuple]:
+    """viewform parameters for one field: entry.N per value (a grid row is its own entry); an
+    "Other" answer is entry.N=__other_option__ with its words in entry.N.other_option_response;
+    dates and times go as their checked format (YYYY-MM-DD, MM-DD, … HH:MM, HH:MM:SS)."""
+    name = "entry." + field["entry_id"]
+    params, words = [], None
+    for value in values:
+        text = other_text(value) if field.get("other") else None
+        if text:
+            params.append((name, OTHER_VALUE))
+            words = text
+        else:
+            params.append((name, value))
+    if words is not None:
+        params.append((name + OTHER_SUFFIX, words))
+    return params
+
+
 def validate_answers(forms: list[dict], answers: list[dict], profile=None) -> list[dict]:
     """Never allow model-provided destinations, arbitrary fields or invented options."""
     if not isinstance(answers, list):
@@ -231,9 +354,13 @@ def validate_answers(forms: list[dict], answers: list[dict], profile=None) -> li
             # Missing personal facts remain blank and appear in the software's question
             # editor. They must not invalidate other usable answers or invent a value.
             continue
+        if question["type"] not in SUPPORTED:
+            # A file upload or an unknown type is never prefilled; a value the model wrote for
+            # it anyway is dropped (the field stays listed for the student) rather than
+            # costing the whole answer set another turn.
+            continue
         if (
-            question["type"] not in SUPPORTED
-            or not isinstance(values, list)
+            not isinstance(values, list)
             or not values
             or any(
                 not isinstance(x, str)
@@ -244,11 +371,10 @@ def validate_answers(forms: list[dict], answers: list[dict], profile=None) -> li
                 for x in values
             )
             or len(set(values)) != len(values)
-            or (question["type"] != "checkbox" and len(values) != 1)
+            or (question["type"] not in MULTIPLE and len(values) != 1)
         ):
             raise WorkflowError("表单答案包含不支持的题型、空值或内部审核标记。")
-        if field["choices"] and set(values) - set(field["choices"]):
-            raise WorkflowError("表单答案包含原题不存在的选项，未打开填写。")
+        check_values(question, field, values)
         # Identity cannot be changed by course content or model suggestions.
         identity = {"学籍番号": "student_id", "学号": "student_id", "氏名": "name", "姓名": "name"}
         label = question["title"].strip()
@@ -273,10 +399,16 @@ def prefill_url(form: dict, answers: list[dict], *, account="") -> str:
         # Native collected-email fields (including the verified-email checkbox)
         # are populated by this responder parameter; it does not submit a response.
         params.append(("emailAddress", account))
+    fields = {
+        field["entry_id"]: (question, field)
+        for question in form["questions"]
+        for field in question["fields"]
+    }
     for answer in values:
         if not re.fullmatch(r"\d{1,20}", answer["entry_id"]):
             raise WorkflowError("表单原生 entry ID 无效。")
-        params.extend(("entry." + answer["entry_id"], x) for x in answer["values"])
+        question, field = fields[answer["entry_id"]]
+        params.extend(prefill_parameters(question, field, answer["values"]))
     url = form_url(form["url"]) + "?" + urlencode(params)
     if len(url) > 60000:
         raise WorkflowError("答案超过原生预填链接大小限制，初稿已保留，未省略答案冒充完成。")
@@ -342,13 +474,12 @@ def fill_response_forms(settings, package: Path, *, progress=lambda _: None, ope
         try:
             fresh = read_form(form["url"])
         except PermissionDenied as exc:
-            fresh = authenticated_form_cache(
-                settings.data_dir, settings.school_email, form["url"], exc
-            )
+            # Login-only: re-read with the school-login browser (read mode) or a recent capture.
+            fresh = restricted_form(settings, form["url"], exc, progress)
         if context_digest(fresh) != form["context_sha256"]:
             raise WorkflowError("原表单题目或选项已修改，请重新读题生成；未覆盖草稿。")
         selected = [x for x in answers if x["form_url"] == form["url"]]
-        url = prefill_url(form, selected, account=settings.school_email)
+        url = prefill_url(form, selected, account=school_account(settings))
         filled = {x["entry_id"] for x in selected}
         plans.append(
             {

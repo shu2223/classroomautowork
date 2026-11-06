@@ -13,7 +13,10 @@ const kindLabels = {refresh: "刷新待办", review: "作答", fill: "填写"};
 const submissionLabels = {RETURNED: "已退回", SUBMISSION_STATE_UNSPECIFIED: "状态不明"};
 // Google Forms question types, in the words of the Chinese Google Forms editor.
 const questionTypes = {short_text: "简答题", paragraph: "段落", single_choice: "单选题", checkbox: "复选框", dropdown: "下拉列表", scale: "线性量表",
-  grid: "网格题", date: "日期", time: "时间", file_upload: "文件上传", image: "图片"};
+  grid: "单选题网格", checkbox_grid: "复选框网格", date: "日期", time: "时间", file_upload: "文件上传", image: "图片"};
+// The label of a form's "Other" option in the question data (form_read.OTHER_CHOICE); an answer that picks it is this
+// label followed by the words written into it.
+const OTHER_CHOICE = "[その他の自由記入]";
 const efforts = {low: "低", medium: "中", high: "高", xhigh: "很高", max: "最高"};
 // How an OpenAI-compatible server was asked for its answer (generation.json structured_output_mode).
 const OUTPUT_MODES = {json_schema: "JSON Schema（严格）", json_object: "JSON 对象（接口不支持 JSON Schema）", none: "只靠提示词（接口不支持 JSON 格式）"};
@@ -31,7 +34,9 @@ const state = {pending: null, jobs: [], resultJobs: [], active: null, focus: nul
   // settings dialog shows, when it is not (yet) the active one; suggestions: the model ids each endpoint listed when saved.
   provider: null, providerView: null, suggestions: {openai: [], anthropic_compatible: []},
   // Connection tests: the provider being tested now, and this page's latest result per provider (shown in its group).
-  testing: null, tests: {}, settingsBusy: false};
+  testing: null, tests: {}, settingsBusy: false,
+  // 设置 → 学校账号: {state: signed_out|signed_in|expired|mismatch, email, verified_at, …} from the server.
+  schoolLogin: null};
 // True until the first answer from the server: the list shows placeholder rows rather than "nothing yet".
 let booting = !!(token || BASE);
 
@@ -47,8 +52,10 @@ function formContentGaps(fill) {
   if (Object.hasOwn(fill || {}, "remaining_answer_fields")) return fill.remaining_answer_fields || [];
   return fill?.forms?.length ? fill.forms.flatMap(form => Object.hasOwn(form, "remaining_answer_fields") ? form.remaining_answer_fields || [] : (form.remaining_fields || []).filter(field => field.required)) : (fill?.remaining_fields || []).filter(field => field.required);
 }
+// A required file upload is no gap: it can never be prefilled, so uploading it is the student's own step in the form (completion.py).
 function formUserInputGaps(fill, keys = ["user_input_fields", "unsupported_fields"]) {
-  return keys.flatMap(key => Object.hasOwn(fill || {}, key) ? fill[key] || [] : (fill?.forms || []).flatMap(form => form[key] || [])).filter(field => field.required);
+  return keys.flatMap(key => (Object.hasOwn(fill || {}, key) ? fill[key] || [] : (fill?.forms || []).flatMap(form => form[key] || []))
+    .filter(field => !(key === "unsupported_fields" && field.type === "file_upload"))).filter(field => field.required);
 }
 function formGenerationIncomplete(item) {
   const mapping = Object.hasOwn(item?.form_fill || {}, "form_mapping_complete") ? item.form_fill.form_mapping_complete : item?.generation?.form_mapping_complete;
@@ -408,6 +415,7 @@ async function loadState() {
   state.error = null; state.pending = data.pending; state.jobs = data.jobs; state.resultJobs = data.result_jobs || [];
   state.active = data.active_job_id; state.timezone = data.timezone || "Asia/Tokyo";
   state.provider = data.provider || null; state.apiKey = data.provider?.anthropic || data.api_key || null;
+  if (data.school_login) state.schoolLogin = {...state.schoolLogin, ...data.school_login};
   // The provider was switched elsewhere (another tab or device): the toolbar lists its models again.
   if (state.models && state.provider?.active && state.models.provider !== state.provider.active) loadModels();
   if (state.pending) { const keys = new Set(state.pending.assignments.map(keyOf)); state.selected = new Set([...state.selected].filter(x => keys.has(x))); }
@@ -422,7 +430,7 @@ function updateJob(job) {
 
 // ---- rendering -----------------------------------------------------------
 
-function renderAll() { renderHeader(); renderIssues(); renderFilters(); renderList(); renderJob(); renderHistory(); renderButtons(); renderApiKey(); renderProvider(); }
+function renderAll() { renderHeader(); renderIssues(); renderFilters(); renderList(); renderJob(); renderHistory(); renderButtons(); renderApiKey(); renderProvider(); renderSchoolLogin(); }
 
 function renderHeader() {
   const pending = state.pending, source = pending?.source || {}, latest = latestItems();
@@ -832,10 +840,12 @@ function applySettings(view) {
   if (Array.isArray(suggestions)) state.suggestions.openai = suggestions;
   if (Array.isArray(compatSuggestions)) state.suggestions.anthropic_compatible = compatSuggestions;
 }
-function openSettings() {
-  state.providerView = null; fillClaudeForm(); for (const name in ENDPOINTS) fillEndpointForm(name); renderProvider();
+function openSettings(section) {
+  state.providerView = null; fillClaudeForm(); for (const name in ENDPOINTS) fillEndpointForm(name); renderProvider(); renderSchoolLogin();
   $("settingsDialog").showModal();
+  if (section === "school") requestAnimationFrame(() => $("schoolSettings").scrollIntoView({block: "start"}));
   api("/api/settings/openai").then(view => { applySettings(view); renderProvider(); for (const name in ENDPOINTS) renderModelSuggestions(name); }).catch(() => {});
+  loadSchoolLogin();
 }
 async function chooseProvider(provider) {
   if (provider === (state.providerView || activeProvider()) || $("providerSeg").getAttribute("aria-busy")) return;
@@ -953,6 +963,278 @@ async function testConnection(provider) {
     await api("/api/settings/openai").then(applySettings).catch(() => {});
     renderProvider(); renderTests();
   }
+}
+
+// ---- settings: the school account (school_browser.py) ------------------------------------
+// The login lives only in the mini PC's school-login browser. This page shows who is signed in and opens a remote view
+// of that browser to sign in: a live picture of the page, taps, the text typed below it and a few keys. Nothing typed
+// here is kept by the page: the field is emptied as soon as its text is sent.
+const school = {open: false, started: false, ended: false, finishing: false, busy: false, seq: 0, frame: null, url: null,
+  host: "", hint: "", password: false, editable: false, reveal: false, chain: Promise.resolve(), drag: null, scroll: null,
+  viewport: null, resize: null, typing: false, field: null, refused: false, elsewhere: false};
+function schoolStatusLines(status) {
+  if (!status) return ["正在读取…"];
+  const when = status.verified_at ? "确认于 " + dateLabel(status.verified_at, true) : null;
+  if (status.state === "signed_in") {
+    const lines = [factRow(["已登录", {text: status.email, wrap: true}, when])];
+    if (status.uncertain) lines.push(node("span", "账号是从页面文字里找到的（Google 的账号列表格式可能变了），请确认这是你的学校账号。", "status-sub warn"));
+    return lines;
+  }
+  if (status.state === "expired") return [node("span", "登录已过期，需要重新登录", "status-warn"), factRow([{text: status.email, wrap: true}, when], "status-sub")];
+  if (status.state === "mismatch")
+    return [node("span", "账号与设置不符", "status-warn"), node("span", `已登录 ${status.email}，设置里的学校邮箱是 ${status.school_email}。请退出登录后用学校邮箱登录。`, "status-sub warn")];
+  return ["未登录"];
+}
+function renderSchoolLogin() {
+  const status = state.schoolLogin, el = $("schoolLoginStatus"), key = JSON.stringify([status?.state, status?.email, status?.verified_at, status?.uncertain, status?.school_email, state.timezone]);
+  if (el.dataset.key !== key) { el.dataset.key = key; el.replaceChildren(...schoolStatusLines(status)); }
+  const signed = !!status && status.state !== "signed_out", mismatch = status?.state === "mismatch";
+  setText($("schoolSignIn"), signed ? "重新登录" : "登录");
+  // A working login needs no action: 重新登录 is then an ordinary button, 登录 the main one. Another account than the
+  // settings' email is fixed by logging out first, so 退出登录 is the main action then.
+  $("schoolSignIn").classList.toggle("ys-btn--primary", !["signed_in", "mismatch"].includes(status?.state));
+  $("schoolSignIn").disabled = !status || school.busy || school.open;
+  const logout = $("schoolLogout");
+  logout.hidden = !(signed || status?.profile); logout.disabled = school.busy || school.open;
+  // Without a login, what is left is a sign-in that was never finished: the button clears that browser's data.
+  setText(logout, signed ? "退出登录" : "清除登录资料");
+  logout.className = mismatch ? "ys-btn ys-btn--primary btn small" : "ys-btn ys-btn--danger link small";
+}
+async function loadSchoolLogin() {
+  try { state.schoolLogin = await api("/api/school-login/status"); } catch (error) { if (!state.schoolLogin) state.schoolLogin = {state: "signed_out"}; }
+  renderSchoolLogin();
+}
+async function schoolLogout() {
+  const signed = state.schoolLogin?.state && state.schoolLogin.state !== "signed_out";
+  if (!confirm(signed ? "退出学校账号？会删除小主机上这个浏览器的全部登录资料；之后需要登录的表单要重新登录才能读取。"
+    : "清除小主机上这个浏览器留下的登录资料？（之前的登录没有完成，资料没有在用。）")) return;
+  school.busy = true; renderSchoolLogin();
+  try { state.schoolLogin = await api("/api/school-login/logout", "POST", {}); toast(signed ? "已退出学校账号，浏览器的登录资料已删除。" : "浏览器的登录资料已清除。", "ok"); }
+  catch (error) { toast(error.message, "bad"); await loadSchoolLogin(); }
+  finally { school.busy = false; renderSchoolLogin(); if (state.panel?.data) renderPanel(); }
+}
+const schoolHints = {
+  not_secure: "Google 拒绝了这个浏览器（“此浏览器或应用可能不安全”）。点“返回”后再试一次，或在画面里选择其他登录方式；仍然不行时，可以在作业的“补充后重做”里导入题目。",
+  passkey: "Google 要求用通行密钥验证，远程画面里用不了。请点画面里的“尝试其他方式”（別の方法を試す），改用密码或验证码。"};
+function signedInView() { return school.host === "docs.google.com"; }
+function schoolStatusText() {
+  // While the page opens, the view itself says so (once).
+  if (school.ended || !school.frame) return "";
+  if (school.finishing) return "正在确认登录的是哪个账号…";
+  if (school.refused) return "这个账号没有保存。请在画面里重新登录学校账号，再点“完成”。";
+  if (signedInView()) return "已经登录 Google。点“完成”确认账号。";
+  if (school.editable) return school.password ? `密码栏已选中：在上面输入${school.reveal ? "" : "（不会显示）"}，按键盘上的回车发送并确认。` : "输入栏已选中：在上面输入，按键盘上的回车发送并确认。";
+  return "点画面里的输入框或按钮来操作；输入的文字只送到登录页。";
+}
+function renderSchoolDialog() {
+  const ended = school.ended, live = school.started && !ended;
+  // The host line shows where the view is, with the lock; nothing while the page opens, and no lock once it is closed.
+  setText($("schoolHost"), ended ? "登录窗口已关闭" : school.host || "\u00a0");
+  // (Its line keeps its place while empty, so the view under it does not change size when the host appears.)
+  $("schoolHostLine").classList.toggle("is-empty", !ended && !school.host); $("schoolHostLine").classList.toggle("is-closed", ended);
+  $("schoolDialog").classList.toggle("is-ended", ended);
+  $("schoolTakeover").hidden = !(ended && school.elsewhere);
+  const hint = schoolHints[school.hint] && !ended ? schoolHints[school.hint] : "";
+  $("schoolHint").hidden = !hint; setText($("schoolHintText"), hint);
+  setText($("schoolStatusLine"), schoolStatusText());
+  for (const el of [$("schoolText"), $("schoolSend"), $("schoolReveal"), $("schoolBack"), ...document.querySelectorAll("[data-school-key]")]) el.disabled = !live || school.finishing;
+  $("schoolFinish").hidden = ended; $("schoolFinish").disabled = !live || school.finishing; setBusy($("schoolFinish"), school.finishing);
+  // 完成 becomes the main action once Google has sent the view on to its continue page (docs.google.com).
+  $("schoolFinish").classList.toggle("ys-btn--primary", (signedInView() && !school.refused) || school.finishing);
+  setText($("schoolFinish"), school.finishing ? "正在确认…" : "完成"); setText($("schoolCancel"), ended ? "关闭" : "取消");
+  const input = $("schoolText"), type = school.password && !school.reveal ? "password" : "text";
+  if (input.type !== type) input.type = type;
+  input.placeholder = school.password ? "在这里输入密码，发送到登录页" : "在这里输入，发送到登录页";
+  $("schoolReveal").hidden = !school.password; setText($("schoolReveal"), school.reveal ? "隐藏" : "显示");
+  $("schoolReveal").setAttribute("aria-pressed", String(school.reveal));
+}
+// A sign-in error is red; a window that closed in the ordinary way (cancelled, idle, opened elsewhere) is said calmly.
+function showSchoolError(message, quiet = false) {
+  const el = $("schoolError"); el.replaceChildren(...(message ? errorNodes(message) : [])); el.hidden = !message;
+  el.parentElement.classList.toggle("is-quiet", !!message && quiet);
+}
+// The picture keeps its proportions and fits the view, at the size the sign-in page was laid out for. While a touch
+// screen's keyboard is up (the text field has the focus) it keeps the view's width instead, near one to one, and shows
+// the band of the remote page around its focused field: the rest is a swipe away, and nothing shrinks to a stamp.
+function fitSchoolFrame() {
+  const frame = school.frame, img = $("schoolFrame"), view = $("schoolView");
+  if (!frame || !frame.width || !frame.height) return;
+  const typing = school.typing, viewH = view.clientHeight;
+  const fit = Math.min(1, view.clientWidth / frame.width, typing ? Infinity : viewH / frame.height);
+  const height = Math.floor(frame.height * fit);
+  img.style.width = Math.floor(frame.width * fit) + "px"; img.style.height = height + "px";
+  let shift = 0;
+  if (typing && height > viewH) {
+    // The field a third of the way down, so what Google shows under it (an error, the next button) stays in sight.
+    const anchor = school.field ? school.field.top * fit - viewH / 3 : 0;
+    shift = Math.round(Math.max(0, Math.min(height - viewH, anchor)));
+  }
+  img.style.transform = shift ? `translateY(${-shift}px)` : "";
+}
+function setSchoolTyping(on) {
+  on = on && matchMedia("(pointer: coarse)").matches;
+  if (school.typing === on) return;
+  school.typing = on; $("schoolDialog").classList.toggle("is-typing", on); fitSchoolFrame();
+}
+function applySchoolFrame(f) {
+  school.seq = f.seq;
+  if (f.image) {
+    const bytes = Uint8Array.from(atob(f.image), c => c.charCodeAt(0)), url = URL.createObjectURL(new Blob([bytes], {type: "image/jpeg"}));
+    const img = $("schoolFrame"), old = school.url;
+    school.url = url; img.src = url; img.hidden = false; $("schoolViewNote").hidden = true;
+    if (old) URL.revokeObjectURL(old);
+    school.frame = {image_width: f.image_width, image_height: f.image_height, width: f.width, height: f.height};
+    fitSchoolFrame();
+  }
+  if (f.password !== school.password) { school.password = !!f.password; school.reveal = false; }
+  const focused = !!f.editable && !school.editable;
+  school.editable = !!f.editable; school.host = f.host || school.host; school.hint = f.hint || "";
+  // Back on Google's sign-in after an account 完成 refused: the usual guidance again.
+  if (school.refused && school.host && school.host !== "docs.google.com") school.refused = false;
+  const field = f.editable && f.top >= 0 ? {top: f.top, bottom: f.bottom} : null;
+  if (JSON.stringify(field) !== JSON.stringify(school.field)) { school.field = field; fitSchoolFrame(); }
+  // Signed in: a phone's keyboard goes down, so 完成 is in sight.
+  if (signedInView() && !school.refused && school.typing) $("schoolText").blur();
+  renderSchoolDialog();
+  // On a computer the keyboard goes on typing: a field chosen in the picture sends the focus to the text field here.
+  if (focused && !matchMedia("(pointer: coarse)").matches && document.activeElement !== $("schoolText")) $("schoolText").focus({preventScroll: true});
+}
+function schoolEnded(message, quiet = false) {
+  if (school.ended) return;
+  school.ended = true; school.editable = false; school.password = false;
+  if (document.activeElement === $("schoolText")) $("schoolText").blur();
+  showSchoolError(message || "登录窗口已经关闭。需要时请在 设置 → 学校账号 重新开始登录。", quiet);
+  renderSchoolDialog();
+}
+async function pollSchool() {
+  let failures = 0;
+  while (school.open && !school.ended) {
+    let f;
+    try { f = await api(`/api/school-login/frame?after=${school.seq}&wait=20`, "GET", undefined, 35000); failures = 0; }
+    catch (error) {
+      if (!school.open) return;
+      if (++failures >= 4) { schoolEnded(error.message); return; }
+      await new Promise(resolve => setTimeout(resolve, 1500)); continue;
+    }
+    if (!school.open) return;
+    if (f.ended) { schoolEnded(f.message, true); return; }
+    applySchoolFrame(f);
+  }
+}
+// Input goes out one action at a time, in order (the text, then 回车).
+function schoolInput(action) {
+  school.chain = school.chain.then(() => school.started && !school.ended ? api("/api/school-login/input", "POST", action) : null)
+    .catch(error => { showSchoolError(error.message); });
+  return school.chain;
+}
+function sendSchoolText(enter) {
+  const input = $("schoolText"), text = input.value;
+  showSchoolError(null);
+  if (text) { input.value = ""; schoolInput({type: "text", text}); }
+  if (enter) schoolInput({type: "key", key: "Enter"});
+  if (!text && !enter) input.focus();
+}
+// A point of the picture, in the frame image's pixels (the server maps it to the page).
+function schoolPoint(event) {
+  const rect = $("schoolFrame").getBoundingClientRect(), frame = school.frame;
+  const x = Math.min(Math.max(event.clientX - rect.left, 0), rect.width), y = Math.min(Math.max(event.clientY - rect.top, 0), rect.height);
+  return {x: Math.round(x / rect.width * frame.image_width), y: Math.round(y / rect.height * frame.image_height)};
+}
+// A swipe (touch) or the wheel scrolls the page, sent at most every 80 ms; the distance is in the page's own pixels.
+function queueSchoolScroll(event, dx, dy) {
+  const rect = $("schoolFrame").getBoundingClientRect(), per = school.frame.width / rect.width;
+  const pending = school.scroll || (school.scroll = {...schoolPoint(event), dx: 0, dy: 0, timer: null});
+  pending.dx += dx * per; pending.dy += dy * per;
+  if (!pending.timer) pending.timer = setTimeout(flushSchoolScroll, 80);
+}
+function flushSchoolScroll() {
+  const pending = school.scroll; school.scroll = null;
+  if (!pending) return;
+  clearTimeout(pending.timer);
+  if (Math.abs(pending.dx) + Math.abs(pending.dy) >= 1) schoolInput({type: "scroll", x: pending.x, y: pending.y, dx: Math.round(pending.dx), dy: Math.round(pending.dy)});
+}
+// While a touch screen's keyboard is up (phone or iPad: the visible part is clearly shorter than the page), the sheet
+// follows the visible part of the screen, so the picture, the field and the keys stay above the keyboard.
+function trackSchoolViewport(on) {
+  const vv = window.visualViewport, dialog = $("schoolDialog");
+  if (on && vv && !school.viewport) {
+    school.viewport = () => {
+      const keyboard = matchMedia("(pointer: coarse)").matches && vv.scale < 1.05 && vv.height < window.innerHeight - 80;
+      dialog.classList.toggle("is-keyboard", keyboard);
+      if (keyboard) { dialog.style.setProperty("--school-vh", Math.round(vv.height) + "px"); dialog.style.setProperty("--school-top", Math.round(vv.offsetTop) + "px"); }
+      else { dialog.style.removeProperty("--school-vh"); dialog.style.removeProperty("--school-top"); }
+      fitSchoolFrame();
+    };
+    vv.addEventListener("resize", school.viewport); vv.addEventListener("scroll", school.viewport); school.viewport();
+  } else if (!on && vv && school.viewport) {
+    vv.removeEventListener("resize", school.viewport); vv.removeEventListener("scroll", school.viewport); school.viewport = null;
+    dialog.style.removeProperty("--school-vh"); dialog.style.removeProperty("--school-top"); dialog.classList.remove("is-keyboard");
+  }
+}
+function resetSchool() {
+  Object.assign(school, {started: false, ended: false, finishing: false, seq: 0, frame: null, host: "", hint: "", password: false, editable: false, reveal: false, drag: null, scroll: null, field: null, refused: false, elsewhere: false, chain: Promise.resolve()});
+  const img = $("schoolFrame"); img.hidden = true; img.removeAttribute("src"); img.style.transform = "";
+  setText($("schoolViewNote"), "正在打开 Google 登录页…"); $("schoolViewNote").hidden = false; $("schoolText").value = "";
+  showSchoolError(null); renderSchoolDialog();
+}
+async function openSchoolLogin() {
+  if (school.open) return;
+  school.open = true; resetSchool(); renderSchoolLogin();
+  $("schoolDialog").showModal(); trackSchoolViewport(true);
+  school.resize = school.resize || new ResizeObserver(() => fitSchoolFrame());
+  school.resize.observe($("schoolView"));
+  await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+  await startSchool(false);
+}
+// `takeover`: a sign-in window open elsewhere (another device, a closed tab) is closed and opened here instead.
+async function startSchool(takeover) {
+  // The sign-in page is laid out for the size of the view here, so the picture shows it at one to one.
+  const view = $("schoolView"), touch = matchMedia("(pointer: coarse)").matches;
+  const body = {width: Math.round(view.clientWidth), height: Math.round(view.clientHeight), touch, scale: (window.devicePixelRatio || 1) >= 1.5 ? 2 : 1, takeover};
+  try {
+    const status = await api("/api/school-login/start", "POST", body, 90000);
+    if (!school.open) { api("/api/school-login/cancel", "POST", {}).catch(() => {}); return; }
+    school.started = true; state.schoolLogin = {...state.schoolLogin, ...status}; renderSchoolDialog();
+    pollSchool();
+  } catch (error) {
+    // Refused because a window is open elsewhere: say so, and offer to open it here.
+    const status = await api("/api/school-login/status").catch(() => null);
+    if (!school.open) return;
+    school.elsewhere = !!status?.session?.active;
+    schoolEnded(error.message, school.elsewhere); setText($("schoolViewNote"), "登录页没有打开。");
+  }
+}
+function takeoverSchool() {
+  if (!school.open || !school.ended) return;
+  resetSchool(); startSchool(true);
+}
+async function finishSchool() {
+  if (!school.started || school.ended || school.finishing) return;
+  school.finishing = true; showSchoolError(null); renderSchoolDialog();
+  try {
+    await school.chain;
+    const status = await api("/api/school-login/finish", "POST", {}, 60000);
+    state.schoolLogin = status; school.ended = true;
+    $("schoolDialog").close();
+    toast(`已登录学校账号 ${status.email}。之前因表单停下的作业，点“重试未完成”即可读取。`, "ok");
+    if (state.panel?.data) renderPanel();
+  } catch (error) { school.refused = true; showSchoolError(error.message); }
+  finally { school.finishing = false; renderSchoolDialog(); renderSchoolLogin(); }
+}
+function cancelSchool() {
+  const live = school.started && !school.ended;
+  school.ended = true;
+  if (live) api("/api/school-login/cancel", "POST", {}).catch(() => {});
+  if ($("schoolDialog").open) $("schoolDialog").close();
+}
+function schoolClosed() {
+  if (school.started && !school.ended) api("/api/school-login/cancel", "POST", {}).catch(() => {});
+  school.open = false; school.ended = true; school.started = false; school.frame = null; $("schoolText").value = "";
+  setSchoolTyping(false); $("schoolDialog").classList.remove("is-ended");
+  if (school.url) { URL.revokeObjectURL(school.url); school.url = null; }
+  const img = $("schoolFrame"); img.removeAttribute("src"); img.hidden = true;
+  trackSchoolViewport(false); school.resize?.disconnect();
+  renderSchoolLogin(); loadSchoolLogin();
 }
 
 // ---- jobs ----------------------------------------------------------------
@@ -1099,12 +1381,30 @@ function renderPanel() {
   const notes = $("panelNotes"); notes.replaceChildren();
   const lines = [];
   if (data.policy_changed) lines.push(["warn", "补充说明或课程规则已变化，需要重做才会生效。"]);
+  // The item stopped without an answer (its own form was not read, or the model named what it lacked): why, and what to do.
+  const unread = (manifest.warnings || []).filter(w => w.form_unread && (w.origins || []).some(o => o.assignment_id === manifest.assignment_id && o.role === "coursework"));
+  if (item.error && !data.text["draft.md"] && item.error !== g?.error && !delivered(item)) {
+    const words = node("span"), login = unread.some(w => ["login_required", "login_expired", "account_mismatch"].includes(w.form_unread));
+    const job = [...state.jobs, ...state.resultJobs].find(x => x.id === jobId), retry = job && !activeStates.has(job.status) && ["completed_with_issues", "failed", "paused", "interrupted"].includes(job.status);
+    if (login && state.schoolLogin?.state === "signed_in") {
+      // Signed in since it stopped: the next step is the retry, right here (on a phone the job card is behind this panel).
+      words.append(`已登录学校账号 ${state.schoolLogin.email}，这一项可以重试了：重试时会用学校账号读取表单。`);
+      lines.push(["info", retry ? [words, button("重试未完成", "ys-btn ys-btn--sm btn small note-action", () => { closePanel(); jobAction(jobId, "retry"); })] : [words]]);
+    } else {
+      words.append(...errorNodes(item.error));
+      lines.push([item.status === "failed" ? "bad" : "warn", login ? [words, button("登录学校账号", "ys-btn ys-btn--sm btn small note-action", openSchoolLogin)] : [words]]);
+    }
+  }
   if (form) {
-    const missing = formContentGaps(data.form_fill), user = formUserInputGaps(data.form_fill, ["user_input_fields"]), native = formUserInputGaps(data.form_fill, ["unsupported_fields"]);
+    const missing = formContentGaps(data.form_fill), user = formUserInputGaps(data.form_fill, ["user_input_fields"]);
+    // A file upload cannot be prefilled: listed, required or not, for the student to upload in the form.
+    const unsupported = (data.form_fill.forms || []).flatMap(x => x.unsupported_fields || []);
+    const uploads = unsupported.filter(x => x.type === "file_upload"), native = unsupported.filter(x => x.type !== "file_upload" && x.required);
     if (missing.length) lines.push(["warn", `${missing.length} 个必答题没有答案：` + missing.map(x => x.title || x.entry_id).join("；")]);
     if (user.length) lines.push(["warn", `${user.length} 栏需要你本人填写，点“补充后重做”填写后会自动带入表单。`]);
+    if (uploads.length) lines.push(["warn", "需要你在表单里自己上传：" + uploads.map(x => (x.title || x.entry_id) + (x.required ? "" : "（选填）")).join("；")]);
     if (native.length) lines.push(["warn", `${native.length} 栏需要在原表单里操作：` + native.map(x => x.title || x.entry_id).join("；")]);
-    lines.push(["info", "预填链接会带入候选答案；在 Google 里改过的草稿请从原表单继续。提交由你操作。"]);
+    lines.push(["info", "打开预填表单 → 在 Google 表单里逐项核对，确认无误后由你自己点「送信」。作业助手不会、也无法提交。"]);
   }
   // The note counts what the 待核对 tab counts: the questions, and any 资料缺口 listed under them.
   const questions = data.review?.questions || [], gaps = (manifest.warnings || []).length;
@@ -1183,6 +1483,20 @@ function classroomSource(source) {
   }
   return parts.length ? parts : null;
 }
+// A form question's answer options as the form shows them: its choices ("Other" in words), a grid's columns once and
+// its rows, a date's or time's format.
+function questionFacts(question, withType) {
+  const fields = question.fields || [], grid = ["grid", "checkbox_grid"].includes(question.type), type = questionTypes[question.type];
+  const listed = grid ? fields[0]?.choices || [] : fields.flatMap(field => field.choices || []);
+  // "Other" goes last, as the form shows it.
+  const choices = [...listed.filter(choice => choice !== OTHER_CHOICE), ...(listed.includes(OTHER_CHOICE) ? ["其他（自由填写）"] : [])];
+  const format = ["date", "time"].includes(question.type) ? fields[0]?.format : null;
+  const lines = [];
+  if ((withType && type) || choices.length || format)
+    lines.push(factRow([withType && type && {text: type, cls: "fact-type"}, format && {text: format, cls: "num"}, ...choices.map(choice => ({text: choice, lang: ja(choice), wrap: true}))], "small source-choices fact-row--slash"));
+  if (grid && fields.length) lines.push(factRow([{text: "行", cls: "fact-type"}, ...fields.map(field => ({text: field.row || field.entry_id, lang: ja(field.row), wrap: true}))], "small source-choices fact-row--slash"));
+  return lines;
+}
 // A Google Form reaches the sources as JSON (form_read.py): a question, or the form's own description and sections.
 // Each is set out as the form shows it; JSON of any other shape stays readable as code. Null when the text is not JSON.
 function formSource(text) {
@@ -1193,9 +1507,7 @@ function formSource(text) {
   if (!Array.isArray(value) && "item_id" in value) {
     if (value.title) parts.push(withLang(node("strong", value.title, "source-title"), value.title));
     if (value.description) parts.push(prose(value.description, "muted content-text"));
-    const type = questionTypes[value.type], choices = (value.fields || []).flatMap(field => field.choices || []);
-    if (type || choices.length)
-      parts.push(factRow([type && {text: type, cls: "fact-type"}, ...choices.map(choice => ({text: choice, lang: ja(choice), wrap: true}))], "small source-choices fact-row--slash"));
+    parts.push(...questionFacts(value, true));
   } else if (!Array.isArray(value) && Array.isArray(value.sections)) {
     if (value.description) parts.push(prose(value.description, "content-text"));
     for (const section of value.sections) {
@@ -1244,8 +1556,7 @@ function renderPanelTab() {
           if (!question.item_id) continue;
           const row = node("div", undefined, "source"); row.append(node("div", `第 ${question.page} 页`, "locator"), withLang(node("strong", question.title, "source-title"), question.title));
           if (question.description) row.append(withLang(node("p", question.description, "muted content-text"), question.description));
-          const choices = (question.fields || []).flatMap(field => field.choices || []);
-          if (choices.length) { const line = factRow(choices.map(choice => ({text: choice, lang: ja(choice), wrap: true})), "small source-choices fact-row--slash"); row.append(line); }
+          row.append(...questionFacts(question, ["grid", "checkbox_grid", "date", "time", "file_upload"].includes(question.type)));
           content.append(row);
         } catch { content.append(withLang(node("pre", source.text, "content-text"), source.text)); }
       }
@@ -1365,6 +1676,23 @@ function supplementFields(data) {
   return (data?.response_fields || []).flatMap(form => form.questions.flatMap(question => question.fields.map(field => ({form, question, field, supplied: supplied.get(`${form.url}:${field.entry_id}`), generated: known.has(`${form.url}:${field.entry_id}`)}))))
     .filter(x => !x.generated || x.supplied).sort((a, b) => a.question.page - b.question.page || a.question.title.localeCompare(b.question.title, "ja", {numeric: true}));
 }
+// A date or time field's own control: the browser's picker where one fits the format, else text in that format.
+const DATE_INPUTS = {"YYYY-MM-DD": "date", "YYYY-MM-DD HH:MM": "datetime-local", "HH:MM": "time"};
+function formatControl(id, format, value) {
+  const control = node("input", undefined, "ys-input format-input"), kind = DATE_INPUTS[format];
+  control.type = kind || "text"; control.id = id;
+  if (kind) control.value = kind === "datetime-local" ? (value || "").replace(" ", "T") : value || "";
+  else { control.value = value || ""; control.placeholder = format; control.inputMode = "numeric"; control.autocomplete = "off"; }
+  if (kind === "time" || kind === "datetime-local") control.step = "60";
+  return [control, () => { const text = control.value.trim().replace("T", " "); return text ? [text] : []; }];
+}
+// An "Other" option: a choice of its own and the words that go with it.
+function otherWords(id, supplied) {
+  const input = node("input", undefined, "ys-input other-input"); input.type = "text"; input.id = id + "-other"; input.maxLength = 2000;
+  input.placeholder = "其他：在这里填写"; input.setAttribute("aria-label", "其他选项的内容");
+  const found = (supplied?.values || []).find(x => x.startsWith(OTHER_CHOICE)); input.value = found ? found.slice(OTHER_CHOICE.length) : "";
+  return input;
+}
 function renderAnswerInputs(data) {
   const content = $("answerInputs"); content.replaceChildren();
   const fields = supplementFields(data);
@@ -1372,28 +1700,47 @@ function renderAnswerInputs(data) {
   $("answerInputNote").textContent = data?.response_fields_error || "按原题填写或选择。回答只保存在小主机上，会自动带入预填表单。";
   $("extraSupplement").open = !fields.length;
   for (const {form, question, field, supplied} of fields) {
-    const id = `answer-input-${state.supplement.editors.length}`, checkboxes = question.type === "checkbox" && field.choices.length;
-    // 第 N 页 · the question (in Japanese) · 必填 or 选填
-    const caption = [`第 ${question.page} 页 · `, withLang(node("span", question.title), question.title), field.required ? "（必填）" : "（选填）"];
-    const group = node(checkboxes ? "fieldset" : "div", undefined, checkboxes ? "choice-set answer-field" : "ys-field answer-field");
-    if (checkboxes) { const legend = node("legend"); legend.append(...caption); group.append(legend); }
+    const id = `answer-input-${state.supplement.editors.length}`, type = question.type;
+    const several = (type === "checkbox" || type === "checkbox_grid") && field.choices.length;
+    // 第 N 页 · the question (in Japanese) · a grid's row · 必填 or 选填
+    const caption = [`第 ${question.page} 页 · `, withLang(node("span", question.title), question.title)];
+    if (field.row) caption.push(" · ", withLang(node("span", field.row), field.row));
+    caption.push(field.required ? "（必填）" : "（选填）");
+    const group = node(several ? "fieldset" : "div", undefined, several ? "choice-set answer-field" : "ys-field answer-field");
+    if (several) { const legend = node("legend"); legend.append(...caption); group.append(legend); }
     else { const label = node("label", undefined, "ys-field-label"); label.append(...caption); label.htmlFor = id; group.append(label); }
     if (question.description) group.append(withLang(node("p", question.description, "ys-field-help small muted"), question.description));
-    let control, read;
-    if (["single_choice", "dropdown", "scale"].includes(question.type) && field.choices.length) {
-      control = node("select"); const empty = node("option", "请选择"); empty.value = ""; control.append(empty);
-      for (const value of field.choices) { const option = withLang(node("option", value), value); option.value = value; control.append(option); }
-      control.value = supplied?.values?.[0] || ""; read = () => control.value ? [control.value] : [];
+    const choices = field.choices.filter(x => x !== OTHER_CHOICE);
+    let read;
+    if (["single_choice", "dropdown", "scale", "grid"].includes(type) && field.choices.length) {
+      const control = node("select"); const empty = node("option", "请选择"); empty.value = ""; control.append(empty);
+      for (const value of choices) { const option = withLang(node("option", value), value); option.value = value; control.append(option); }
+      const other = field.other ? otherWords(id, supplied) : null;
+      if (other) { const option = node("option", "其他…"); option.value = OTHER_CHOICE; control.append(option); }
+      const current = supplied?.values?.[0] || "";
+      control.value = other && current.startsWith(OTHER_CHOICE) ? OTHER_CHOICE : current;
       const wrap = node("span", undefined, "ys-select"); wrap.append(control, ysIcon("chevron-down")); control.id = id; group.append(wrap);
-    } else if (["short_text", "paragraph"].includes(question.type)) {
-      control = node(question.type === "paragraph" ? "textarea" : "input", undefined, "ys-input"); if (question.type === "paragraph") control.rows = 3; else control.type = "text";
+      if (other) { other.hidden = control.value !== OTHER_CHOICE; control.addEventListener("change", () => { other.hidden = control.value !== OTHER_CHOICE; if (!other.hidden) other.focus(); }); group.append(other); }
+      read = () => control.value === OTHER_CHOICE ? (other.value.trim() ? [OTHER_CHOICE + other.value.trim()] : []) : control.value ? [control.value] : [];
+    } else if (["short_text", "paragraph"].includes(type)) {
+      const control = node(type === "paragraph" ? "textarea" : "input", undefined, "ys-input"); if (type === "paragraph") control.rows = 3; else control.type = "text";
       control.maxLength = 20000; control.value = supplied?.values?.[0] || ""; read = () => control.value.trim() ? [control.value.trim()] : [];
       control.id = id; group.append(control);
-    } else if (checkboxes) {
+    } else if (several) {
       const options = []; group.id = id;
-      for (const value of field.choices) { const option = node("label", undefined, "ys-check-label inline"), input = node("input", undefined, "ys-check"); input.type = "checkbox"; input.value = value; input.checked = supplied?.values?.includes(value) || false; option.append(input, withLang(node("span", value), value)); group.append(option); options.push(input); }
-      read = () => options.filter(x => x.checked).map(x => x.value);
-    } else { group.append(node("p", "这一题需要在原表单里填写。", "answer-native small muted")); content.append(group); continue; }
+      for (const value of choices) { const option = node("label", undefined, "ys-check-label inline"), input = node("input", undefined, "ys-check"); input.type = "checkbox"; input.value = value; input.checked = supplied?.values?.includes(value) || false; option.append(input, withLang(node("span", value), value)); group.append(option); options.push(input); }
+      let other = null, otherBox = null;
+      if (field.other) {
+        other = otherWords(id, supplied); otherBox = node("input", undefined, "ys-check"); otherBox.type = "checkbox"; otherBox.checked = !!other.value;
+        const option = node("label", undefined, "ys-check-label inline"); option.append(otherBox, node("span", "其他")); group.append(option, other);
+        other.addEventListener("input", () => { if (other.value.trim()) otherBox.checked = true; });
+      }
+      read = () => [...options.filter(x => x.checked).map(x => x.value), ...(otherBox?.checked && other.value.trim() ? [OTHER_CHOICE + other.value.trim()] : [])];
+    } else if (["date", "time"].includes(type) && field.format) {
+      const [control, value] = formatControl(id, field.format, supplied?.values?.[0]);
+      group.append(control); if (!DATE_INPUTS[field.format]) group.append(node("p", `按 ${field.format} 填写。`, "ys-field-help small muted"));
+      read = value;
+    } else { group.append(node("p", type === "file_upload" ? "这一题要在原表单里自己上传文件。" : "这一题需要在原表单里填写。", "answer-native small muted")); content.append(group); continue; }
     content.append(group);
     state.supplement.editors.push({form_url: form.url, entry_id: field.entry_id, context_sha256: form.context_sha256, read});
   }
@@ -1484,6 +1831,56 @@ for (const name in ENDPOINTS) {
   for (const type of ["input", "focus"]) el.models.addEventListener(type, () => renderModelSuggestions(name));
 }
 for (const b of document.querySelectorAll("[data-test-provider]")) b.addEventListener("click", () => testConnection(b.dataset.testProvider));
+// 设置 → 学校账号 and its sign-in view.
+$("schoolSignIn").addEventListener("click", openSchoolLogin);
+$("schoolLogout").addEventListener("click", schoolLogout);
+$("schoolClose").addEventListener("click", cancelSchool);
+$("schoolCancel").addEventListener("click", cancelSchool);
+$("schoolFinish").addEventListener("click", finishSchool);
+$("schoolTakeover").addEventListener("click", takeoverSchool);
+$("schoolDialog").addEventListener("close", schoolClosed);
+$("schoolSend").addEventListener("click", () => sendSchoolText(false));
+$("schoolBack").addEventListener("click", () => { showSchoolError(null); school.chain = school.chain.then(() => api("/api/school-login/back", "POST", {})).catch(error => showSchoolError(error.message)); });
+for (const b of document.querySelectorAll("[data-school-key]")) b.addEventListener("click", () => { showSchoolError(null); schoolInput({type: "key", key: b.dataset.schoolKey}); });
+// The buttons beside the text field do not take the focus from it, so a phone's keyboard stays up while they are used.
+for (const b of [$("schoolSend"), $("schoolReveal"), ...document.querySelectorAll("[data-school-key]")]) b.addEventListener("pointerdown", event => { if (document.activeElement === $("schoolText")) event.preventDefault(); });
+$("schoolReveal").addEventListener("click", () => { school.reveal = !school.reveal; renderSchoolDialog(); });
+// A touch screen's keyboard is up while the text field has the focus: the picture then keeps the view's width.
+$("schoolText").addEventListener("focus", () => setSchoolTyping(true));
+$("schoolText").addEventListener("blur", () => setSchoolTyping(false));
+// 回车 on the keyboard sends the text and presses Enter on the page; not while an input method is still composing.
+$("schoolText").addEventListener("keydown", event => { if (event.key === "Enter" && !event.isComposing && event.keyCode !== 229) { event.preventDefault(); sendSchoolText(true); } });
+$("schoolFrame").addEventListener("pointerdown", event => {
+  if (!school.frame || school.ended) return;
+  event.preventDefault();
+  school.drag = {id: event.pointerId, x: event.clientX, y: event.clientY, lastX: event.clientX, lastY: event.clientY, moved: false, touch: event.pointerType !== "mouse"};
+  try { $("schoolFrame").setPointerCapture(event.pointerId); } catch { /* a pointer the browser no longer tracks */ }
+});
+$("schoolFrame").addEventListener("pointermove", event => {
+  const drag = school.drag;
+  if (!drag || drag.id !== event.pointerId) return;
+  if (Math.hypot(event.clientX - drag.x, event.clientY - drag.y) > 8) drag.moved = true;
+  if (drag.moved && drag.touch) { queueSchoolScroll(event, drag.lastX - event.clientX, drag.lastY - event.clientY); drag.lastX = event.clientX; drag.lastY = event.clientY; }
+});
+$("schoolFrame").addEventListener("pointerup", event => {
+  const drag = school.drag; school.drag = null;
+  if (!drag || drag.id !== event.pointerId || !school.frame || school.ended) return;
+  if (drag.moved) { flushSchoolScroll(); return; }
+  showSchoolError(null); schoolInput({type: "tap", ...schoolPoint(event)});
+});
+$("schoolFrame").addEventListener("pointercancel", () => { school.drag = null; flushSchoolScroll(); });
+$("schoolFrame").addEventListener("wheel", event => {
+  if (!school.frame || school.ended) return;
+  event.preventDefault();
+  const unit = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? 400 : 1;  // lines or pages, as pixels
+  queueSchoolScroll(event, event.deltaX * unit, event.deltaY * unit);
+}, {passive: false});
+$("schoolFrame").addEventListener("contextmenu", event => event.preventDefault());
+// A page that goes away ends its sign-in at once (the server would also end it once the polling stops).
+window.addEventListener("pagehide", () => {
+  if (!school.started || school.ended) return;
+  try { fetch(BASE + "/api/school-login/cancel", {method: "POST", keepalive: true, credentials: BASE ? "same-origin" : "omit", headers: {"Content-Type": "application/json", ...(token ? {Authorization: "Bearer " + token} : {})}, body: "{}"}); } catch { /* the server ends it anyway */ }
+});
 $("policyForm").addEventListener("submit", async event => {
   event.preventDefault(); const submit = event.submitter; submit.disabled = true;
   try {

@@ -118,12 +118,18 @@ def _form_gap_reason(field):
 
 
 def form_user_input_gaps(receipt):
+    """Required fields still waiting for the student before the prefilled answers are complete.
+
+    A file upload is not one of them: it can never be prefilled, so uploading it in the form is
+    the student's own last step, like submitting (the result lists it as 需要你在表单里自己上传).
+    """
     return [
         field
         for key in ("user_input_fields", "unsupported_fields")
         for field in _form_fields(receipt, key)
         if field.get("required")
         and (key == "unsupported_fields" or _form_gap_reason(field) == "personal_fact")
+        and not (key == "unsupported_fields" and field.get("type") == "file_upload")
     ]
 
 
@@ -156,7 +162,9 @@ def form_fill_outcome(receipt, generation=None):
     missing_sources = [field for field in missing if _form_gap_reason(field) == "missing_source"]
     user_input = form_user_input_gaps(receipt)
     unsupported = [
-        field for field in _form_fields(receipt, "unsupported_fields") if field.get("required")
+        field
+        for field in _form_fields(receipt, "unsupported_fields")
+        if field.get("required") and field.get("type") != "file_upload"
     ]
     mapping_complete = receipt.get(
         "form_mapping_complete", (generation or {}).get("form_mapping_complete")

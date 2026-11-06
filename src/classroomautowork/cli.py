@@ -15,6 +15,7 @@ from .kb_client import KnowledgeClient
 from .local import prefer_ipv4, require_private_path, state_root
 from .pending import discover_pending
 from .review import finalize
+from .school_forms import school_account
 from .search import retrieve
 from .store import Store
 from .workflow import prepare
@@ -137,7 +138,9 @@ def main(argv=None) -> int:
                         allowed.append(warning["url"])
                 form = import_form_capture(
                     settings.data_dir,
-                    settings.school_email,
+                    # The account forms are read with: the settings' school email, else the
+                    # one verified at the school sign-in (production leaves the first empty).
+                    school_account(settings),
                     args.url,
                     require_private_path(args.question_data).read_text(encoding="utf-8"),
                     allowed,
