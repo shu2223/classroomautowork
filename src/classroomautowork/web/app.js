@@ -1802,6 +1802,9 @@ async function saveFormInputs(apply, close = true) {
   if (!close) return result;
   $("supplementDialog").close(); await loadState();
   toast(result.apply_queued ? "回答已保存，当前任务结束后自动带入表单" : apply ? "回答已保存，正在带入表单" : "回答已保存", "ok");
+  // The fill makes a new prefill link. A fill still running reopens the panel when it ends (pollJob); one that ended
+  // before the state was read (a fill takes about a second) reopens it here, so 打开预填表单 never keeps the old link.
+  if (apply && result?.id && state.panel && state.active !== result.id) openPanel(result.id, state.panel.key, state.panel.tab);
   return result;
 }
 async function saveSupplement(continueRun) {
