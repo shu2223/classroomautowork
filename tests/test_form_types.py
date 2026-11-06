@@ -448,3 +448,39 @@ def test_a_question_picture_that_cannot_be_read_is_a_warning(attached):
 
 def test_questions_without_a_picture_are_unchanged(form):
     assert form["media"] == [] and all(q["type"] != "question_image" for q in form["questions"])
+
+
+def test_a_link_too_long_for_google_leaves_the_longest_text_out(form):
+    """2026-11-06, live: three Japanese reaction answers made a 10,276-character link and Google
+    answered 400. The link now stays within the limit; the longest text answer is left out for
+    the student to paste, the choices and the shorter text stay in."""
+    long = "授業で学んだことを自分の言葉で書く。" * 50
+    answers = [
+        answer(form, "101", [long]),
+        answer(form, "100", ["名前" * 40]),
+        answer(form, "102", ["A"]),
+    ]
+    with pytest.raises(WorkflowError, match="长度上限"):
+        form_fill.prefill_url(form, answers)
+    url, left_out = form_fill.fit_prefill(form, answers, account="student@school.example")
+    assert len(url) <= form_fill.MAX_PREFILL_URL
+    assert [x["entry_id"] for x in left_out] == ["101"] and left_out[0]["values"] == [long]
+    query = dict(parse_qsl(urlsplit(url).query))
+    assert "entry.101" not in query and query["entry.102"] == "A" and "entry.100" in query
+    assert query["emailAddress"] == "student@school.example"
+
+
+def test_a_short_link_leaves_nothing_out(form):
+    answers = [answer(form, "101", ["短い答え"]), answer(form, "102", ["A"])]
+    url, left_out = form_fill.fit_prefill(form, answers)
+    assert left_out == [] and url == form_fill.prefill_url(form, answers)
+
+
+def test_every_text_may_be_left_out_but_never_a_choice(form, monkeypatch):
+    monkeypatch.setattr(form_fill, "MAX_PREFILL_URL", 170)
+    texts = [answer(form, "101", ["x" * 300]), answer(form, "100", ["y" * 200])]
+    url, left_out = form_fill.fit_prefill(form, texts)
+    assert {x["entry_id"] for x in left_out} == {"100", "101"} and "entry." not in url
+    monkeypatch.setattr(form_fill, "MAX_PREFILL_URL", 60)
+    with pytest.raises(WorkflowError, match="选择题"):
+        form_fill.fit_prefill(form, [answer(form, "102", ["A"])])

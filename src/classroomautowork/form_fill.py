@@ -386,11 +386,56 @@ def validate_answers(forms: list[dict], answers: list[dict], profile=None) -> li
     return validated
 
 
+# Google answers a longer request URL with 400 Bad Request (measured 2026-11-06: 8,197
+# characters were served, 8,497 refused). A prefill link stays below this; free-text answers that
+# do not fit are left out of the link (the longest first) and listed for the student to paste.
+MAX_PREFILL_URL = 8000
+FREE_TEXT = {"short_text", "paragraph"}
+
+
 def prefill_url(form: dict, answers: list[dict], *, account="") -> str:
     """Only a viewform GET; repeated checkbox entry parameters select exact values."""
     values = validate_answers([form], answers)
     if not values:
         raise WorkflowError("没有实际可填的表单答案；不能把空链接称为已填写。")
+    url = _prefill_link(form, values, account)
+    if len(url) > MAX_PREFILL_URL:
+        raise WorkflowError(
+            "答案超过 Google 预填链接的长度上限（约 8000 字符），初稿已保留，未省略答案冒充完成。"
+        )
+    return url
+
+
+def fit_prefill(form: dict, answers: list[dict], *, account="") -> tuple[str, list[dict]]:
+    """The prefill link, and the free-text answers left out of it so that Google accepts it.
+
+    The longest text answer goes first, then the next, until the link fits; a choice is never
+    left out (a link that cannot fit its choices is refused). What is left out keeps its answer:
+    the student pastes it into the form."""
+    values = validate_answers([form], answers)
+    if not values:
+        raise WorkflowError("没有实际可填的表单答案；不能把空链接称为已填写。")
+    types = {
+        field["entry_id"]: question["type"]
+        for question in form["questions"]
+        for field in question["fields"]
+    }
+    kept, left_out = list(values), []
+    url = _prefill_link(form, kept, account)
+    while len(url) > MAX_PREFILL_URL:
+        texts = [x for x in kept if types.get(x["entry_id"]) in FREE_TEXT]
+        if not texts:
+            raise WorkflowError(
+                "选择题的答案就超过了 Google 预填链接的长度上限，没有生成链接；初稿已保留。"
+            )
+        longest = max(texts, key=lambda x: len(urlencode([("v", "\n".join(x["values"]))])))
+        kept.remove(longest)
+        left_out.append(longest)
+        url = _prefill_link(form, kept, account)
+    return url, left_out
+
+
+def _prefill_link(form: dict, values: list[dict], account: str) -> str:
     params = [("usp", "pp_url"), ("srd", "true")]
     if account:
         if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", account):
@@ -409,10 +454,7 @@ def prefill_url(form: dict, answers: list[dict], *, account="") -> str:
             raise WorkflowError("表单原生 entry ID 无效。")
         question, field = fields[answer["entry_id"]]
         params.extend(prefill_parameters(question, field, answer["values"]))
-    url = form_url(form["url"]) + "?" + urlencode(params)
-    if len(url) > 60000:
-        raise WorkflowError("答案超过原生预填链接大小限制，初稿已保留，未省略答案冒充完成。")
-    return url
+    return form_url(form["url"]) + "?" + urlencode(params)
 
 
 def current_response_urls(reader, course_id, assignment_id):
@@ -479,14 +521,30 @@ def fill_response_forms(settings, package: Path, *, progress=lambda _: None, ope
         if context_digest(fresh) != form["context_sha256"]:
             raise WorkflowError("原表单题目或选项已修改，请重新读题生成；未覆盖草稿。")
         selected = [x for x in answers if x["form_url"] == form["url"]]
-        url = prefill_url(form, selected, account=school_account(settings))
-        filled = {x["entry_id"] for x in selected}
+        url, left_out = fit_prefill(form, selected, account=school_account(settings))
+        filled = {x["entry_id"] for x in selected} - {x["entry_id"] for x in left_out}
+        questions = {
+            field["entry_id"]: question
+            for question in form["questions"]
+            for field in question["fields"]
+        }
         plans.append(
             {
                 "title": form["title"],
                 "url": url,
                 "original_url": form["url"],
-                "prefilled_fields": len(selected),
+                "prefilled_fields": len(filled),
+                # Answers too long for the link: the page shows each with a copy button.
+                "paste_fields": [
+                    {
+                        "entry_id": x["entry_id"],
+                        "item_id": questions[x["entry_id"]]["item_id"],
+                        "title": questions[x["entry_id"]]["title"],
+                        "type": questions[x["entry_id"]]["type"],
+                        "text": "\n".join(x["values"]),
+                    }
+                    for x in left_out
+                ],
                 "needs_user": [x["review_note"] for x in selected if x.get("needs_user")]
                 + [
                     x["review_note"]
@@ -553,7 +611,8 @@ def _open_plans(path, record, progress, opener):
             old_forms = {x["original_url"]: x for x in previous.get("forms", [])}
             for plan in plans:
                 old = old_forms.get(plan["original_url"], {})
-                if old.get("url") != plan["url"]:
+                # A link longer than Google accepts (made before the limit) is replaced.
+                if old.get("url") != plan["url"] and len(old.get("url") or "") <= MAX_PREFILL_URL:
                     raise WorkflowError("预填记录的地址已经变化，不能复用未知链接。")
                 plan["opened"] = old.get("opened") is True
             if previous.get("status") in {"opened_native_prefill", "prefill_ready"}:
