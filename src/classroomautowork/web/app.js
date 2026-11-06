@@ -1931,16 +1931,34 @@ window.addEventListener("resize", () => {
 
 // Pick up work started in another window, and refresh a stale to-do list while idle.
 let lastRefreshAttempt = 0;
+// The open panel is read again without blanking it, from the item's newest record (a fill or a redo started from here,
+// another tab or the phone), and drawn again only when something changed, keeping the reader's place.
+async function refreshPanel() {
+  const panel = state.panel;
+  if (!panel?.data) return;
+  const latest = latestItems().get(panel.key), jobId = latest?.job.id || panel.jobId, item = latest?.item || panel.item;
+  try {
+    const data = await api(`/api/jobs/${jobId}/items/${panel.key}`);
+    if (state.panel !== panel) return;
+    if (jobId === panel.jobId && item.status === panel.item.status && item.error === panel.item.error && JSON.stringify(data) === JSON.stringify(panel.data)) return;
+    const scroll = $("panel").scrollTop;
+    Object.assign(panel, {jobId, item, data}); renderPanel(); $("panel").scrollTop = scroll;
+  } catch { /* the next sync tries again */ }
+}
 async function syncWhenIdle() {
   if ((!token && !BASE) || state.active || state.busy || document.hidden || document.querySelector("dialog[open]")) return;
   try {
     await loadState();
+    await refreshPanel();
     const age = Date.now() - Date.parse(state.pending?.refreshed_at || 0);
     if (!state.active && !(age < 15 * 60 * 1000) && Date.now() - lastRefreshAttempt > 60000) { lastRefreshAttempt = Date.now(); await action("/api/refresh", {}); }
   } catch (error) { state.error = error.message; renderIssues(); }
 }
 setInterval(syncWhenIdle, 60000);
 document.addEventListener("visibilitychange", () => { if (!document.hidden) syncWhenIdle(); });
+// A page the browser restores from its back-forward cache (the Back button, or returning to the app on a phone) is the
+// page as it was when left: read everything again.
+window.addEventListener("pageshow", event => { if (event.persisted) syncWhenIdle(); });
 
 renderAll();
 if (token || BASE) loadState().then(() => { loadModels(); syncWhenIdle(); }).catch(error => { booting = false; state.error = error.message; renderHeader(); renderIssues(); renderList(); });
