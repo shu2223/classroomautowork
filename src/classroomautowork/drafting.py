@@ -1253,12 +1253,16 @@ def missing_sources_message(missing: list[str], manifest: dict) -> str:
     """An empty answer that names what it lacked: say what, and how to supply it."""
     shown = "；".join(_short(value) for value in missing[:3])
     more = f"（共 {len(missing)} 项）" if len(missing) > 3 else ""
-    # (An unread own form stops the item before any model call, so only the words count here.)
-    forms = any(FORM_WORDS.search(str(value)) for value in missing)
+    # An unread own form stops the item before any model call. Signing in helps only when some
+    # form of the course was left unread for want of the login; a form that was read (with the
+    # login or without) and still lacks a picture shown in class does not get that advice.
+    forms = any(FORM_WORDS.search(str(value)) for value in missing) and any(
+        warning.get("form_unread") in LOGIN_REASONS for warning in manifest.get("warnings", [])
+    )
     return (
         f"模型没有给出答案，它缺少：{shown}{more}。"
-        + ("需要登录的表单请在 设置 → 学校账号 登录后重试；" if forms else "")
-        + "其他资料请在“补充后重做”里写进补充说明后重做。"
+        + ("需要登录的表单请在 设置 → 学校账号 登录后重试；其他资料" if forms else "缺少的资料")
+        + "请在“补充后重做”里写进补充说明后重做，或者自己在原表单或文档里作答。"
         "同样的资料再试一次也只会得到空答案，所以没有自动重试。"
     )
 
@@ -1268,7 +1272,9 @@ def generate_answer(package, **options):
 
     Two stops come first, both without a model call that cannot help: the assignment's own
     form was not read (FormsUnread, before any turn), and an empty answer that names what it
-    lacks (MissingSources, without the repair: the same inputs give the same answer)."""
+    lacks (MissingSources, without the repair: the same inputs give the same answer). The second
+    holds whether or not the model read the questions in full: a picture shown only on the
+    classroom screen is missing all the same."""
     if not options.get("ai_confirmed"):
         return generate_review(package, **options)
     progress = options.get("progress", lambda _: None)
@@ -1285,11 +1291,7 @@ def generate_answer(package, **options):
             receipt = generate_review(package, repair_attempt=attempt, **options)
             generation = receipt.get("generation") or {}
             missing = [x for x in generation.get("missing_sources") or [] if str(x).strip()]
-            if (
-                not receipt.get("draft_sha256")
-                and generation.get("requirements_complete") is False
-                and missing
-            ):
+            if not receipt.get("draft_sha256") and missing:
                 progress("模型没有给出答案并列出了缺少的资料；同样的资料重试也一样，没有自动重试")
                 raise MissingSources(missing_sources_message(missing, manifest))
             if receipt.get("draft_sha256"):

@@ -103,8 +103,9 @@ def test_an_empty_answer_naming_what_it_lacks_is_not_repaired(tmp_path, monkeypa
         return empty_answer(missing)
 
     monkeypatch.setattr(drafting, "generate_review", review)
+    elsewhere = [unread("login_required", role="announcement", assignment_id=None)]
     with pytest.raises(MissingSources) as caught:
-        drafting.generate_answer(package_with(tmp_path, []), ai_confirmed=True)
+        drafting.generate_answer(package_with(tmp_path, elsewhere), ai_confirmed=True)
     assert calls == [0]
     message = str(caught.value)
     assert "設問で参照されている写真" in message and "第3回の講義資料" in message
@@ -120,7 +121,31 @@ def test_without_a_form_the_advice_is_the_supplement_only(tmp_path, monkeypatch)
     assert "学校账号" not in str(caught.value) and "补充说明" in str(caught.value)
 
 
-@pytest.mark.parametrize("answer", [empty_answer([]), empty_answer(["x"], complete=True)])
+def test_a_picture_missing_from_a_fully_read_form_is_not_repaired(tmp_path, monkeypatch):
+    """2026-11-06, live: the form was read with the school login and the model read its one
+    question in full (requirements_complete true), but the runway look it asks about is shown
+    only on the classroom screen. The empty answer stops at once, with no repair turn and no
+    advice to sign in."""
+    calls = []
+    missing = [
+        "题目要描写的「スクリーンに映っているランウェイの1ルック」图片。Google Forms 的抽取结果中"
+        " media 为空，课程资料中也没有这张图片。"
+    ]
+
+    def review(package, **options):
+        calls.append(options.get("repair_attempt"))
+        return empty_answer(missing, complete=True)
+
+    monkeypatch.setattr(drafting, "generate_review", review)
+    with pytest.raises(MissingSources) as caught:
+        drafting.generate_answer(package_with(tmp_path, []), ai_confirmed=True)
+    assert calls == [0]
+    message = str(caught.value)
+    assert "ランウェイ" in message and "学校账号" not in message
+    assert "补充说明" in message and "自己在原表单" in message
+
+
+@pytest.mark.parametrize("answer", [empty_answer([]), empty_answer(["  "], complete=True)])
 def test_other_empty_answers_still_get_their_one_repair(tmp_path, monkeypatch, answer):
     calls = []
 
@@ -206,8 +231,24 @@ def test_the_login_reason_leads_when_several_own_forms_are_unread():
     ],
 )
 def test_the_form_advice_needs_the_word_form(tmp_path, monkeypatch, missing, advice):
-    """C8: 'information' or 'format' is no form."""
+    """C8: 'information' or 'format' is no form. (A form of the course is left unread for want
+    of the login here, so signing in can help.)"""
     monkeypatch.setattr(drafting, "generate_review", lambda *a, **k: empty_answer(missing))
+    elsewhere = [unread("login_required", role="announcement", assignment_id=None)]
     with pytest.raises(MissingSources) as caught:
-        drafting.generate_answer(package_with(tmp_path, []), ai_confirmed=True)
+        drafting.generate_answer(package_with(tmp_path, elsewhere), ai_confirmed=True)
     assert ("学校账号" in str(caught.value)) is advice
+
+
+@pytest.mark.parametrize("warnings", [[], [{"source": "form:abc", "url": URL}]])
+def test_no_sign_in_advice_when_no_form_waits_for_the_login(tmp_path, monkeypatch, warnings):
+    """Every form was read (or the only warning is not a login one): signing in changes
+    nothing, whatever words the model used."""
+    monkeypatch.setattr(
+        drafting,
+        "generate_review",
+        lambda *a, **k: empty_answer(["the picture in the Google Form"]),
+    )
+    with pytest.raises(MissingSources) as caught:
+        drafting.generate_answer(package_with(tmp_path, warnings), ai_confirmed=True)
+    assert "学校账号" not in str(caught.value)
