@@ -332,8 +332,13 @@ function keepFocus(region, render) {
 let toastTimer = null;
 // tone: "ok" (a check) or "bad" (an error mark); none for plain notices. An error's second line (the server's own
 // words, see errorParts) goes under it as a quiet detail and keeps the toast up longer, so there is time to read it.
+// A short name for the copy button: a leading 【…】 label when the question has one, else its first words.
+function pasteLabel(field) {
+  const title = (field.title || field.entry_id || "").trim(), mark = title.match(/^【[^】]{1,12}】/);
+  return mark ? mark[0] : "「" + (title.length > 14 ? title.slice(0, 13) + "…" : title) + "」";
+}
 async function copyAnswer(field) {
-  try { await navigator.clipboard.writeText(field.text || ""); toast(`已复制「${field.title || field.entry_id}」的答案，去表单里粘贴`, "ok"); }
+  try { await navigator.clipboard.writeText(field.text || ""); toast(`已复制${pasteLabel(field)}的答案，去表单里粘贴`, "ok"); }
   catch { toast("没能复制：请在“答案”里选中这一栏的文字手动复制。", "bad"); }
 }
 function toast(message, tone) {
@@ -1411,7 +1416,7 @@ function renderPanel() {
     // Answers too long for Google's prefill link (about 8000 characters): copied here, pasted into the form.
     const paste = (data.form_fill.forms || []).flatMap(x => x.paste_fields || []);
     if (paste.length) lines.push(["warn", [`${paste.length} 栏答案太长，预填链接放不下，没有带入表单。复制后粘贴到表单里对应的栏：`,
-      ...paste.map(x => button("复制「" + (x.title || x.entry_id) + "」", "ys-btn ys-btn--sm btn small note-action", () => copyAnswer(x)))]]);
+      ...paste.map(x => { const b = button("复制" + pasteLabel(x), "ys-btn ys-btn--sm btn small note-action", () => copyAnswer(x)); b.title = x.title || ""; return b; })]]);
     lines.push(["info", "打开预填表单 → 在 Google 表单里逐项核对，确认无误后由你自己点「送信」。作业助手不会、也无法提交。"]);
   }
   // The note counts what the 待核对 tab counts: the questions, and any 资料缺口 listed under them.
