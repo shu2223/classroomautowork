@@ -6,6 +6,7 @@ import json
 import threading
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import pytest
 from PIL import Image
@@ -86,6 +87,7 @@ class FakeChromium:
         self.closed = False
         self.on_frame = self.on_target = None
         self.body_value = accounts_body(ACCOUNT)
+        self.accounts_status = 200
         self.documents = [("doc-1", "https://accounts.google.com/ListAccounts", 200)]
         self.focus = {"password": False, "editable": True, "hint": ""}
         self.modes = []
@@ -117,7 +119,10 @@ class FakeChromium:
     def close_page(self, page):
         self.pages.pop(page.target_id, None)
 
-    def evaluate(self, page, expression, timeout=10.0):
+    def evaluate(self, page, expression, timeout=10.0, await_promise=False):
+        if expression == sb.ACCOUNTS_SCRIPT:
+            assert await_promise and page.url == sb.ACCOUNTS_PAGE
+            return [self.accounts_status, self.body_value.decode("utf-8")]
         if expression == sb.FOCUS_SCRIPT:
             return dict(self.focus)
         if expression == sb.IMAGES_DONE:
@@ -291,6 +296,29 @@ def test_finish_refuses_what_it_cannot_verify(browser, body, school_email, messa
         browser.finish()
     assert not (browser.data_dir / sb.STATE_FILE).exists()
     assert browser.status()["session"]["active"]
+
+
+@pytest.mark.parametrize("status", [400, 403, 500])
+def test_finish_reports_an_account_list_google_did_not_give(browser, status):
+    """Google answers a GET of the list with 400; whatever it answers to the POST, nothing is
+    saved unless it is the list."""
+    browser.start(width=390, height=844, touch=True)
+    FakeChromium.launched[-1].accounts_status = status
+    with pytest.raises(WorkflowError, match=f"(?s)没能确认登录的是哪个账号.*HTTP {status}"):
+        browser.finish()
+    assert not (browser.data_dir / sb.STATE_FILE).exists()
+    assert browser.status()["session"]["active"]
+
+
+def test_the_account_list_is_posted_from_googles_sign_in_host():
+    """The list request Chromium itself makes (a POST with a body of one space), sent from a
+    page of accounts.google.com; the guard lets it through only while signing in."""
+    assert urlsplit(sb.ACCOUNTS_PAGE).hostname == "accounts.google.com"
+    assert json.dumps(sb.ACCOUNTS_URL) in sb.ACCOUNTS_SCRIPT
+    assert "method: 'POST', body: ' '" in sb.ACCOUNTS_SCRIPT
+    assert sb.ACCOUNTS_SCRIPT.count("fetch(") == 1
+    assert guard.allowed(guard.SIGN_IN, "POST", sb.ACCOUNTS_URL, "Fetch")
+    assert not guard.allowed(guard.READ, "POST", sb.ACCOUNTS_URL, "Fetch")
 
 
 def test_school_email_picks_its_account_among_several(browser):
@@ -632,7 +660,7 @@ def test_a_refused_account_is_signed_out_and_the_saved_login_forgotten(browser, 
     chromium.navigate = lambda page, url, timeout=30.0: visited.append(url) or navigate(page, url)
     with pytest.raises(WorkflowError, match="已全部退出"):
         browser.finish()
-    assert visited == [sb.ACCOUNTS_URL, sb.LOGOUT_URL]
+    assert visited == [sb.ACCOUNTS_PAGE, sb.LOGOUT_URL]
     assert not (browser.data_dir / sb.STATE_FILE).exists()
     assert browser.status()["state"] == "signed_out" and browser.status()["session"]["active"]
     again = [c for c in chromium.pipe.calls if c[0] == "Page.navigate"][-1]

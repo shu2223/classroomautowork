@@ -66,6 +66,12 @@ CONTINUE_URL = "https://docs.google.com/forms/"
 ACCOUNTS_URL = (
     "https://accounts.google.com/ListAccounts?gpsia=1&source=ChromiumBrowser&json=standard"
 )
+# Google answers a GET of the account list with 400; Chromium itself POSTs it (a body of one
+# space). So 完成 opens a small page of accounts.google.com in the hidden tab and posts the list
+# request from there (same origin, in an isolated world). Sign-in mode lets a POST reach Google's
+# sign-in host only; read mode refuses it.
+ACCOUNTS_PAGE = "https://accounts.google.com/robots.txt"
+ACCOUNTS_LIMIT = 65536
 # Signs every Google account of this browser out (a GET, allowed in sign-in mode): after an
 # account 完成 refused, nothing of it stays in the profile for a later read to use.
 LOGOUT_URL = "https://accounts.google.com/Logout?hl=ja"
@@ -187,6 +193,15 @@ IMAGES_SCRIPT = r"""(() => {
   });
 })()"""
 IMAGES_DONE = "Array.from(document.images).every((i) => i.complete)"
+ACCOUNTS_SCRIPT = (
+    "(async () => {\n"
+    f"  const response = await fetch({json.dumps(ACCOUNTS_URL)}, {{\n"
+    "    method: 'POST', body: ' ', credentials: 'include',\n"
+    "    headers: {'Content-Type': 'application/x-www-form-urlencoded'},\n"
+    "  });\n"
+    f"  return [response.status, (await response.text()).slice(0, {ACCOUNTS_LIMIT})];\n"
+    "})()"
+)
 
 _MANAGERS = {}
 _MANAGERS_LOCK = threading.Lock()
@@ -1060,8 +1075,9 @@ class Chromium:
         except WorkflowError:
             pass
 
-    def evaluate(self, page: _Page, expression: str, timeout=10.0):
-        """Evaluate in an isolated world of the page's main frame (page scripts cannot see it)."""
+    def evaluate(self, page: _Page, expression: str, timeout=10.0, await_promise=False):
+        """Evaluate in an isolated world of the page's main frame (page scripts cannot see it);
+        `await_promise` waits for an async expression's result."""
         if page.world is None:
             result = self.pipe.call(
                 "Page.createIsolatedWorld",
@@ -1070,12 +1086,10 @@ class Chromium:
                 timeout=timeout,
             )
             page.world = result["executionContextId"]
-        result = self.pipe.call(
-            "Runtime.evaluate",
-            {"expression": expression, "contextId": page.world, "returnByValue": True},
-            page.session,
-            timeout=timeout,
-        )
+        params = {"expression": expression, "contextId": page.world, "returnByValue": True}
+        if await_promise:
+            params["awaitPromise"] = True
+        result = self.pipe.call("Runtime.evaluate", params, page.session, timeout=timeout)
         if result.get("exceptionDetails"):
             raise CDPError("页面检查失败。")
         return (result.get("result") or {}).get("value")
@@ -1588,8 +1602,7 @@ class SchoolBrowser:
         try:
             page = browser.open_page(1280, 900, False)
             try:
-                body = self._load(browser, page, ACCOUNTS_URL, timeout=20)
-                emails, certain = parse_accounts(body.decode("utf-8", "replace"))
+                emails, certain = parse_accounts(self._accounts(browser, page))
                 refusal = self._refusal(emails)
                 if refusal:
                     self._sign_out(browser, page)
@@ -1658,16 +1671,19 @@ class SchoolBrowser:
         except WorkflowError:
             pass
 
-    def _load(self, browser, page, url, timeout=30.0) -> bytes:
-        result = browser.navigate(page, url, timeout=timeout)
+    def _accounts(self, browser, page) -> str:
+        """Google's list of the accounts signed in to this browser (its JSON text)."""
+        result = browser.navigate(page, ACCOUNTS_PAGE, timeout=20)
         if result.get("errorText"):
             raise WorkflowError(f"页面没有打开（{result['errorText'][:80]}）。")
-        if not page.wait_load(result.get("loaderId"), timeout):
+        if not page.wait_load(result.get("loaderId"), 20):
             raise WorkflowError("页面加载超时。")
-        documents = [d for d in page.documents if d[2] == 200]
-        if not documents:
-            raise WorkflowError("页面没有返回内容。")
-        return browser.body(page, documents[-1][0])
+        value = browser.evaluate(page, ACCOUNTS_SCRIPT, timeout=20, await_promise=True)
+        if not (isinstance(value, list) and len(value) == 2 and isinstance(value[1], str)):
+            raise WorkflowError("Google 的账号列表无法识别。")
+        if value[0] != 200:
+            raise WorkflowError(f"Google 的账号列表没有返回（HTTP {value[0]}）。")
+        return value[1]
 
     def status(self) -> dict:
         with self._lock:

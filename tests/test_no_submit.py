@@ -193,6 +193,18 @@ def test_the_school_browser_reads_without_typing_or_clicking_and_never_reads_coo
     assert not browser_guard.allowed(
         browser_guard.SIGN_IN, "POST", "https://classroom.google.com/u/0/c/x/a/y/submit", "XHR"
     )
+    # The one request the program itself sends from that browser is the account list at 完成,
+    # to Google's sign-in host; no other script it runs in a page makes a request.
+    scripts = {
+        name: value
+        for name, value in vars(sb).items()
+        if name.endswith(("_SCRIPT", "_DONE")) and isinstance(value, str)
+    }
+    assert {name for name, value in scripts.items() if "fetch(" in value or "POST" in value} == {
+        "ACCOUNTS_SCRIPT"
+    }
+    assert sb.ACCOUNTS_URL.startswith("https://accounts.google.com/ListAccounts?")
+    assert not browser_guard.submits(sb.ACCOUNTS_URL)
 
 
 def test_the_page_says_the_student_submits():
