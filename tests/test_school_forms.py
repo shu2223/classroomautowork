@@ -4,6 +4,7 @@ pairing of rendered pictures with native image items."""
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from PIL import Image
@@ -60,11 +61,18 @@ def rendered(path=None, ids=("110",), size=(740, 416), google=True, in_list=True
 
 
 class FakeBrowser:
-    def __init__(self, html=None, images=None, error=None):
+    """read_page as the school browser's; walk_pages turns no page unless `walk` says what the
+    later pages rendered ({page: build(capture_dir)}) or `walk_error` is raised."""
+
+    def __init__(self, html=None, images=None, error=None, walk=None, walk_error=None):
         self.html = html or login_page()
         self.images = images
         self.error = error
+        self.walk = walk
+        self.walk_error = walk_error
+        self.draft = "cleared"
         self.calls = []
+        self.walks = []
 
     def read_page(self, url, capture_dir):
         self.calls.append((url, capture_dir))
@@ -72,6 +80,22 @@ class FakeBrowser:
             raise self.error
         images = self.images(capture_dir) if callable(self.images) else (self.images or [])
         return {"html": self.html, "images": images, "blocked": 0}
+
+    def walk_pages(self, url, link, item_pages, target_page, capture_dir):
+        self.walks.append(
+            {"url": url, "link": link, "item_pages": item_pages, "target": target_page}
+        )
+        if self.walk_error:
+            raise self.walk_error
+        if self.walk is None:
+            return {"pages": {}, "reached": 1, "stopped": "第 1 页没有唯一的「次へ」按钮"}
+        pages = {page: build(capture_dir) for page, build in self.walk.items()}
+        return {
+            "pages": pages,
+            "reached": max(pages, default=1),
+            "stopped": "",
+            "draft": self.draft,
+        }
 
 
 def signed_in(data_dir, state="signed_in", email=ACCOUNT):
@@ -138,10 +162,11 @@ def test_signed_in_reads_the_form_and_pairs_the_marked_first_page_picture(tmp_pa
         (lambda d: [rendered(picture_file(d), ids=(), google=False)], set()),
         # Icons are not pictures.
         (lambda d: [rendered(picture_file(d, size=(24, 24)), ids=(), size=(24, 24))], set()),
-        # A page-2 picture is never rendered without clicking; one marked as such still pairs.
+        # A picture marked with a page-2 item but shown on page 1 does not fit the page data:
+        # not paired here (it pairs when page 2 itself shows it, after 次へ).
         (
             lambda d: [rendered(picture_file(d, size=(600, 400)), ids=("111",), size=(600, 400))],
-            {"111"},
+            set(),
         ),
     ],
 )
@@ -480,3 +505,141 @@ def test_the_question_picture_pairs_with_the_picture_inside_that_question():
         },
     ]
     assert school_forms.match_images(form, rendered) == {"1124768656": "/capture/000.img"}
+
+
+# -- later pages: Google's 次へ in walk mode (school_browser.walk_pages, browser_guard)
+
+
+def page_two_picture(d):
+    return [rendered(picture_file(d, "p2.img", size=(600, 400)), ids=("111",), size=(600, 400))]
+
+
+def test_a_later_page_picture_is_read_by_turning_to_its_page(tmp_path):
+    from classroomautowork.student import StudentProfile
+
+    signed_in(tmp_path)
+    StudentProfile(student_id="S1234", name="Test Student").save(tmp_path)
+    browser = FakeBrowser(images=lambda d: [rendered(picture_file(d))], walk={2: page_two_picture})
+    events = []
+    form = school_forms.restricted_form(
+        settings(tmp_path), URL, LOGIN_WALL, events.append, browser=browser
+    )
+    media = {m["item_id"]: m for m in form["media"]}
+    assert Path(media["110"]["image_path"]).is_file()
+    assert Path(media["111"]["image_path"]).is_file()
+    assert form["read_complete"] and not form["warnings"]
+    (walk,) = browser.walks
+    assert walk["url"] == URL and walk["target"] == 2
+    assert walk["item_pages"] == {"100": 1, "101": 1, "103": 2, "110": 1, "111": 2}
+    # The required questions before page 2 get the student's own ID and a marked placeholder;
+    # nothing of page 2 itself, and the link is a viewform GET of the same form.
+    query = parse_qs(urlsplit(walk["link"]).query)
+    assert walk["link"].startswith(URL + "?")
+    assert query["entry.200"] == ["S1234"] and query["entry.201"] == ["（翻页用）"]
+    assert query["emailAddress"] == [ACCOUNT] and "entry.203" not in query
+    assert "正在用学校账号翻到第 2 页（只翻页，不提交）" in "".join(map(str, events))
+    assert "已翻到第 2 页，读到 1/1 张后面几页的图片；没有提交，翻页留下的草稿已删除" in map(
+        str, events
+    )
+    assert events[-1].startswith("已用学校账号读取表单：2 页、3 个题目、2 张图片")
+
+
+def test_a_picture_already_kept_is_not_walked_for_again(tmp_path):
+    signed_in(tmp_path)
+    browser = FakeBrowser(walk={2: page_two_picture})
+    school_forms.restricted_form(settings(tmp_path), URL, LOGIN_WALL, browser=browser)
+    _path(tmp_path, URL).unlink()  # read again (no fresh capture), the pictures are kept
+    school_forms.restricted_form(settings(tmp_path), URL, LOGIN_WALL, browser=browser)
+    assert len(browser.calls) == 2 and len(browser.walks) == 1
+
+
+def branching_page():
+    page = login_page()
+    # "Choose" sends option B to another section: the page order depends on the answer.
+    return page.replace('[\\"B\\"]', '[\\"B\\", null, 102]').replace('["B"]', '["B", null, 102]')
+
+
+@pytest.mark.parametrize(
+    "html, why",
+    [
+        (branching_page(), "会按答案跳到不同的页"),
+        (
+            login_page().replace(
+                '[101, "Describe it", null, 1, [[201, null, 1]]]',
+                '[101, "Upload it", null, 13, [[201, null, 1]]]',
+            ),
+            "无法占位的必答题",
+        ),
+    ],
+)
+def test_no_walk_for_a_branching_form_or_an_answer_that_cannot_be_prefilled(tmp_path, html, why):
+    signed_in(tmp_path)
+    browser = FakeBrowser(html=html, walk={2: page_two_picture})
+    events = []
+    form = school_forms.restricted_form(
+        settings(tmp_path), URL, LOGIN_WALL, events.append, browser=browser
+    )
+    assert not browser.walks
+    assert any("第 2 页图片材料尚未读取" in w for w in form["warnings"])
+    assert any(why in str(e) for e in events), events
+
+
+def test_a_walk_that_fails_leaves_the_gap_and_the_read_stands(tmp_path):
+    signed_in(tmp_path)
+    browser = FakeBrowser(walk_error=WorkflowError("表单页面加载超时。"))
+    events = []
+    form = school_forms.restricted_form(
+        settings(tmp_path), URL, LOGIN_WALL, events.append, browser=browser
+    )
+    assert len(form["questions"]) == 3 and browser.walks
+    assert any("第 2 页图片材料尚未读取" in w for w in form["warnings"])
+    assert any("翻页读取图片没有完成（表单页面加载超时。）" in str(e) for e in events)
+
+
+def test_a_walk_that_stops_early_says_where(tmp_path):
+    signed_in(tmp_path)
+    browser = FakeBrowser()
+    events = []
+    school_forms.restricted_form(
+        settings(tmp_path), URL, LOGIN_WALL, events.append, browser=browser
+    )
+    assert any(
+        str(e)
+        == "已翻到第 1 页，读到 0/1 张后面几页的图片；没有提交（第 1 页没有唯一的「次へ」按钮）"
+        for e in events
+    ), events
+
+
+def test_a_later_page_picture_pairs_only_on_its_own_page(tmp_path):
+    signed_in(tmp_path)
+    import_form_capture(tmp_path, ACCOUNT, URL, login_page(), [URL])
+    from classroomautowork.form_read import parse_form
+
+    form = parse_form(login_page(), URL)
+    # The page-2 picture rendered on page 2 pairs; the same rendering does not pair on page 1.
+    shown = [rendered(picture_file(tmp_path / "c", size=(600, 400)), ids=(), size=(600, 400))]
+    assert school_forms.match_images(form, shown, page=2) == {"111": shown[0]["path"]}
+    assert school_forms.match_images(form, shown, page=1) == {}
+
+
+def test_a_draft_the_walk_could_not_delete_is_said_with_the_item(tmp_path):
+    signed_in(tmp_path)
+    browser = FakeBrowser(walk={2: page_two_picture})
+    browser.draft = "left"
+    events = []
+    form = school_forms.restricted_form(
+        settings(tmp_path), URL, LOGIN_WALL, events.append, browser=browser
+    )
+    assert school_forms.DRAFT_LEFT in form["warnings"] and not form["read_complete"]
+    assert school_forms.DRAFT_LEFT in map(str, events)
+    assert "フォームをクリア" in school_forms.DRAFT_LEFT
+
+
+def test_a_login_that_expires_after_a_page_turn_says_the_draft_may_be_left(tmp_path):
+    signed_in(tmp_path)
+    expired = school_browser.LoginExpired("学校账号的登录已过期，表单后面几页的图片没有读到。")
+    expired.draft_left = True
+    browser = FakeBrowser(walk_error=expired)
+    form = school_forms.restricted_form(settings(tmp_path), URL, LOGIN_WALL, browser=browser)
+    assert school_forms.DRAFT_LEFT in form["warnings"]
+    assert any("第 2 页图片材料尚未读取" in w for w in form["warnings"])

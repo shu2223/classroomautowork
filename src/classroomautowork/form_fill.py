@@ -457,6 +457,58 @@ def _prefill_link(form: dict, values: list[dict], account: str) -> str:
     return form_url(form["url"]) + "?" + urlencode(params)
 
 
+# What a page turn answers a required question with (school_forms walks a form's pages to see
+# its later pictures). These go to Google only as the page being turned, never as a response:
+# the student's prefill link is made from the real answers later.
+WALK_TEXT = "（翻页用）"
+WALK_DATES = {
+    "YYYY-MM-DD": "2000-01-01",
+    "MM-DD": "01-01",
+    "YYYY-MM-DD HH:MM": "2000-01-01 00:00",
+    "MM-DD HH:MM": "01-01 00:00",
+    "HH:MM": "00:00",
+    "HH:MM:SS": "00:00:00",
+}
+
+
+def walk_link(form: dict, page: int, *, account="", profile=None) -> str | None:
+    """A prefill link that lets Google's 次へ through every page before `page`: each required
+    field there gets the student's own identity (学籍番号, 氏名, … from the profile), its first
+    choice, a fixed date or time, or WALK_TEXT. None when one of them cannot be prefilled (a file
+    upload, a question of an unknown type, a choice question without choices): 次へ would not
+    pass it."""
+    params = []
+    for question in form["questions"]:
+        if question["page"] >= page:
+            continue
+        for field in question["fields"]:
+            if not field.get("required"):
+                continue
+            kind = question["type"]
+            if kind not in SUPPORTED:
+                return None
+            if kind in {"date", "time"}:
+                value = WALK_DATES.get(field.get("format") or "")
+                if value is None:
+                    return None
+            elif kind in FREE_TEXT:
+                key = identity_key(question["title"])
+                value = (getattr(profile, key, "") if profile and key else "") or WALK_TEXT
+            else:
+                choices = [c for c in field.get("choices") or [] if c != OTHER_CHOICE]
+                if not choices:
+                    return None
+                value = choices[0]
+            params.extend(prefill_parameters(question, field, [value]))
+    query = [("usp", "pp_url")]
+    if account:
+        if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", account):
+            raise WorkflowError("表单账户无效。")
+        query += [("authuser", account), ("emailAddress", account)]
+    url = form_url(form["url"]) + "?" + urlencode(query + params)
+    return url if len(url) <= MAX_PREFILL_URL else None
+
+
 def current_response_urls(reader, course_id, assignment_id):
     submissions = [
         x for x in reader.own_submissions(course_id) if x.get("courseWorkId") == assignment_id

@@ -3,9 +3,13 @@
 Some Google Forms only open for the school account. The user signs in once, from the 作业助手
 page, through a remote view of this browser (a screencast plus taps, text and a few keys). The
 browser then reads those forms for the program: a GET of the canonical viewform page, nothing
-clicked or typed. It cannot submit anything: every request of every target goes through
-`browser_guard.allowed` (see there), at the browser level and again on each target, which is
-held at start until its own interception is on.
+clicked or typed. Pictures on later pages are only shown after 次へ, so for those the browser
+walks the form (`walk_pages`): it opens a prefill link and clicks Google's own 次へ, page by
+page, then the form's own clear to delete the draft Google kept of the page turns. It cannot
+submit anything: every request of every target goes through `browser_guard.allowed` (see there;
+a page turn and that one draft deletion are the only POSTs walk mode lets through), at the
+browser level and again on each target, which is held at start until its own interception is
+on.
 
 Only Chromium uses the login. This module never reads cookies or credential files, never logs,
 stores or returns what the user types, and stores only `school-login.json` (the verified email,
@@ -33,7 +37,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit
 
 from . import browser_guard as guard
 from .errors import Busy, PermissionDenied, WorkflowError
@@ -193,6 +197,68 @@ IMAGES_SCRIPT = r"""(() => {
   });
 })()"""
 IMAGES_DONE = "Array.from(document.images).every((i) => i.complete)"
+# Walk mode (see walk_pages). Google's 次へ in the languages a form may be shown in, and the
+# buttons that end a form: the walker clicks only a lone 次へ, never on a page showing an ending
+# button. A walk turns at most MAX_WALK_PAGES − 1 pages.
+NEXT_LABELS = ("次へ", "Next", "下一页", "下一頁", "다음")
+END_LABELS = ("送信", "Submit", "提交", "提出", "제출")
+# The form's own clear (the link under the page, and the same words on its confirm button).
+CLEAR_LABELS = ("フォームをクリア", "Clear form", "清除表单内容", "清除表單內容", "양식 지우기")
+MAX_WALK_PAGES = 20
+# The second net on a walking page: everything to formResponse but the plain address a page
+# turn posts to (Fetch checks that one: walk mode, `browser_guard.turn_refusal`).
+WALK_BLOCKED_URL_PATTERNS = ["*formresponse*", "*formResponse?*", "*formResponse/*"]
+PAGE_SCRIPT = (
+    "(() => {\n"
+    f"  const labels = {json.dumps(NEXT_LABELS)}, ends = {json.dumps(END_LABELS)};\n"
+    r"""  const ids = new Set();
+  for (const n of document.querySelectorAll('[data-item-id], [data-params]')) {
+    const direct = n.getAttribute('data-item-id');
+    if (direct && /^\d{1,20}$/.test(direct)) ids.add(direct);
+    const m = /^%\.@\.\[(\d{1,20}),/.exec(n.getAttribute('data-params') || '');
+    if (m) ids.add(m[1]);
+  }
+  const text = (b) => String(b.textContent || b.value || '').trim();
+  const buttons = Array.from(document.querySelectorAll('[role="button"], button, input[type="submit"]'));
+  const next = buttons.filter((b) => labels.includes(text(b)));
+  const end = buttons.some((b) => ends.includes(text(b)));
+  let at = null;
+  if (next.length === 1 && !end) {
+    next[0].scrollIntoView({block: 'center'});
+    const r = next[0].getBoundingClientRect();
+    if (r.width > 0 && r.height > 0) at = {x: r.left + r.width / 2, y: r.top + r.height / 2};
+  }
+  const form = document.querySelector('form');
+  const values = form ? Array.from(form.querySelectorAll('input[type="hidden"]'))
+    .filter((i) => /^entry\.\d{1,20}$/.test(i.name)).map((i) => [i.name, String(i.value)]) : [];
+  const shown = (e) => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  const dialog = Array.from(document.querySelectorAll('[role="dialog"], [role="alertdialog"]')).some(shown);
+  return {ready: document.readyState, items: Array.from(ids), next: next.length, end, at, values,
+          dialog, done: Array.from(document.images).every((i) => i.complete)};
+})()"""
+)
+# Where the form's own clear is: the link on the page, or (dialog true) the confirm button of
+# the dialog it opens. Only looks; the walker clicks there.
+CLEAR_SCRIPT = (
+    "((inDialog) => {\n"
+    f"  const labels = {json.dumps(CLEAR_LABELS)};\n"
+    r"""  const shown = (e) => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  const scopes = inDialog
+    ? Array.from(document.querySelectorAll('[role="dialog"], [role="alertdialog"]')).filter(shown)
+    : [document];
+  const found = [];
+  for (const scope of scopes) {
+    for (const e of scope.querySelectorAll('[role="button"], button, a, span, div')) {
+      if (labels.includes(String(e.textContent || '').trim()) && shown(e)) found.push(e);
+    }
+  }
+  if (!found.length) return null;
+  const e = found[found.length - 1];
+  e.scrollIntoView({block: 'center'});
+  const r = e.getBoundingClientRect();
+  return {x: r.left + r.width / 2, y: r.top + r.height / 2};
+})"""
+)
 ACCOUNTS_SCRIPT = (
     "(async () => {\n"
     f"  const response = await fetch({json.dumps(ACCOUNTS_URL)}, {{\n"
@@ -634,6 +700,17 @@ class Chromium:
         self.scale = 2 if scale == 2 else 1
         self.mode = None
         self.read_url = ""
+        # Walk mode: how many page turns may still pass, the last page (from 0) one may leave,
+        # how many passed, and why the last refused one was refused.
+        self.turns_left = 0
+        self.last_from = -1
+        self.turns_sent = 0
+        self.turn_refused = ""
+        self.turn_requests = set()  # network IDs of the page turns let through
+        # After a walk: the form's own clear may delete the draft the page turns left, once.
+        self.deletes_left = 0
+        self.deletes_sent = 0
+        self.delete_requests = set()
         self.blocked = 0
         self.blocked_submits = 0
         self.login_wall = False
@@ -822,12 +899,31 @@ class Chromium:
         self._post(done.set)
         done.wait(15)
 
-    def set_mode(self, mode, read_url=""):
+    def set_mode(self, mode, read_url="", *, turns=0, last_from=-1):
+        """`turns` and `last_from` only count in walk mode: at most `turns` page turns, none
+        leaving a page later than `last_from` (from 0)."""
         with self._lock:
             self.mode = mode
             self.read_url = read_url
+            walking = mode == guard.WALK
+            self.turns_left = turns if walking else 0
+            self.last_from = last_from if walking else -1
+            self.turns_sent = 0
+            self.turn_refused = ""
+            self.turn_requests = set()
+            self.deletes_left = 0
+            self.deletes_sent = 0
+            self.delete_requests = set()
             self.login_wall = False
             self.blocked_navigation = ""
+
+    def allow_draft_deletion(self):
+        """Walk mode, after the last page turn: no more turns; one deletion of the draft."""
+        with self._lock:
+            if self.mode == guard.WALK:
+                self.turns_left = 0
+                self.last_from = -1
+                self.deletes_left = 1
 
     def _event(self, session, method, params):
         if method == "Fetch.requestPaused":
@@ -905,9 +1001,75 @@ class Chromium:
         with self._lock:
             mode, read_url = self.mode, self.read_url
             top = kind == "Document" and params.get("frameId") in self.page_ids
-        ok = mode is not None and guard.allowed(
-            mode, method, url, kind, top_level=top, read_url=read_url
+        turn = mode == guard.WALK and guard.submits(url)
+        deletion = (
+            mode == guard.WALK
+            and not turn
+            and (method or "").upper() == "POST"
+            and urlsplit(url).path.endswith("/deletedraft")
         )
+        if deletion:
+            headers = {str(k).lower(): v for k, v in (request.get("headers") or {}).items()}
+            network_id = params.get("networkId")
+            with self._lock:
+                again = bool(network_id) and network_id in self.delete_requests
+                ok = (again or self.deletes_left > 0) and guard.draft_deletion(
+                    method,
+                    url,
+                    kind,
+                    read_url=read_url,
+                    content_type=headers.get("content-type"),
+                    body=_post_body(request),
+                )
+                if ok and not again:
+                    self.deletes_left -= 1
+                    self.deletes_sent += 1
+                    if network_id:
+                        self.delete_requests.add(network_id)
+        elif turn:
+            # A page turn is judged on its body; the budget is taken under the lock, so two
+            # requests at once cannot both spend the last turn. One request is paused once by
+            # each interception it passes (the browser's and its page's): it spends a turn once,
+            # by its network ID; a pause without that ID spends one every time (fail closed).
+            headers = {str(k).lower(): v for k, v in (request.get("headers") or {}).items()}
+            body = _post_body(request)
+            network_id = params.get("networkId")
+            with self._lock:
+                why = guard.turn_refusal(
+                    method,
+                    url,
+                    kind,
+                    top_level=top,
+                    read_url=read_url,
+                    content_type=headers.get("content-type"),
+                    body=body,
+                    last_from=self.last_from,
+                )
+                again = bool(network_id) and network_id in self.turn_requests
+                if not why and not again and self.turns_left <= 0:
+                    why = "no page turn left"
+                ok = not why and guard.allowed(
+                    mode,
+                    method,
+                    url,
+                    kind,
+                    top_level=top,
+                    read_url=read_url,
+                    content_type=headers.get("content-type"),
+                    body=body,
+                    last_from=self.last_from,
+                )
+                if ok and not again:
+                    self.turns_left -= 1
+                    self.turns_sent += 1
+                    if network_id:
+                        self.turn_requests.add(network_id)
+                elif not ok:
+                    self.turn_refused = why or "refused"
+        else:
+            ok = mode is not None and guard.allowed(
+                mode, method, url, kind, top_level=top, read_url=read_url
+            )
         try:
             if ok:
                 self.pipe.send("Fetch.continueRequest", {"requestId": params["requestId"]}, session)
@@ -916,7 +1078,7 @@ class Chromium:
                 self.blocked += 1
                 if guard.submits(url):
                     self.blocked_submits += 1
-                if mode == guard.READ and top:
+                if mode in {guard.READ, guard.WALK} and top:
                     self.blocked_navigation = url
                     if guard.login_wall(url):
                         self.login_wall = True
@@ -1812,6 +1974,227 @@ class SchoolBrowser:
                 self._reading = False
                 self._last_use = time.monotonic()
 
+    def walk_pages(
+        self, url: str, link: str, item_pages: dict, target_page: int, capture_dir: Path
+    ) -> dict:
+        """Turn the pages of a form with Google's own 次へ, from its first page to
+        `target_page`, and return what the later pages rendered:
+        {"pages": {page: [images, as read_page]}, "reached": last page seen, "stopped": why the
+        walk ended before `target_page`, else ""}.
+
+        `link` is a prefill link of the same form whose answers let 次へ through the required
+        questions of the pages before; `item_pages` maps the form's item IDs to their pages (as
+        read from the page data), which is how the walker knows which page is showing. Walk mode:
+        the guard lets through at most target_page − 1 page turns of this form, none leaving a
+        page after target_page − 1, and nothing else to formResponse. Only a lone 次へ is ever
+        clicked, never on a page that shows 送信, and the walk stops at the first page it cannot
+        account for. Nothing is typed: the answers come in with the link.
+
+        Google keeps what a page turn carried as this account's draft of the form. So the walk
+        does not start when the form already holds a draft (a dialog asking which draft to use,
+        or the first page holding answers the link did not bring: the student's own, say), and
+        after the walk the form's own 「フォームをクリア」 deletes the draft it left, which a fresh
+        load then confirms: "draft" is "none" (no page turned), "cleared" or "left" (it could not
+        be deleted; the student must clear it before using the form).
+        """
+        from .form_read import form_url
+
+        canonical = form_url(url)
+        if form_url(link) != canonical:
+            raise WorkflowError("翻页用的链接不是这份表单的。")
+        if type(target_page) is not int or not 2 <= target_page <= MAX_WALK_PAGES:
+            raise WorkflowError("翻页的目标页无效。")
+        with self._lock:
+            if self._session or self._opening:
+                raise Busy("学校账号登录窗口正在使用，表单暂时不能读取。完成或取消登录后再重试。")
+            if self._reading:
+                raise Busy("另一份表单正在用学校账号读取，请稍后重试。")
+            self._reading = True
+        try:
+            browser = self._ensure(1)
+            browser.set_mode(
+                guard.WALK, canonical, turns=target_page - 1, last_from=target_page - 2
+            )
+        except BaseException:
+            with self._lock:
+                self._reading = False
+            raise
+        page = None
+        result = {"pages": {}, "reached": 0, "stopped": "", "draft": "none"}
+        expected = sorted(
+            (key, value)
+            for key, value in parse_qsl(urlsplit(link).query, keep_blank_values=True)
+            if re.fullmatch(r"entry\.\d{1,20}", key)
+        )
+        try:
+            page = browser.open_page(1280, 2400, False)
+            browser.pipe.call(
+                "Network.setBlockedURLs", {"urls": WALK_BLOCKED_URL_PATTERNS}, page.session
+            )
+            try:
+                opened = browser.navigate(page, link, timeout=READ_SECONDS)
+            except WorkflowError:
+                opened = {}
+            if browser.login_wall:
+                raise LoginExpired("login wall")
+            if opened.get("errorText") or not opened.get("loaderId"):
+                raise WorkflowError(_not_opened(browser.blocked_navigation, opened))
+            if not page.wait_load(opened["loaderId"], READ_SECONDS, lambda: browser.login_wall):
+                if browser.login_wall:
+                    raise LoginExpired("login wall")
+                raise WorkflowError("表单页面加载超时。")
+            try:
+                self._turn_pages(
+                    browser, page, item_pages, target_page, capture_dir, expected, result
+                )
+            except LoginExpired:
+                raise
+            except WorkflowError as exc:
+                # A page that broke off the walk: still delete what the turns so far left.
+                result["stopped"] = str(exc).split("\n")[0]
+            if browser.turns_sent:
+                result["draft"] = self._delete_draft(browser, page, canonical, item_pages)
+            return result
+        except LoginExpired:
+            mark_expired(self.data_dir)
+            expired = LoginExpired(
+                "学校账号的登录已过期，表单后面几页的图片没有读到。请在 设置 → 学校账号 重新登录后重试。"
+            )
+            expired.draft_left = bool(browser.turns_sent)
+            raise expired from None
+        finally:
+            if page is not None:
+                browser.close_page(page)
+            browser.set_mode(None)
+            with self._lock:
+                self._reading = False
+                self._last_use = time.monotonic()
+
+    def _turn_pages(self, browser, page, item_pages, target_page, capture_dir, expected, result):
+        """The walk itself (see walk_pages): fills `result` page by page."""
+        current = 1
+        while True:
+            state = self._settle(browser, page, item_pages, current)
+            if browser.login_wall:
+                raise LoginExpired("login wall")
+            if state is None:
+                result["stopped"] = f"第 {current} 页没有按预期出现"
+                break
+            result["reached"] = current
+            if current == 1:
+                shown = sorted(
+                    (pair[0], pair[1])
+                    for pair in state.get("values") or []
+                    if isinstance(pair, list) and len(pair) == 2 and pair[1]
+                )
+                names = {name for name, _ in shown} | {
+                    pair[0] for pair in state.get("values") or [] if isinstance(pair, list)
+                }
+                if state.get("dialog") or shown != [x for x in expected if x[0] in names]:
+                    result["stopped"] = (
+                        "这份表单里已经有一份草稿（可能是你自己填到一半的），为了不覆盖它，没有翻页"
+                    )
+                    break
+            if current > 1:
+                result["pages"][current] = self._images(
+                    browser, page, capture_dir / f"page{current}"
+                )
+            if current == target_page:
+                break
+            if state["end"] or state["next"] != 1 or not isinstance(state["at"], dict):
+                result["stopped"] = f"第 {current} 页没有唯一的「次へ」按钮"
+                break
+            before = browser.turns_sent
+            self._click(browser, page, state["at"])
+            why = self._wait_turn(browser, before)
+            if why:
+                result["stopped"] = f"第 {current} 页没有翻过去（{why}）"
+                break
+            current += 1
+
+    def _delete_draft(self, browser, page, canonical, item_pages) -> str:
+        """Delete the draft the page turns left with the form's own clear, then load the form
+        afresh: "cleared" when its first page holds no answer and asks nothing, else "left"."""
+        browser.allow_draft_deletion()
+        try:
+            link = browser.evaluate(page, CLEAR_SCRIPT + "(false)", timeout=5)
+            if isinstance(link, dict):
+                self._click(browser, page, link)
+                confirm = None
+                end = time.monotonic() + 8
+                while confirm is None and time.monotonic() < end:
+                    time.sleep(0.3)
+                    confirm = browser.evaluate(page, CLEAR_SCRIPT + "(true)", timeout=5)
+                if isinstance(confirm, dict):
+                    self._click(browser, page, confirm)
+                    end = time.monotonic() + 10
+                    while not browser.deletes_sent and time.monotonic() < end:
+                        time.sleep(0.2)
+                    time.sleep(1)
+            opened = browser.navigate(page, canonical, timeout=READ_SECONDS)
+            if not opened.get("loaderId") or not page.wait_load(
+                opened["loaderId"], READ_SECONDS, lambda: browser.login_wall
+            ):
+                return "left"
+            state = self._settle(browser, page, item_pages, 1)
+        except WorkflowError:
+            return "left"
+        if not browser.deletes_sent or not state or state.get("dialog"):
+            return "left"
+        held = [
+            p for p in state.get("values") or [] if isinstance(p, list) and len(p) == 2 and p[1]
+        ]
+        return "left" if held else "cleared"
+
+    @staticmethod
+    def _settle(browser, page, item_pages, expected, timeout=READ_SECONDS):
+        """The page's state once it shows page `expected` (every item it carries belongs to that
+        page) and has loaded, its pictures too (up to 10 s more); None if it never does."""
+        end = time.monotonic() + timeout
+        matched_at = None
+        while time.monotonic() < end and not browser.login_wall:
+            try:
+                state = browser.evaluate(page, PAGE_SCRIPT, timeout=5)
+            except WorkflowError:
+                state = None  # between two documents
+            if isinstance(state, dict) and state.get("ready") == "complete":
+                pages = {item_pages[x] for x in state.get("items") or [] if x in item_pages}
+                if pages == {expected}:
+                    matched_at = matched_at or time.monotonic()
+                    if state.get("done") or time.monotonic() - matched_at > 10:
+                        return state
+            time.sleep(0.25)
+        return None
+
+    @staticmethod
+    def _click(browser, page, at):
+        x, y = at.get("x"), at.get("y")
+        if not all(isinstance(v, (int, float)) and 0 <= v <= 4000 for v in (x, y)):
+            raise WorkflowError("「次へ」按钮的位置无效。")
+        for kind in ("mouseMoved", "mousePressed", "mouseReleased"):
+            browser.pipe.call(
+                "Input.dispatchMouseEvent",
+                {"type": kind, "x": x, "y": y, "button": "left", "clickCount": 1},
+                page.session,
+            )
+
+    @staticmethod
+    def _wait_turn(browser, before, timeout=10.0) -> str:
+        """'' once the page turn went out; else why not (the guard refused it, or Google's
+        page sent nothing: a required answer it did not accept, say)."""
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            with browser._lock:
+                sent, refused = browser.turns_sent, browser.turn_refused
+            if sent > before:
+                return ""
+            if refused:
+                return "翻页请求不符合规则，已拦截：" + refused
+            if browser.login_wall:
+                return "登录已过期"
+            time.sleep(0.2)
+        return "Google 没有发出翻页，可能有必答题的占位答案没有被接受"
+
     def _images(self, browser, page, capture_dir: Path) -> list[dict]:
         try:
             rendered = browser.evaluate(page, IMAGES_SCRIPT, timeout=10)
@@ -1858,6 +2241,21 @@ class SchoolBrowser:
                     entry["path"] = str(path)
             result.append(entry)
         return result
+
+
+def _post_body(request: dict):
+    """The text of a paused request's body (inline, else from its entries), or None."""
+    body = request.get("postData")
+    if isinstance(body, str):
+        return body
+    entries = request.get("postDataEntries")
+    if not isinstance(entries, list) or not entries:
+        return None
+    try:
+        raw = b"".join(base64.b64decode(entry.get("bytes") or "") for entry in entries)
+        return raw.decode("utf-8")
+    except (ValueError, TypeError, AttributeError, UnicodeDecodeError):
+        return None
 
 
 def _not_opened(blocked: str, result: dict) -> str:

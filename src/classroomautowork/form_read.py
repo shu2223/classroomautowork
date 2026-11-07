@@ -272,6 +272,31 @@ def parse_form(html: str, url: str) -> dict:
         ) from exc
 
 
+def branches(html: str) -> bool:
+    """Whether the form may leave its page order: a choice that goes to another section
+    (option[2] set) or a section that names where it goes next (item[5] set). True also when the
+    page data cannot be read. Only a form that goes page by page is walked (school_forms)."""
+    match = re.search(r"\bFB_PUBLIC_LOAD_DATA_\s*=\s*(\[)", html)
+    if not match:
+        return True
+    try:
+        payload, _ = json.JSONDecoder().raw_decode(html[match.start(1) :])
+        items = payload[1][1]
+        for item in items:
+            if item[3] == 8:
+                if len(item) > 5 and item[5] is not None:
+                    return True
+                continue
+            for entry in item[4] if len(item) > 4 and isinstance(item[4], list) else []:
+                options = entry[1] if isinstance(entry, list) and len(entry) > 1 else None
+                for option in options if isinstance(options, list) else []:
+                    if isinstance(option, list) and len(option) > 2 and option[2] is not None:
+                        return True
+    except (ValueError, TypeError, IndexError, KeyError, RecursionError):
+        return True
+    return False
+
+
 def _fields(kind, entries):
     """The answer fields of one question (a grid: one per row), and whether it is a checkbox
     grid. Raises ValueError for page data of an unexpected shape."""

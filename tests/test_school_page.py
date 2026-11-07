@@ -49,7 +49,8 @@ def test_the_group_and_the_view_have_their_controls():
         "在这里输入，发送到登录页",
     ):
         assert words in PAGE
-    assert "登录只保存在小主机上，只用来读取表单的题目和图片；AI 和程序都不能提交任何内容。" in PAGE
+    assert "登录只保存在小主机上，只用来读取表单的题目和图片。" in PAGE
+    assert "只翻页，不提交" in PAGE and "AI 和程序都不能提交任何内容。" in PAGE
     assert "style=" not in PAGE and "<style" not in PAGE and "<script>" not in PAGE
 
 

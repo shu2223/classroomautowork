@@ -6,10 +6,22 @@ rest fail with BlockedByClient. The rules make submitting impossible from that b
 clicks:
 
 * any URL whose path contains ``/formResponse`` is blocked, on any host and with any method
-  (Google Forms' submit endpoint, which also submits on a GET with ``submit=``);
+  (Google Forms' submit endpoint, which also submits on a GET with ``submit=``). The one
+  exception is a page turn in walk mode, below;
 * read mode (the program reading a form): GET and HEAD only, and the page itself may only be
   the canonical ``viewform`` URL being read. A redirect to Google's sign-in means the login
   has expired; the reader stops there (`login_wall`);
+* walk mode (the program turning the pages of a form to see its later pictures): read mode,
+  plus Google's own 次へ. Google Forms turns a page by POSTing the page to ``formResponse`` with
+  ``continue=1``; only the final 送信 posts without it, and only that records an answer. So a
+  POST there passes only as `page_turn` says: the main frame's own navigation, to exactly this
+  form's ``formResponse`` on docs.google.com (no query, no escapes), a form-encoded body with
+  exactly one ``continue=1`` and no ``submit``, and a page history that starts at the first page,
+  goes one page at a time and ends no later than `last_from` (never the last page). The browser
+  also counts them: no more page turns than the walk asked for. Google keeps what a page turn
+  carried as the account's draft of that form, so after the walk the form's own
+  「フォームをクリア」 deletes it: once the walk is over, one XHR POST to this form's
+  ``deletedraft`` (`draft_deletion`) passes too;
 * sign-in mode (the user signing in through the remote view): GET and HEAD anywhere; any other
   method only to Google's sign-in hosts and, over https, to named hosts that are not Google's (a
   school's own sign-in page). Docs, Forms, Classroom, Drive, Gmail, Apps Script and the Google
@@ -24,11 +36,12 @@ clicks:
 import ipaddress
 import re
 import socket
-from urllib.parse import unquote_to_bytes, urlsplit
+from urllib.parse import parse_qsl, unquote_to_bytes, urlsplit
 
 READ = "read"
 SIGN_IN = "sign_in"
-MODES = {READ, SIGN_IN}
+WALK = "walk"
+MODES = {READ, SIGN_IN, WALK}
 SAFE_METHODS = {"GET", "HEAD"}
 # Google's registrable domains (lower case); a host equal to one or below one is Google's.
 GOOGLE_DOMAINS = (
@@ -70,6 +83,12 @@ SIGN_IN_PATHS = {
     "www.recaptcha.net": re.compile(r"/recaptcha/.*"),
 }
 SUBMIT_PATH = "/formResponse"
+# A page turn's own address: this form's endpoint, written plainly (no escapes, no query).
+TURN_PATH = re.compile(r"/forms/(?:u/\d{1,2}/)?d/e/([A-Za-z0-9_-]{8,200})/formResponse")
+READ_PATH = re.compile(r"/forms/d/e/([A-Za-z0-9_-]{8,200})/viewform")
+DRAFT_PATH = re.compile(r"/forms/(?:u/\d{1,2}/)?d/e/([A-Za-z0-9_-]{8,200})/deletedraft")
+PAGE_HISTORY = re.compile(r"\d{1,3}(?:,\d{1,3}){0,99}")
+MAX_TURN_BODY = 512 * 1024
 # Names that resolve to this machine, its LAN or its tailnet rather than to a public site.
 LOCAL_SUFFIXES = (
     "localhost",
@@ -165,6 +184,99 @@ def login_wall(url: str) -> bool:
     return is_google_host(host) and path.startswith(("/ServiceLogin", "/accounts/ServiceLogin"))
 
 
+def turn_refusal(
+    method: str,
+    url: str,
+    resource_type: str,
+    *,
+    top_level: bool,
+    read_url: str,
+    content_type,
+    body,
+    last_from: int,
+) -> str:
+    """Why this request is not a page turn of the form being walked ('' when it is one).
+
+    A page turn is what Google's own 次へ sends: the page's main frame POSTing the page, form
+    encoded, to this form's formResponse with continue=1, its page history 0,1,…,n with n (the
+    page it leaves, counted from 0) no later than `last_from`."""
+    if (method or "").upper() != "POST" or resource_type != "Document" or not top_level:
+        return "not the page's own POST"
+    if not isinstance(last_from, int) or last_from < 0:
+        return "no page turn allowed"
+    try:
+        parts, own = urlsplit(url), urlsplit(read_url)
+    except ValueError:
+        return "unreadable address"
+    target, form = TURN_PATH.fullmatch(parts.path), READ_PATH.fullmatch(own.path)
+    if (
+        parts.scheme != "https"
+        or parts.netloc != "docs.google.com"
+        or parts.query
+        or parts.fragment
+        or not target
+        or own.netloc != "docs.google.com"
+        or not form
+        or target[1] != form[1]
+    ):
+        return "not this form's page turn address"
+    if str(content_type or "").split(";")[0].strip().lower() != "application/x-www-form-urlencoded":
+        return "not form encoded"
+    if not isinstance(body, str) or len(body) > MAX_TURN_BODY:
+        return "no readable body"
+    try:
+        pairs = parse_qsl(body, keep_blank_values=True, strict_parsing=True, max_num_fields=5000)
+    except ValueError:
+        return "malformed body"
+    if [value for key, value in pairs if key == "continue"] != ["1"]:
+        return "no continue=1"
+    if any(key.lower() == "submit" for key, _ in pairs):
+        return "a submit field"
+    history = [value for key, value in pairs if key == "pageHistory"]
+    if len(history) != 1 or not PAGE_HISTORY.fullmatch(history[0]):
+        return "no page history"
+    pages = [int(x) for x in history[0].split(",")]
+    if pages != list(range(len(pages))):
+        return "pages not in order from the first"
+    if pages[-1] > last_from:
+        return "past the last page it may leave"
+    return ""
+
+
+def draft_deletion(method: str, url: str, resource_type: str, *, read_url: str, content_type, body):
+    """Whether this is the form's own 「フォームをクリア」 deleting the draft of the form being
+    walked: an XHR POST to its deletedraft on docs.google.com (query: ouid and token only),
+    form encoded, its body the one draft_response_action_request field."""
+    if (method or "").upper() != "POST" or resource_type not in {"XHR", "Fetch"}:
+        return False
+    try:
+        parts, own = urlsplit(url), urlsplit(read_url)
+        query = parse_qsl(parts.query, keep_blank_values=True, strict_parsing=bool(parts.query))
+    except ValueError:
+        return False
+    target, form = DRAFT_PATH.fullmatch(parts.path), READ_PATH.fullmatch(own.path)
+    if (
+        parts.scheme != "https"
+        or parts.netloc != "docs.google.com"
+        or parts.fragment
+        or not target
+        or own.netloc != "docs.google.com"
+        or not form
+        or target[1] != form[1]
+        or not {key for key, _ in query} <= {"ouid", "token"}
+    ):
+        return False
+    if str(content_type or "").split(";")[0].strip().lower() != "application/x-www-form-urlencoded":
+        return False
+    if not isinstance(body, str) or len(body) > 4096:
+        return False
+    try:
+        pairs = parse_qsl(body, keep_blank_values=True, strict_parsing=True)
+    except ValueError:
+        return False
+    return [key for key, _ in pairs] == ["draft_response_action_request"]
+
+
 def allowed(
     mode: str,
     method: str,
@@ -173,12 +285,17 @@ def allowed(
     *,
     top_level: bool = False,
     read_url: str = "",
+    content_type=None,
+    body=None,
+    last_from: int = -1,
 ) -> bool:
     """Whether the school-login browser may send this request.
 
     `resource_type` is the DevTools type (Document, Script, Image, XHR, Fetch, Ping, …);
     `top_level` marks the navigation of a page's own main frame (also a popup's), which in read
-    mode must be the form being read (`read_url`, canonical viewform). Unknown modes, methods,
+    and walk mode must be the form being read (`read_url`, canonical viewform). In walk mode a
+    POST to the form's formResponse passes only as a page turn (`turn_refusal`, from its
+    `content_type` and `body`, leaving no page later than `last_from`). Unknown modes, methods,
     schemes and unparsable URLs are refused.
     """
     method = (method or "").upper()
@@ -192,11 +309,20 @@ def allowed(
         # data:, blob: and about: never reach the network; anything else is not expected.
         return parts.scheme in {"data", "blob", "about"} and method in SAFE_METHODS
     if submits(url):
-        return False
+        return mode == WALK and not turn_refusal(
+            method,
+            url,
+            resource_type,
+            top_level=top_level,
+            read_url=read_url,
+            content_type=content_type,
+            body=body,
+            last_from=last_from,
+        )
     host = host_of(url)
     if is_local_host(host):
         return False
-    if mode == READ:
+    if mode in {READ, WALK}:
         if method not in SAFE_METHODS:
             return False
         if top_level:

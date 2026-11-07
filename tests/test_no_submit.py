@@ -3,7 +3,9 @@
 Submitting is always the student's own click in Google Forms, after checking every answer the
 prefill link brought in. These checks read the source itself, so a later change that adds a way
 to submit fails here; the request guard of the school-login browser has its own table test
-(test_browser_guard.py) and a real-Chromium harness check (staging.sh e2e-school).
+(test_browser_guard.py) and a real-Chromium harness check (staging.sh e2e-school). The one
+request to formResponse that may pass is a page turn (Google's own 次へ, continue=1) while the
+program walks a form's pages to see its later pictures; the final 送信 never does.
 """
 
 import ast
@@ -62,11 +64,14 @@ def test_the_submit_endpoint_is_named_only_to_canonicalise_and_to_block_it():
         if "formresponse" in value.lower()
     }
     # form_read: a pasted …/formResponse link is read as its GET viewform page.
-    # browser_guard and school_browser: the rule and the second net that block it in Chromium.
+    # browser_guard and school_browser: the rule and the second net that block it in Chromium,
+    # and the address of a page turn (walk mode) with the second net of a walking page.
     assert found == {
         ("form_read.py", "FORM_PATH"),
         ("browser_guard.py", "SUBMIT_PATH"),
+        ("browser_guard.py", "TURN_PATH"),
         ("school_browser.py", "BLOCKED_URL_PATTERNS"),
+        ("school_browser.py", "WALK_BLOCKED_URL_PATTERNS"),
     }
     assert browser_guard.submits("https://docs.google.com/forms/d/e/x/formResponse")
     # The rule decodes the path: no spelling of it gets through (SEC-1).
@@ -181,7 +186,7 @@ def test_the_school_browser_reads_without_typing_or_clicking_and_never_reads_coo
     for forbidden in ("getCookies", "getAllCookies", "Storage.get", "Cookies", "Login Data"):
         assert forbidden not in source
     # Every request of every target goes through the guard, and a submit is refused in any mode.
-    for mode in (browser_guard.READ, browser_guard.SIGN_IN):
+    for mode in (browser_guard.READ, browser_guard.SIGN_IN, browser_guard.WALK):
         for method in ("GET", "POST"):
             assert not browser_guard.allowed(
                 mode,
@@ -244,4 +249,41 @@ def test_the_guard_never_rewrites_a_request():
             failed.append(node.lineno)
     assert len(released) == 1 and len(failed) == 1
     text = (SRC / "school_browser.py").read_text(encoding="utf-8")
-    assert "fulfillRequest" not in text and "postData" not in text
+    assert "fulfillRequest" not in text
+    # A body is only read (to judge a page turn), never written.
+    import inspect
+
+    reader = inspect.getsource(sb._post_body)
+    assert text.count("postData") == reader.count("postData") > 0
+
+
+def test_the_walk_clicks_only_googles_own_next_and_types_nothing():
+    import inspect
+
+    walking = "".join(
+        inspect.getsource(function)
+        for function in (
+            sb.SchoolBrowser.walk_pages,
+            sb.SchoolBrowser._turn_pages,
+            sb.SchoolBrowser._delete_draft,
+            sb.SchoolBrowser._settle,
+            sb.SchoolBrowser._click,
+            sb.SchoolBrowser._wait_turn,
+        )
+    )
+    for forbidden in ("insertText", "dispatchKeyEvent", "submit(", "Runtime.callFunctionOn"):
+        assert forbidden not in walking
+    assert walking.count("Input.dispatchMouseEvent") == 1
+    # The page script only looks: it clicks, submits and dispatches nothing itself, and finds
+    # the one 次へ, never on a page that shows 送信.
+    for script in (sb.PAGE_SCRIPT, sb.CLEAR_SCRIPT):
+        for forbidden in (".click(", "submit(", "dispatchEvent", "fetch(", "XMLHttpRequest"):
+            assert forbidden not in script
+    # The clear only deletes the draft the page turns left: after them, once (the guard checks
+    # it is this form's deletedraft), and only if a page turned at all.
+    assert "if browser.turns_sent:" in walking
+    assert "allow_draft_deletion" in inspect.getsource(sb.SchoolBrowser._delete_draft)
+    assert "送信" in sb.END_LABELS and not set(sb.NEXT_LABELS) & set(sb.END_LABELS)
+    assert "next.length === 1 && !end" in sb.PAGE_SCRIPT
+    # The guard's budget: as many turns as pages to go, none leaving the target page.
+    assert "turns=target_page - 1, last_from=target_page - 2" in walking

@@ -204,3 +204,205 @@ def test_local_hosts(host, local):
 )
 def test_google_hosts(host, google):
     assert guard.is_google_host(host) is google
+
+
+# -- walk mode: Google's own 次へ, and nothing else to formResponse
+
+WALK = guard.WALK
+TURN = "https://docs.google.com/forms/u/0/d/e/1FAIpQLSdUnitLoginForm0000000000/formResponse"
+FORM_ENCODED = "application/x-www-form-urlencoded"
+
+
+def turn_body(history="0", extra=""):
+    return (
+        "entry.1=a&fvv=1&partialResponse=%5Bnull%5D&pageHistory="
+        + history
+        + extra
+        + ("&fbzx=-1&submissionTimestamp=-1&continue=1")
+    )
+
+
+def walks(
+    url=TURN,
+    *,
+    method="POST",
+    kind="Document",
+    top=True,
+    ctype=FORM_ENCODED,
+    body=None,
+    last_from=0,
+    mode=WALK,
+    read_url=FORM,
+):
+    return guard.allowed(
+        mode,
+        method,
+        url,
+        kind,
+        top_level=top,
+        read_url=read_url,
+        content_type=ctype,
+        body=turn_body() if body is None else body,
+        last_from=last_from,
+    )
+
+
+def test_a_page_turn_passes_in_walk_mode():
+    assert walks()
+    assert walks(TURN.replace("/u/0/", "/"))
+    assert walks(body=turn_body("0,1"), last_from=1)
+    assert walks(ctype=FORM_ENCODED + "; charset=UTF-8")
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        # Not a page turn: the final 送信 (no continue), or anything that looks like one.
+        {"body": turn_body().replace("&continue=1", "")},
+        {"body": turn_body().replace("continue=1", "continue=0")},
+        {"body": turn_body() + "&continue=1"},
+        {"body": turn_body() + "&submit=Submit"},
+        {"body": turn_body() + "&SUBMIT=1"},
+        # Past the last page the walk may leave (never the form's last page), or out of order.
+        {"body": turn_body("0,1")},
+        {"body": turn_body("0,1,2"), "last_from": 1},
+        {"body": turn_body("1")},
+        {"body": turn_body("0,2"), "last_from": 5},
+        {"body": turn_body("0,0"), "last_from": 5},
+        {"body": turn_body("")},
+        {"body": turn_body("0") + "&pageHistory=0"},
+        {"last_from": -1},
+        # Not the page's own form-encoded POST to this form's plain endpoint.
+        {"method": "GET"},
+        {"method": "PUT"},
+        {"kind": "XHR"},
+        {"kind": "Document", "top": False},
+        {"ctype": "multipart/form-data; boundary=x"},
+        {"ctype": None},
+        {"body": ""},
+        {"body": "%%%"},
+        {"url": TURN + "?submit=Submit"},
+        {"url": TURN + "#x"},
+        {"url": TURN.replace("formResponse", "form%52esponse")},
+        {"url": TURN.replace("formResponse", "formresponse")},
+        {"url": TURN.replace("Form0000", "Form1111")},
+        {"url": TURN.replace("https://", "http://")},
+        {"url": TURN.replace("docs.google.com", "docs.google.com:443")},
+        {
+            "url": "https://example.ac.jp/forms/u/0/d/e/1FAIpQLSdUnitLoginForm0000000000/formResponse"
+        },
+        {"read_url": ""},
+        # Read and sign-in mode never let it through, however it looks.
+        {"mode": guard.READ},
+        {"mode": guard.SIGN_IN},
+    ],
+)
+def test_anything_else_to_form_response_is_refused_in_walk_mode(change):
+    assert not walks(**change)
+
+
+def test_walk_mode_is_read_mode_for_everything_else():
+    for method, url, kind, top, expected in [
+        ("GET", FORM + "?usp=pp_url&entry.1=a", "Document", True, True),
+        ("GET", "https://lh7-rt.googleusercontent.com/formsz/abc=w740", "Image", False, True),
+        ("GET", "https://docs.google.com/forms/d/e/x/closedform", "Document", True, False),
+        ("POST", "https://docs.google.com/forms/d/e/x/naLogImpressions", "XHR", False, False),
+        ("POST", FORM, "Document", True, False),
+        ("GET", "http://127.0.0.1:8771/api/bootstrap", "Image", False, False),
+        ("GET", TURN + "?entry.1=a&submit=Submit", "Image", False, False),
+    ]:
+        assert guard.allowed(WALK, method, url, kind, top_level=top, read_url=FORM) is expected
+
+
+def test_the_turn_refusal_says_why():
+    assert (
+        guard.turn_refusal(
+            "POST",
+            TURN,
+            "Document",
+            top_level=True,
+            read_url=FORM,
+            content_type=FORM_ENCODED,
+            body=turn_body().replace("&continue=1", ""),
+            last_from=0,
+        )
+        == "no continue=1"
+    )
+    assert (
+        guard.turn_refusal(
+            "POST",
+            TURN,
+            "Document",
+            top_level=True,
+            read_url=FORM,
+            content_type=FORM_ENCODED,
+            body=turn_body("0,1"),
+            last_from=0,
+        )
+        == "past the last page it may leave"
+    )
+    assert (
+        guard.turn_refusal(
+            "POST",
+            TURN,
+            "Document",
+            top_level=True,
+            read_url=FORM,
+            content_type=FORM_ENCODED,
+            body=None,
+            last_from=0,
+        )
+        == "no readable body"
+    )
+
+
+# -- the draft deletion after a walk (the form's own 「フォームをクリア」)
+
+DELETE = "https://docs.google.com/forms/u/0/d/e/1FAIpQLSdUnitLoginForm0000000000/deletedraft"
+DELETE_BODY = "draft_response_action_request=%5Bnull%2C%5B%5D%5D"
+
+
+def deletes(
+    url=DELETE + "?ouid=1&token=t",
+    *,
+    method="POST",
+    kind="XHR",
+    ctype=FORM_ENCODED + ";charset=UTF-8",
+    body=DELETE_BODY,
+    read_url=FORM,
+):
+    return guard.draft_deletion(method, url, kind, read_url=read_url, content_type=ctype, body=body)
+
+
+def test_the_forms_own_draft_deletion_is_recognised():
+    assert deletes()
+    assert deletes(DELETE)
+    assert deletes(kind="Fetch")
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"url": DELETE.replace("Form0000", "Form1111")},
+        {"url": DELETE + "?ouid=1&token=t&submit=Submit"},
+        {"url": DELETE.replace("deletedraft", "formResponse")},
+        {"url": DELETE.replace("deletedraft", "delete%64raft")},
+        {"url": DELETE.replace("https://", "http://")},
+        {"url": DELETE.replace("docs.google.com", "example.ac.jp")},
+        {"method": "GET"},
+        {"kind": "Document"},
+        {"ctype": "multipart/form-data; boundary=x"},
+        {"body": DELETE_BODY + "&entry.1=a"},
+        {"body": "entry.1=a"},
+        {"body": None},
+        {"read_url": ""},
+    ],
+)
+def test_nothing_else_passes_as_the_draft_deletion(change):
+    assert not deletes(**change)
+
+
+def test_allowed_never_lets_the_deletion_through_by_itself():
+    """Only the browser's walk lets it through, once, after the last page turn."""
+    for mode in (READ, SIGN_IN, WALK):
+        assert not guard.allowed(mode, "POST", DELETE + "?ouid=1&token=t", "XHR", read_url=FORM)
