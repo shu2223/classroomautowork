@@ -159,3 +159,60 @@ def test_reusing_one_answer_does_not_prevent_other_failed_items_retrying(tmp_pat
     assert any(x["assignment_id"] == "3" for x in calls[0])
     assert not any(x["assignment_id"] == "2" for x in calls[0])
     assert jobs._jobs[identifier]["items"][0]["status"] == "ready"
+
+
+def uncited_claim_result(root):
+    """A completed report whose claim list adds a sourced restatement of the task that the
+    draft does not cite (seen 2026-11-09: two real answers discarded for it)."""
+    package, generation, result, _ = failed_report(root)
+    sources = json.loads((package / "evidence.json").read_text(encoding="utf-8"))["sources"]
+    task = next(c for c in sources if c["source_id"] == "coursework:2")
+    result["review"]["claim_checks"].append(
+        {"claim": "The task asks for one store", "kind": "sourced", "evidence_ids": [task["id"]]}
+    )
+    return package, generation, result, task
+
+
+def test_sourced_claim_the_draft_does_not_cite_becomes_a_note_not_a_failure(tmp_path):
+    package, generation, result, task = uncited_claim_result(tmp_path)
+    receipt = drafting.accept_model_result(package, generation, result, json.dumps(result))
+    assert receipt["status"] == "ready_for_human_review"
+    review = json.loads((package / "review.json").read_text(encoding="utf-8"))
+    assert [c["claim"] for c in review["claim_checks"]] == ["食品安全"]
+    assert [c["claim"] for c in review["uncited_claims"]] == ["The task asks for one store"]
+    note = review["questions"][-1]
+    assert "The task asks for one store" in note and task["title"] in note
+    assert note in (package / "questions.md").read_text(encoding="utf-8")
+    assert {
+        "field": "review.claim_checks[1]",
+        "kind": "sourced_claim_not_cited_in_draft",
+        "evidence_ids": [task["id"]],
+    } in generation["validation_normalizations"]
+    # The model's own result is kept as returned.
+    assert len(result["review"]["claim_checks"]) == 2
+
+
+@pytest.mark.parametrize("change", ["unknown_id", "no_ids", "bad_quote", "no_text"])
+def test_uncited_claims_still_fail_when_their_ids_or_quotes_are_wrong(tmp_path, change):
+    package, generation, result, task = uncited_claim_result(tmp_path)
+    claim = result["review"]["claim_checks"][-1]
+    if change == "unknown_id":
+        claim["evidence_ids"] = ["f" * 24]
+    elif change == "no_ids":
+        claim["evidence_ids"] = []
+    elif change == "bad_quote":
+        claim["quotes"] = [{"evidence_id": task["id"], "text": "Invented quotation"}]
+    else:
+        claim["claim"] = " "
+    with pytest.raises(WorkflowError):
+        drafting.accept_model_result(package, generation, result, json.dumps(result))
+    assert not (package / "review-receipt.json").exists()
+
+
+def test_uncited_claim_is_left_alone_without_a_draft():
+    review = {
+        "claim_checks": [{"claim": "x", "kind": "sourced", "evidence_ids": ["a"]}],
+        "questions": [],
+    }
+    normalized, repairs = drafting._move_uncited_claims(review, " ", {"a": {"text": ""}})
+    assert normalized == review and not repairs

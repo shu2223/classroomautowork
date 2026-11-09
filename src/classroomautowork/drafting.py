@@ -1033,6 +1033,69 @@ def _normalize_requirement_sources(review, allowed):
     return review, repairs
 
 
+def _move_uncited_claims(review, draft, sources):
+    """Move a sourced claim whose evidence the draft does not cite out of the claim list.
+
+    The claim list is never shown; the reviewer reads the draft and its [E:id] citations. A
+    model sometimes lists a claim the draft does not make in citable form (often a restatement
+    of the task itself), and the whole answer used to fail for it. Only claims whose evidence
+    IDs are real and whose quotations match their sources move; they are kept in
+    review["uncited_claims"] and each becomes a note under 待核对. Everything else is left for
+    finalize to check exactly as before."""
+    review = copy.deepcopy(review)
+    claims, questions = review.get("claim_checks"), review.get("questions")
+    if not draft.strip() or not isinstance(claims, list) or not isinstance(questions, list):
+        return review, []
+    cited = set(re.findall(r"\[E:([^\]]+)\]", draft))
+    kept, moved, repairs, notes = [], [], [], []
+    for index, claim in enumerate(claims):
+        ids = claim.get("evidence_ids") if isinstance(claim, dict) else None
+        quotes = claim.get("quotes", []) if isinstance(claim, dict) else None
+        if not (
+            isinstance(claim, dict)
+            and claim.get("kind") == "sourced"
+            and isinstance(claim.get("claim"), str)
+            and claim["claim"].strip()
+            and isinstance(ids, list)
+            and ids
+            and all(isinstance(i, str) and i in sources for i in ids)
+            and not set(ids) <= cited
+            and isinstance(quotes, list)
+            and all(
+                isinstance(q, dict)
+                and q.get("evidence_id") in sources
+                and isinstance(q.get("text"), str)
+                and q["text"]
+                and q["text"] in sources[q["evidence_id"]].get("text", "")
+                for q in quotes
+            )
+        ):
+            kept.append(claim)
+            continue
+        missing = [i for i in ids if i not in cited]
+        moved.append(claim)
+        repairs.append(
+            {
+                "field": f"review.claim_checks[{index}]",
+                "kind": "sourced_claim_not_cited_in_draft",
+                "evidence_ids": missing,
+            }
+        )
+        where = "；".join(
+            " ".join(str(x) for x in (sources[i].get("title"), sources[i].get("locator")) if x)
+            for i in missing[:2]
+        )
+        notes.append(
+            f"AI 列出一条有出处的说法，但初稿里没有标出这个出处：「{claim['claim'].strip()[:120]}」"
+            f"（出处：{where}）。初稿如果写到这一点，请对照出处核对。"
+        )
+    if moved:
+        review["claim_checks"] = kept
+        review["uncited_claims"] = moved
+        review["questions"] = list(dict.fromkeys([*questions, *notes]))
+    return review, repairs
+
+
 def accept_model_result(
     package: Path, generation: dict, result: dict, result_text: str, forms=None
 ):
@@ -1106,6 +1169,12 @@ def accept_model_result(
     review, repairs = _normalize_requirement_sources(
         result["review"], set(manifest["requirement_source_ids"])
     )
+    sources = {
+        x["id"]: x
+        for x in json.loads((package / "evidence.json").read_text(encoding="utf-8"))["sources"]
+    }
+    review, moved = _move_uncited_claims(review, result["draft"], sources)
+    repairs += moved
     if incomplete and result["draft"].strip():
         # A candidate can be reviewed without claiming that unread questions are complete.
         note = "原题尚有未读取部分；这里只包含基于实际已读题目或资料的候选内容，请核对后提交。"
