@@ -182,6 +182,8 @@ class LocalHandler(BaseHTTPRequestHandler):
             elif path in ("/api/settings/openai", "/api/settings/anthropic-compatible"):
                 # Either path gives every provider's status and the endpoints' model suggestions.
                 result = jobs.openai_settings()
+            elif path == "/api/google-docs/status":
+                result = jobs.google_doc_status()
             elif path == "/api/school-login/status":
                 result = jobs.school_login_status()
             elif path == "/api/school-login/frame":
@@ -344,6 +346,23 @@ class LocalHandler(BaseHTTPRequestHandler):
                     ai_confirmed=payload.get("ai_confirmed", False),
                     shown_provider=payload.get("provider"),
                 )
+            elif path in ("/api/google-docs/authorize", "/api/google-docs/forget"):
+                if payload:
+                    raise WorkflowError("这个操作不接受参数。")
+                result = (
+                    jobs.google_doc_start()
+                    if path.endswith("authorize")
+                    else jobs.google_doc_forget()
+                )
+            elif path == "/api/google-docs/finish":
+                # The pasted address holds a one-time code: no answer or error repeats it.
+                result = jobs.google_doc_finish(payload)
+            elif match := re.fullmatch(
+                r"/api/jobs/([a-f0-9]{32})/items/([0-9]+:[0-9]+)/google-doc", path
+            ):
+                if payload:
+                    raise WorkflowError("新建文档不接受远端文档 ID 或额外参数。")
+                result = jobs.create_google_doc(match[1], match[2])
             elif path == "/api/documents/authorize":
                 if payload:
                     raise WorkflowError("文档授权请求不接受额外参数。")

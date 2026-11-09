@@ -7,7 +7,7 @@ import uuid
 from dataclasses import asdict, replace
 from pathlib import Path
 
-from . import connection_test, school_browser
+from . import connection_test, google_doc, school_browser
 from .answer_document import create_answer_document, valid_answer_document
 from .auth import documents_authorized
 from .batch import course_batches
@@ -160,6 +160,7 @@ class FrontendJobs:
         (self.root / "jobs").mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._active = None
+        self._creating_docs = set()
         self._cancel = threading.Event()
         self._thread = None
         self._models_lock = threading.Lock()
@@ -526,6 +527,56 @@ class FrontendJobs:
                 provider=job_provider(source),
             )
         return self._start("fill", [{**item, "package": str(package)}], ai_confirmed=True)
+
+    # ---- a new Google Doc with the answer (google_doc.py) ----
+
+    def google_doc_status(self):
+        return google_doc.status(self.settings.data_dir, school_account(self.settings))
+
+    def google_doc_start(self):
+        return google_doc.start(self.settings.data_dir, school_account(self.settings))
+
+    def google_doc_finish(self, payload):
+        if set(payload) != {"url"}:
+            raise WorkflowError("授权请求只接受粘贴的网址。")
+        return google_doc.finish(
+            self.settings.data_dir, payload["url"], school_account(self.settings)
+        )
+
+    def google_doc_forget(self):
+        return google_doc.forget(self.settings.data_dir, school_account(self.settings))
+
+    def create_google_doc(self, job_id, key):
+        """Upload the verified answer as a new Doc; Google is called outside the job lock."""
+        with self._lock:
+            if self._active:
+                raise WorkflowError("请等当前任务结束，再新建 Google 文档；不会重新调用 AI。")
+            if not self.package_view(job_id, key)["text"]["draft.md"]:
+                raise WorkflowError("没有已核验的答案，不能新建文档。")
+            package = self.package_path(job_id, key)
+            if package in self._creating_docs:
+                raise WorkflowError("这份文档正在新建，请稍等。")
+            self._creating_docs.add(package)
+        try:
+            record = google_doc.create(
+                self.settings.data_dir, package, school_account(self.settings)
+            )
+        finally:
+            with self._lock:
+                self._creating_docs.discard(package)
+        with self._lock:
+            job = self._jobs[job_id]
+            item = next(x for x in job["items"] if item_key(x) == key)
+            item["answer_document"] = valid_answer_document(package) or item.get("answer_document")
+            item["google_doc"] = {
+                k: record[k] for k in ("file_id", "name", "url", "email", "created_at")
+            }
+            self._save(job)
+            return {
+                "job": self._snapshot(job),
+                "document": item["google_doc"],
+                "reused": bool(record.get("reused")),
+            }
 
     def export_answer(self, job_id, key):
         with self._lock:
@@ -1399,6 +1450,10 @@ class FrontendJobs:
             "document_fill": read_json(package / "document-fill.json"),
             "form_fill": read_json(package / "form-fill.json") if not changed else None,
             "answer_document": valid_answer_document(package) if text["draft.md"] else None,
+            "google_doc": google_doc.current(package) if text["draft.md"] else None,
+            "own_document_suggested": bool(text["draft.md"])
+            and not fields_error
+            and google_doc.needs_own_document(manifest, response_fields),
         }
 
     @staticmethod

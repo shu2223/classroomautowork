@@ -2879,3 +2879,9 @@ label.field-row { cursor: default; }
   .switch:checked::after { background: HighlightText; }
   .assignments tbody tr.open { outline: 2px solid Highlight; outline-offset: -2px; }
 }
+
+/* ---------- 设置 → Google 文档: the two steps of the one-time grant ---------- */
+
+.drive-steps { margin: 0; padding-left: 1.4em; display: grid; gap: var(--ys-space-2); line-height: 1.7; }
+.drive-open { align-self: flex-start; }
+.drive-dialog textarea { font-family: var(--ys-font-mono); font-size: 13px; word-break: break-all; }

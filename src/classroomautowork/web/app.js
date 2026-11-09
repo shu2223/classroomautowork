@@ -854,7 +854,7 @@ function openSettings(section) {
   $("settingsDialog").showModal();
   if (section === "school") requestAnimationFrame(() => $("schoolSettings").scrollIntoView({block: "start"}));
   api("/api/settings/openai").then(view => { applySettings(view); renderProvider(); for (const name in ENDPOINTS) renderModelSuggestions(name); }).catch(() => {});
-  loadSchoolLogin();
+  loadSchoolLogin(); renderDrive(); loadDrive();
 }
 async function chooseProvider(provider) {
   if (provider === (state.providerView || activeProvider()) || $("providerSeg").getAttribute("aria-busy")) return;
@@ -971,6 +971,53 @@ async function testConnection(provider) {
     state.testing = null;
     await api("/api/settings/openai").then(applySettings).catch(() => {});
     renderProvider(); renderTests();
+  }
+}
+
+// ---- settings: Google 文档 (google_doc.py) -------------------------------------------------
+// One grant, Drive's "files this app created" only, so the answer can go into a new Doc in the student's own Drive. The
+// mini PC cannot receive Google's redirect: the student pastes the address of the page that did not open, once.
+const drive = {status: null, then: null};
+function renderDrive() {
+  const s = drive.status, el = $("driveStatus");
+  if (!s) el.replaceChildren("正在读取…");
+  else if (!s.client) el.replaceChildren(node("span", "小主机上还没有 Google 授权用的客户端配置，暂时不能授权。", "status-warn"));
+  else if (s.mismatch) el.replaceChildren(node("span", "授权账号与学校账号不符", "status-warn"), node("span", `已授权 ${s.email}，学校账号是 ${s.account}。请重新授权，在 Google 页面选择学校账号。`, "status-sub warn"));
+  else if (s.authorized) el.replaceChildren(factRow(["已授权", {text: s.email, wrap: true}, s.granted_at ? "授权于 " + dateLabel(s.granted_at, true) : null]));
+  else el.replaceChildren("未授权");
+  setText($("driveAuthorize"), s?.authorized ? "重新授权" : "授权");
+  $("driveAuthorize").classList.toggle("ys-btn--primary", !s?.authorized || !!s?.mismatch);
+  $("driveAuthorize").disabled = !s?.client;
+  $("driveForget").hidden = !s?.authorized;
+}
+async function loadDrive() {
+  try { drive.status = await api("/api/google-docs/status"); } catch (error) { /* keep what was shown */ }
+  renderDrive();
+}
+async function openDriveAuth(then) {
+  drive.then = then || null; $("driveError").hidden = true; $("driveUrl").value = "";
+  try {
+    const started = await api("/api/google-docs/authorize", "POST", {});
+    $("driveOpen").href = started.url; setText($("driveAccount"), started.account ? `（${started.account}）` : "");
+    $("driveDialog").showModal();
+  } catch (error) { toast(error.message, "bad"); }
+}
+async function createGoogleDoc(jobId, key, control) {
+  if (!drive.status) await loadDrive();
+  if (!drive.status?.authorized || drive.status?.mismatch) {
+    if (!drive.status?.client) { toast("小主机上还没有 Google 授权用的客户端配置，暂时不能新建文档。", "bad"); return; }
+    openDriveAuth(() => createGoogleDoc(jobId, key)); return;
+  }
+  if (control) { control.disabled = true; setText(control, "正在新建…"); }
+  try {
+    const result = await api(`/api/jobs/${jobId}/items/${key}/google-doc`, "POST", {}, 180000);
+    updateJob(result.job);
+    toast(result.reused ? "这份答案已经有 Google 文档了。" : "已在你的云端硬盘新建 Google 文档，内容已读回核对。", "ok");
+    if (state.panel?.key === key) openPanel(jobId, key, state.panel.tab);
+  } catch (error) {
+    toast(error.message, "bad");
+    if (error.message.includes("授权")) loadDrive();
+    if (control) { control.disabled = false; setText(control, "新建 Google 文档"); }
   }
 }
 
@@ -1380,7 +1427,14 @@ function renderPanel() {
   const form = data.form_fill?.forms?.[0], doc = data.document_fill?.documents?.[0];
   const original = externalLink(doc?.url || form?.url, doc ? "打开已填入的文档" : "打开预填表单", "ys-btn ys-btn--sm ys-btn--primary btn small primary");
   if (original) actions.append(original);
-  if (data.text["draft.md"]) { const word = button("下载 Word", "ys-btn ys-btn--sm btn small" + (original ? "" : " ys-btn--primary primary"), () => downloadAnswer(jobId, key)); word.prepend(ysIcon("download")); actions.append(word); }
+  // No form or copy of the teacher's file to write in: the answer goes into a new Doc in the student's own Drive.
+  const own = !!data.text["draft.md"] && !original && !!(data.google_doc || data.own_document_suggested);
+  if (data.text["draft.md"]) {
+    const look = "ys-btn ys-btn--sm btn small" + (own ? " ys-btn--primary primary" : "");
+    actions.append(data.google_doc ? externalLink(data.google_doc.url, "打开 Google 文档", look)
+      : button("新建 Google 文档", look, event => createGoogleDoc(jobId, key, event.currentTarget)));
+  }
+  if (data.text["draft.md"]) { const word = button("下载 Word", "ys-btn ys-btn--sm btn small" + (original || own ? "" : " ys-btn--primary primary"), () => downloadAnswer(jobId, key)); word.prepend(ysIcon("download")); actions.append(word); }
   const classroom = externalLink(assignment.alternateLink, "Classroom", "ys-btn ys-btn--sm btn small"); if (classroom) actions.append(classroom);
   actions.append(button("补充后重做", "ys-btn ys-btn--sm btn small", () => openSupplement(jobId, key)));
   actions.append(button("课程规则", "ys-link link small", () => openPolicy(manifest.course_id, manifest.course_name)));
@@ -1390,6 +1444,10 @@ function renderPanel() {
   const notes = $("panelNotes"); notes.replaceChildren();
   const lines = [];
   if (data.policy_changed) lines.push(["warn", "补充说明或课程规则已变化，需要重做才会生效。"]);
+  if (data.text["draft.md"] && !original && data.google_doc)
+    lines.push(["info", `答案已写进你云端硬盘里的「${data.google_doc.name}」。在 Classroom 作业页点「添加或创建 → Google 云端硬盘」选中它，核对后点「提出」。`]);
+  else if (own)
+    lines.push(["info", "这项作业没有你自己的答题文档（表单或老师给每人的副本）。可以点「新建 Google 文档」，在你的云端硬盘新建一份写好答案，再在 Classroom 里附上。"]);
   // The item stopped without an answer (its own form was not read, or the model named what it lacked): why, and what to do.
   const unread = (manifest.warnings || []).filter(w => w.form_unread && (w.origins || []).some(o => o.assignment_id === manifest.assignment_id && o.role === "coursework"));
   if (item.error && !data.text["draft.md"] && item.error !== g?.error && !delivered(item)) {
@@ -1827,6 +1885,24 @@ $("openSettings").addEventListener("click", openSettings);
 $("closePanel").addEventListener("click", closePanel);
 document.addEventListener("keydown", event => { if (event.key === "Escape" && state.panel && !document.querySelector("dialog[open]")) closePanel(); });
 for (const close of document.querySelectorAll(".close-dialog")) close.addEventListener("click", () => close.closest("dialog").close());
+$("driveAuthorize").addEventListener("click", () => openDriveAuth());
+$("driveForget").addEventListener("click", async () => {
+  if (!confirm("取消授权？小主机会删掉这个权限；已经新建的文档仍留在你的云端硬盘里。")) return;
+  try { drive.status = await api("/api/google-docs/forget", "POST", {}); renderDrive(); toast("已取消授权。", "ok"); } catch (error) { toast(error.message, "bad"); }
+});
+// The pasted address holds a one-time code: it leaves the field as soon as it is sent, or the dialog closes.
+$("driveDialog").addEventListener("close", () => { $("driveUrl").value = ""; drive.then = null; });
+$("driveForm").addEventListener("submit", async event => {
+  event.preventDefault();
+  const submit = $("driveForm").querySelector("[type=submit]"), pasted = $("driveUrl").value.trim(), then = drive.then;
+  submit.disabled = true; $("driveError").hidden = true;
+  try {
+    drive.status = await api("/api/google-docs/finish", "POST", {url: pasted});
+    drive.then = null; $("driveDialog").close(); renderDrive(); toast(`已授权 ${drive.status.email}。`, "ok");
+    if (then) then();
+  } catch (error) { $("driveError").textContent = error.message; $("driveError").hidden = false; $("driveError").parentElement.scrollIntoView({block: "nearest"}); }
+  finally { submit.disabled = false; }
+});
 $("aiConfirmed").checked = localStorage.getItem("classroom-ai-enabled") !== "false";
 $("aiConfirmed").addEventListener("change", () => { localStorage.setItem("classroom-ai-enabled", String(aiEnabled())); renderButtons(); renderIssues(); });
 $("modelSelect").addEventListener("change", () => { renderEfforts(); saveModelChoice(); });

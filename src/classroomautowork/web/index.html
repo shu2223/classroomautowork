@@ -198,6 +198,18 @@
       </div>
       <p class="group-foot">登录只保存在小主机上，只用来读取表单的题目和图片。图片在后面几页时，程序会像你点「次へ」那样翻过去（只翻页，不提交），翻完删掉 Google 为此存下的草稿；你已经填了一半的表单不会去翻。AI 和程序都不能提交任何内容。</p>
     </section>
+
+    <section id="driveSettings" class="school-settings" aria-labelledby="driveTitle">
+      <h3 id="driveTitle" class="group-head">Google 文档</h3>
+      <div class="group school-group">
+        <div id="driveStatus" class="group-row key-status status-row" role="status">正在读取…</div>
+        <div class="group-row form-actions">
+          <button id="driveAuthorize" class="ys-btn ys-btn--primary btn small" type="button">授权</button>
+          <button id="driveForget" class="ys-btn ys-btn--danger link small" type="button" hidden>取消授权</button>
+        </div>
+      </div>
+      <p class="group-foot">作业没有给你自己的答题文档时，程序可以在你学校账号的云端硬盘里新建一份 Google 文档，写入核对过的答案。权限只有 Google 的「本程序创建的文件」这一项：程序看不到、也改不了你云端硬盘里的其他任何文件。把文档附到作业里和提交，都由你在 Classroom 里完成。</p>
+    </section>
   </div>
 </dialog>
 
@@ -236,6 +248,25 @@
     <button id="schoolTakeover" class="ys-btn ys-btn--primary btn" type="button" hidden>在这里重新打开</button>
     <button id="schoolFinish" class="ys-btn btn" type="button">完成</button>
   </div>
+</dialog>
+
+<dialog id="driveDialog" class="ys-dialog drive-dialog" aria-labelledby="driveDialogTitle">
+  <form id="driveForm">
+    <div class="ys-dialog-head">
+      <div class="ys-dialog-heading"><h2 id="driveDialogTitle" class="ys-dialog-title" tabindex="-1" autofocus>授权新建 Google 文档</h2><p class="ys-dialog-sub">只需要做一次。</p></div>
+      <button class="ys-btn ys-btn--icon ys-btn--quiet close-dialog" type="button" aria-label="关闭"><svg class="ys-icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6.5 6.5l11 11M17.5 6.5l-11 11"/></svg></button>
+    </div>
+    <div class="ys-dialog-body form-stack">
+      <ol class="drive-steps">
+        <li>点「打开 Google 授权页」，选择学校账号<span id="driveAccount"></span>，然后同意。权限只涉及本程序创建的文件。如果看到「Google 尚未验证此应用」，这是你小主机上的程序，点「继续」。</li>
+        <li>同意后浏览器会跳到一个打不开的页面，地址以 http://localhost:8766/ 开头，这是正常的。复制地址栏里的完整网址，粘贴到下面，再点「完成授权」。</li>
+      </ol>
+      <a id="driveOpen" class="ys-btn btn drive-open" href="#" target="_blank" rel="noopener noreferrer">打开 Google 授权页</a>
+      <label class="ys-field field"><span class="ys-field-label">授权后的网址</span><textarea id="driveUrl" class="ys-input" rows="3" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="http://localhost:8766/?state=…&amp;code=…"></textarea></label>
+      <div class="form-error" role="alert"><svg class="ys-icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3.5a8.5 8.5 0 1 0 0 17 8.5 8.5 0 0 0 0-17zM12 7.75v5M12 16.25h.01"/></svg><p id="driveError" class="error" hidden></p></div>
+    </div>
+    <div class="ys-dialog-foot dialog-foot"><button class="ys-btn ys-btn--primary btn primary" type="submit">完成授权</button></div>
+  </form>
 </dialog>
 
 <dialog id="policyDialog" class="ys-dialog" aria-labelledby="policyTitle">

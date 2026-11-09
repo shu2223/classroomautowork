@@ -12,7 +12,14 @@ import ast
 import re
 from pathlib import Path
 
-from classroomautowork import auth, browser_guard, claude_agent, form_fill, openai_compat
+from classroomautowork import (
+    auth,
+    browser_guard,
+    claude_agent,
+    form_fill,
+    google_doc,
+    openai_compat,
+)
 from classroomautowork import school_browser as sb
 
 SRC = Path(sb.__file__).resolve().parent
@@ -101,7 +108,21 @@ def test_no_module_writes_to_google_forms_or_docs_pages():
                     path.name,
                     node.lineno,
                 )
-    assert senders == {("openai_compat.py", "'POST'")}
+    assert senders == {("openai_compat.py", "'POST'"), ("google_doc.py", None)}
+    # A new Doc in the student's own Drive (google_doc): the OAuth token requests, the upload,
+    # and moving to the trash the one file it just made when that file does not read back.
+    google = sorted(
+        (ast.unparse(node.func), ast.unparse(node.args[0]))
+        for name, node in calls(SRC / "google_doc.py")
+        if name in {"post", "put", "patch", "delete", "request", "urlopen"}
+    )
+    assert google == [
+        ("http.patch", "f'{FILES_URL}/{file_id}'"),
+        ("http.post", "TOKEN_URL"),
+        ("http.post", "TOKEN_URL"),
+        ("http.post", "UPLOAD_URL"),
+    ]
+    assert "classroom.googleapis.com" not in (SRC / "google_doc.py").read_text(encoding="utf-8")
     # The Google API client's one write: the student's own Doc, through documents().
     writes = [
         (path.name, ast.unparse(node.func))
@@ -127,9 +148,13 @@ def test_no_module_writes_to_google_forms_or_docs_pages():
 def test_classroom_access_is_read_only_and_nothing_turns_work_in():
     classroom = [scope for scope in auth.SCOPES if "classroom" in scope]
     assert classroom and all(scope.endswith(".readonly") for scope in classroom)
-    every_scope = {*auth.SCOPES, *auth.DOCUMENT_SCOPES}
+    every_scope = {*auth.SCOPES, *auth.DOCUMENT_SCOPES, *google_doc.SCOPES}
     assert not any("forms" in scope for scope in every_scope)
-    assert not any("drive" in scope and not scope.endswith("readonly") for scope in every_scope)
+    # Drive is read-only, except drive.file: only the files this program created itself.
+    assert {
+        scope for scope in every_scope if "drive" in scope and not scope.endswith("readonly")
+    } == {"https://www.googleapis.com/auth/drive.file"}
+    assert not any("classroom" in scope for scope in google_doc.SCOPES)
     for path in MODULES:
         for name, node in calls(path):
             assert name not in {"turnIn", "reclaim", "modifyAttachments", "return_"}, (
